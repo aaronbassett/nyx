@@ -5,6 +5,16 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "migrate:up": "tsx src/db/migrate-cli.ts up",
+    "migrate:down": "tsx src/db/migrate-cli.ts down",
+    "migrate:status": "tsx src/db/migrate-cli.ts status"
+  },
+  "dependencies": {
+    "pg": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.20.0",
+    "tsx": "^4.23.0"
   }
 }
