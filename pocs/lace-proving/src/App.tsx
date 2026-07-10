@@ -99,7 +99,33 @@ export default function App() {
 
       setStatus("connect", "done");
     } catch (err) {
-      log.error("app", "connect step failed", err);
+      // DAppConnectorAPIError carries code + reason beyond name/message/stack.
+      const apiErr = err as Partial<{ type: string; code: string; reason: string; message: string }>;
+      if (apiErr?.type === "DAppConnectorAPIError" || apiErr?.code || apiErr?.reason) {
+        log.error(
+          "app",
+          `connect step failed [code=${apiErr.code ?? "?"}] reason=${apiErr.reason ?? "?"}`,
+          err,
+        );
+      } else {
+        log.error("app", "connect step failed", err);
+      }
+      if (/wallet is unavailable/i.test(apiErr?.message ?? "")) {
+        // Lace throws this from ensureWallet() when its Midnight wallet store
+        // (midnightWallets$) is empty for the CURRENTLY SELECTED network in
+        // Lace — authorization succeeds without a wallet instance, but
+        // getConfiguration() needs one. (input-output-hk/lace:
+        // dapp-connector-midnight/.../midnight-dapp-connector-api.ts)
+        log.warn(
+          "app",
+          "Lace's Midnight wallet store is empty for its current network. Check, in order: " +
+            "(1) click Connect again — a freshly-woken extension may not have started its account watch yet; " +
+            "(2) open Lace and confirm the Midnight side is on Pre-prod with an account visible and synced; " +
+            "(3) inspect the Lace service-worker console (chrome://extensions → Lace → service worker) for " +
+            "'Account watch failure:' — wallet start errors (e.g. indexer unreachable) are swallowed there " +
+            "and leave the store empty.",
+        );
+      }
       setStatus("connect", "error");
     }
   }, [network]);
