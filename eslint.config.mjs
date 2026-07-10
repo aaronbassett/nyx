@@ -10,8 +10,15 @@ export default tseslint.config(
   ...tseslint.configs.stylisticTypeChecked,
   {
     languageOptions: {
-      parserOptions: { projectService: true, tsconfigRootDir: import.meta.dirname }
-    }
+      parserOptions: { projectService: true, tsconfigRootDir: import.meta.dirname },
+    },
   },
-  prettier
+  {
+    // Root config files (this file, commitlint.config.mjs) aren't part of any
+    // tsconfig, so the type-aware project service can't resolve them. Lint them
+    // without type information instead of erroring.
+    files: ["**/*.config.mjs"],
+    ...tseslint.configs.disableTypeChecked,
+  },
+  prettier,
 );
