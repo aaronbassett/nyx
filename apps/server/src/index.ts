@@ -13,6 +13,7 @@ import { ConfigValidationError, loadConfig } from "./config/index.js";
 import type { Config } from "./config/index.js";
 import { getDb } from "./db/index.js";
 import { createMcpClients } from "./mcp/index.js";
+import { PgSessionStore, createWsHandler } from "./protocol/index.js";
 
 function loadConfigOrExit(): Config {
   try {
@@ -33,7 +34,9 @@ async function main(): Promise<void> {
 
   const db = getDb();
   const mcp = createMcpClients(config.mcp);
-  const app = await buildServer({ config, db, mcp });
+  const sessionStore = new PgSessionStore(db);
+  const wsHandler = createWsHandler({ sessionStore, config });
+  const app = await buildServer({ config, db, mcp, wsHandler });
 
   await app.listen({ port: config.port, host: "0.0.0.0" });
 }
