@@ -41,11 +41,19 @@ export type AuthNonceResponse = z.infer<typeof AuthNonceResponseSchema>;
 /**
  * `POST /auth/verify` request — SIWE-style signature over the issued nonce.
  * The nonce is burned on any attempt (FR-034/039).
+ *
+ * `verifyingKey` is the wallet's BIP-340 Schnorr verifying key (hex). It is
+ * REQUIRED because the unshielded `address` is a hash of the key, so the server
+ * cannot verify the signature — nor confirm the key↔address binding that
+ * prevents key-substitution auth bypass (constitution III) — from
+ * `{ address, message, signature }` alone. The web signer (T039) sends
+ * `{ address, message, signature, verifyingKey }`.
  */
 export const AuthVerifyRequestSchema = z.object({
   address: MidnightAddressSchema,
   signature: z.string().min(1),
   message: z.string().min(1),
+  verifyingKey: z.string().min(1),
 });
 export type AuthVerifyRequest = z.infer<typeof AuthVerifyRequestSchema>;
 
@@ -57,6 +65,17 @@ export const AuthVerifyResponseSchema = z.object({
   address: MidnightAddressSchema,
 });
 export type AuthVerifyResponse = z.infer<typeof AuthVerifyResponseSchema>;
+
+/**
+ * `GET /auth/session` response — the current authenticated account, for
+ * resume-on-reload (US5 scenario 4 / SC-019). Reaching this endpoint with a live
+ * session cookie slides the 7-day expiry (D44) and returns the account; an absent
+ * or invalid session is a 401. No wallet interaction — resume is cookie-only.
+ */
+export const AuthSessionResponseSchema = z.object({
+  address: MidnightAddressSchema,
+});
+export type AuthSessionResponse = z.infer<typeof AuthSessionResponseSchema>;
 
 /** `POST /auth/logout` response — invalidation is immediate and server-side. */
 export const AuthLogoutResponseSchema = z.object({});
