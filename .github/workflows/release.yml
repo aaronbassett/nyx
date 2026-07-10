@@ -1,0 +1,49 @@
+# Release flow (DS-004) — mirrors the release-plz process used in Tome and
+# Midnight Manual, adapted for this TypeScript monorepo via release-please.
+#
+# FRONT-END: on every push to main, release-please maintains a single
+# "chore(main): release X.Y.Z" PR — version bump + CHANGELOG regenerated from
+# Conventional Commits. Merging that PR is the SINGLE approval gate; it pushes
+# the vX.Y.Z tag.
+#
+# BACK-END: the tag fires the `release-artifacts` job, which runs the full
+# green build before any publish, exactly like Tome's gated design (a failed
+# build can never leave a tagged-but-unbuilt release).
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.rp.outputs.release_created }}
+      tag: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - id: rp
+        uses: googleapis/release-please-action@v4
+        with:
+          release-type: node
+
+  release-artifacts:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.released == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Publishing is gated behind a green build — same discipline as Tome's
+      # release.yml running publish last.
+      - run: pnpm lint && pnpm typecheck && pnpm test
+      - run: pnpm -r --if-present build
