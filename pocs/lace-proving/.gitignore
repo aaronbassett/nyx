@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.local
+.DS_Store
+contract/node_modules/
+test-results/
+playwright-report/
+.last-run.json
