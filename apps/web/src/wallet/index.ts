@@ -33,3 +33,13 @@ export type {
   DiscoveredWallet,
   WalletGeneration,
 } from "./types";
+export { buildSiweMessage, logout, requestNonce, resumeSession, signIn } from "./auth";
+export type {
+  Account,
+  AuthClientDeps,
+  SignInFailureReason,
+  SignInOptions,
+  SignInResult,
+  SiweMessageParams,
+  WalletSigner,
+} from "./auth";
