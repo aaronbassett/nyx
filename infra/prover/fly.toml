@@ -1,0 +1,27 @@
+# Interim D37 proof server — FOUNDATIONAL infra (provisioned in Phase 2, T020).
+#
+# This is the STOCK Midnight proof server image. It exists because a wallet-sdk
+# tx-history migration bug (R8) currently blocks in-wallet proving end-to-end.
+# WATCHING ITEM (D37): when the upstream fix lands, the generated-app scaffold
+# default flips back to wallet-delegated proving and this app is retired.
+#
+# ACCESS (two paths, per D62):
+#   1. Nyx-app flows (deposits US6, deploys US8): reached over the Fly private
+#      6PN mesh by the orchestrator — no public exposure needed for these.
+#   2. Generated apps in escape-hatch tabs (US9, gated by Q3/D54): reached via
+#      the token-validating public proxy stood up in T188 (session-bound tokens,
+#      per-session rate limits, D52).
+#
+# PIN the proof-server image tag; verify the current tag via the
+# midnight-tooling:proof-server skill at implementation — never from memory.
+app = "nyx-prover"
+primary_region = "iad"
+
+[build]
+  image = "PIN_ME"   # midnightntwrk/proof-server:<tag> — set via midnight-tooling:proof-server
+
+[http_service]
+  internal_port = 6300
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
