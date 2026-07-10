@@ -66,6 +66,17 @@ export const AuthVerifyResponseSchema = z.object({
 });
 export type AuthVerifyResponse = z.infer<typeof AuthVerifyResponseSchema>;
 
+/**
+ * `GET /auth/session` response — the current authenticated account, for
+ * resume-on-reload (US5 scenario 4 / SC-019). Reaching this endpoint with a live
+ * session cookie slides the 7-day expiry (D44) and returns the account; an absent
+ * or invalid session is a 401. No wallet interaction — resume is cookie-only.
+ */
+export const AuthSessionResponseSchema = z.object({
+  address: MidnightAddressSchema,
+});
+export type AuthSessionResponse = z.infer<typeof AuthSessionResponseSchema>;
+
 /** `POST /auth/logout` response — invalidation is immediate and server-side. */
 export const AuthLogoutResponseSchema = z.object({});
 export type AuthLogoutResponse = z.infer<typeof AuthLogoutResponseSchema>;

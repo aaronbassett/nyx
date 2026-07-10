@@ -376,6 +376,39 @@ describe("session resume — SC-019 zero wallet calls", () => {
   });
 });
 
+describe("GET /auth/session — resume on reload (US5 scenario 4 / SC-019)", () => {
+  it("returns the account and slides the session for a cookie-only request, zero wallet calls", async () => {
+    const result = await signIn();
+    const issueCallsAfterSignIn = h.store.issueCalls;
+    const cookie = `${SESSION_COOKIE_NAME}=${result.sessionId ?? ""}`;
+
+    const resume = await h.app.inject({ method: "GET", url: "/auth/session", headers: { cookie } });
+    expect(resume.statusCode).toBe(200);
+    expect(resume.json<{ address: string }>().address).toBe(result.identity.address);
+
+    // Sliding renewal refreshed the cookie (D44) …
+    const refreshed = setCookieHeader(resume.headers["set-cookie"]) ?? "";
+    expect(refreshed).toMatch(/Max-Age=604800/i);
+    // … via the session store only — never the verify/signing path (SC-019).
+    expect(h.store.slideCalls).toBeGreaterThan(0);
+    expect(h.store.issueCalls).toBe(issueCallsAfterSignIn);
+  });
+
+  it("rejects with 401 when there is no session cookie", async () => {
+    const resume = await h.app.inject({ method: "GET", url: "/auth/session" });
+    expect(resume.statusCode).toBe(401);
+  });
+
+  it("rejects with 401 after the session has been revoked by logout", async () => {
+    const result = await signIn();
+    const cookie = `${SESSION_COOKIE_NAME}=${result.sessionId ?? ""}`;
+    await h.app.inject({ method: "POST", url: "/auth/logout", headers: { cookie } });
+
+    const resume = await h.app.inject({ method: "GET", url: "/auth/session", headers: { cookie } });
+    expect(resume.statusCode).toBe(401);
+  });
+});
+
 describe("POST /auth/logout (T035/T036)", () => {
   it("revokes the session server-side and clears the cookie", async () => {
     const result = await signIn();

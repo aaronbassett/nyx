@@ -15,8 +15,13 @@
  * and session commit only on success.
  */
 import type { FastifyInstance } from "fastify";
-import { AuthVerifyRequestSchema } from "@nyx/protocol";
-import type { AuthLogoutResponse, AuthNonceResponse, AuthVerifyResponse } from "@nyx/protocol";
+import { AuthSessionResponseSchema, AuthVerifyRequestSchema } from "@nyx/protocol";
+import type {
+  AuthLogoutResponse,
+  AuthNonceResponse,
+  AuthSessionResponse,
+  AuthVerifyResponse,
+} from "@nyx/protocol";
 import type { Config } from "../config/index.js";
 import { buildSessionCookie, clearSessionCookie } from "./cookie.js";
 import { createRequireSession } from "./middleware.js";
@@ -73,6 +78,23 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AuthRouteDeps): v
     const body: AuthVerifyResponse = { address };
     return body;
   });
+
+  // Resume-on-reload (US5 scenario 4 / SC-019): with a live session cookie this
+  // returns the account and slides the expiry (via requireSession) — no wallet.
+  app.get(
+    "/auth/session",
+    { preHandler: requireSession },
+    (request, reply): AuthSessionResponse | { error: string } => {
+      const auth = request.auth;
+      if (auth === null) {
+        // Unreachable: requireSession already 401s a missing session. Defensive.
+        reply.code(401);
+        return { error: "unauthenticated" };
+      }
+      // Re-brand the account (validated at sign-in) as it crosses the wire boundary.
+      return AuthSessionResponseSchema.parse({ address: auth.address });
+    },
+  );
 
   app.post(
     "/auth/logout",
