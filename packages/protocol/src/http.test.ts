@@ -44,6 +44,7 @@ describe("auth DTOs", () => {
         address: "mn_addr_test1qexample",
         signature: "sig-bytes-hex",
         message: "nyx.example wants you to sign in",
+        verifyingKey: "vk-bytes-hex",
       }).success,
     ).toBe(true);
     expect(AuthVerifyResponseSchema.safeParse({ address: "mn_addr_test1qexample" }).success).toBe(
@@ -54,6 +55,16 @@ describe("auth DTOs", () => {
   it("rejects a verify request missing the signature", () => {
     const result = AuthVerifyRequestSchema.safeParse({
       address: "mn_addr_test1qexample",
+      message: "nyx.example wants you to sign in",
+      verifyingKey: "vk-bytes-hex",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a verify request missing the verifying key (needed for the key↔address binding)", () => {
+    const result = AuthVerifyRequestSchema.safeParse({
+      address: "mn_addr_test1qexample",
+      signature: "sig-bytes-hex",
       message: "nyx.example wants you to sign in",
     });
     expect(result.success).toBe(false);
