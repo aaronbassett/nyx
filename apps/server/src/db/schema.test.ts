@@ -41,15 +41,28 @@ async function initialMigration(): Promise<Migration> {
   return first;
 }
 
+async function migrationById(id: number): Promise<Migration> {
+  const migrations = await loadMigrations();
+  const found = migrations.find((migration) => migration.id === id);
+  if (found === undefined) {
+    throw new Error(`migration ${String(id)} not found`);
+  }
+  return found;
+}
+
 describe("migration files (static shape)", () => {
-  it("discovers exactly the initial migration with an up/down pair", async () => {
+  it("discovers the initial schema + the ledger-width migration as up/down pairs", async () => {
     const migrations = await loadMigrations();
-    expect(migrations).toHaveLength(1);
-    const migration = await initialMigration();
-    expect(migration.id).toBe(1);
-    expect(migration.name).toBe("initial_schema");
-    expect(migration.upSql.length).toBeGreaterThan(0);
-    expect(migration.downSql.length).toBeGreaterThan(0);
+    expect(migrations).toHaveLength(2);
+    const [first, second] = migrations;
+    expect(first?.id).toBe(1);
+    expect(first?.name).toBe("initial_schema");
+    expect(second?.id).toBe(2);
+    expect(second?.name).toBe("ledger_amount_width_and_credit_unique");
+    for (const migration of migrations) {
+      expect(migration.upSql.length).toBeGreaterThan(0);
+      expect(migration.downSql.length).toBeGreaterThan(0);
+    }
   });
 
   it("creates every data-model table and drops each one on the way down", async () => {
@@ -77,12 +90,33 @@ describe("migration files (static shape)", () => {
     expect(upSql).toContain("BEFORE TRUNCATE ON ledger_entries");
   });
 
-  it("stores monetary amounts as bigint", async () => {
+  it("declares amounts as bigint initially, widened to numeric(40,0) by 0002 (H1)", async () => {
     const { upSql } = await initialMigration();
+    // 0001 creates the per-deposit amount columns as bigint (the 2^63-1 ceiling 0002 lifts).
     expect(upSql).toMatch(/\bamount\s+bigint\s+NOT NULL/);
     expect(upSql).toMatch(/\bexpected_amount\s+bigint\s+NOT NULL/);
+    // burn accounting is vault-global (not per-deposit) and stays bigint — untouched by 0002.
     expect(upSql).toMatch(/\bburn_amount\s+bigint/);
     expect(upSql).toMatch(/\bdrift\s+bigint/);
+
+    // 0002 widens the three per-deposit amount columns to hold the 2^64-1 mint cap + Σ headroom.
+    const { upSql: widenUp } = await migrationById(2);
+    expect(widenUp).toMatch(/ALTER TABLE ledger_entries ALTER COLUMN amount TYPE numeric\(40, 0\)/);
+    expect(widenUp).toMatch(
+      /ALTER TABLE deposit_refs ALTER COLUMN expected_amount TYPE numeric\(40, 0\)/,
+    );
+    expect(widenUp).toMatch(
+      /ALTER TABLE orphan_deposits ALTER COLUMN amount TYPE numeric\(40, 0\)/,
+    );
+  });
+
+  it("adds a partial unique index for exactly-once deposit credits (H2)", async () => {
+    const { upSql, downSql } = await migrationById(2);
+    expect(upSql).toContain("CREATE UNIQUE INDEX ledger_entries_deposit_credit_ref_key");
+    expect(upSql).toMatch(
+      /ledger_entries_deposit_credit_ref_key\s+ON ledger_entries \(ref\)\s+WHERE kind = 'deposit_credit'/,
+    );
+    expect(downSql).toContain("DROP INDEX ledger_entries_deposit_credit_ref_key");
   });
 
   it("enforces exactly one active deploy per project via a partial unique index", async () => {
@@ -251,6 +285,11 @@ describe.skipIf(!hasLiveDatabase)(
     });
 
     it("reverts cleanly all the way down", async () => {
+      // Two migrations are applied; revert both, newest first (0002 narrows the amount
+      // columns back to bigint — lossless here since the live suite stores only small values).
+      await expect(migrateDown(liveUrl())).resolves.toBe(
+        "0002_ledger_amount_width_and_credit_unique",
+      );
       await expect(migrateDown(liveUrl())).resolves.toBe("0001_initial_schema");
       const { rows } = await db.query<{ table_name: string }>(
         `SELECT table_name FROM information_schema.tables
