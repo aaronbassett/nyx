@@ -4,7 +4,23 @@ import tseslint from "typescript-eslint";
 import prettier from "eslint-config-prettier";
 
 export default tseslint.config(
-  { ignores: ["**/dist/**", "**/build/**", "**/node_modules/**", "pocs/**", ".claude/**"] },
+  {
+    ignores: [
+      "**/dist/**",
+      "**/build/**",
+      "**/node_modules/**",
+      "pocs/**",
+      ".claude/**",
+      // @nyx/nyxt-vault TS imports the Compact-generated contract in build/ (produced
+      // by `compact compile`), so type-aware linting needs the toolchain. The whole
+      // package is toolchain-gated (its typecheck/test guard on `compact` availability),
+      // so exclude its build-dependent TS from the repo-wide lint too; it is linted
+      // locally when the toolchain + generated build are present.
+      "packages/nyxt-vault/src/index.ts",
+      "packages/nyxt-vault/src/witnesses.ts",
+      "packages/nyxt-vault/tests/**",
+    ],
+  },
   js.configs.recommended,
   ...tseslint.configs.strictTypeChecked,
   ...tseslint.configs.stylisticTypeChecked,
