@@ -18,6 +18,8 @@
  * mechanism is what is pinned, not the values.
  */
 import { z } from "zod";
+import { NETWORK_IDS } from "./network.js";
+import type { NetworkProfile } from "./network.js";
 
 /**
  * A NYXT base-unit amount (same units as `@nyx/protocol`'s `NyxtAmount`).
@@ -117,6 +119,18 @@ export const EnvSchema = z.object({
   MCP_MNM_URL: z.string().url("must be a valid URL (mnm docs MCP)"),
   PROVER_URL: z.string().url("must be a valid URL (interim D37 proof server)"),
 
+  // Network profile selection + optional per-field endpoint overrides. The
+  // profile bundles PUBLIC endpoints (node/indexer/proof) + the connector's
+  // `networkId`; overrides repoint a single endpoint without a new profile.
+  NYX_NETWORK: z.enum(NETWORK_IDS).default("local-devnet"),
+  NYX_NODE_URL: z.string().url("must be a valid URL (network node override)").optional(),
+  NYX_INDEXER_URL: z.string().url("must be a valid URL (network indexer override)").optional(),
+  NYX_PROOF_SERVER_URL: z
+    .string()
+    .url("must be a valid URL (network proof-server override)")
+    .optional(),
+  NYX_NETWORK_ID: z.string().min(1, "must be a non-empty networkId override").optional(),
+
   // MCP client tunables (D31: bounded concurrency, no silent timeouts).
   MCP_TIMEOUT_MS: positiveInt.default(10_000),
   MCP_HEALTH_TIMEOUT_MS: positiveInt.default(5_000),
@@ -185,6 +199,13 @@ export interface R2ReadConfig {
   readonly bucket: string | undefined;
 }
 
+/**
+ * Resolved network endpoints (public, non-secret). Alias of {@link NetworkProfile}
+ * so callers can depend on the config-level name; the URLs are endpoints, not
+ * credentials, so this flows into `PublicConfig` and never under `secrets`.
+ */
+export type NetworkConfig = NetworkProfile;
+
 /** Economic + operational tunables (D47/D48/D49/D44/D56). */
 export interface Tunables {
   readonly exchangeRateNyxtPerTnight: NyxtAmount;
@@ -217,6 +238,7 @@ export interface ServerSecrets {
 /** The fully validated, frozen server configuration. */
 export interface Config {
   readonly port: number;
+  readonly network: NetworkConfig;
   readonly mcp: McpConfig;
   readonly prover: ProverConfig;
   readonly r2: R2ReadConfig;

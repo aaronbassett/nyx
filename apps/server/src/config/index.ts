@@ -26,6 +26,7 @@ export type {
   ModelRole,
   ModelRoute,
   ModelRoutingTable,
+  NetworkConfig,
   NyxtAmount,
   ProverConfig,
   PublicConfig,
@@ -33,6 +34,13 @@ export type {
   ServerSecrets,
   Tunables,
 } from "./schema.js";
+export {
+  DEFAULT_NETWORK,
+  NETWORK_IDS,
+  NETWORK_PROFILES,
+  resolveNetworkProfile,
+} from "./network.js";
+export type { NetworkEnv, NetworkProfile } from "./network.js";
 
 /**
  * Project a {@link Config} down to the fields safe to expose beyond the server
@@ -40,6 +48,6 @@ export type {
  * this cannot leak them (constitution III).
  */
 export function publicConfig(config: Config): PublicConfig {
-  const { port, mcp, prover, r2, tunables, modelRouting } = config;
-  return { port, mcp, prover, r2, tunables, modelRouting };
+  const { port, network, mcp, prover, r2, tunables, modelRouting } = config;
+  return { port, network, mcp, prover, r2, tunables, modelRouting };
 }
