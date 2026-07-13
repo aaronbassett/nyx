@@ -1,0 +1,66 @@
+# Nyx local development devnet (Phase 5.5) — the Midnight "integrated local node"
+# stack: node + indexer + proof server, on the exact ports Lace's "Undeployed"
+# network pins (node 9944, proof 6300, indexer 8088) so a Lace wallet set to
+# "Undeployed" and Nyx talk to the SAME chain. Start via `pnpm devnet:up`, which
+# runs the port preflight first and will NOT reuse a devnet it did not start.
+#
+# Source: the midnight-tooling:devnet template (midnight-expert plugin); image
+# tags resolved + verified via that skill (constitution I). DO NOT bump from
+# memory — two load-bearing caps:
+#   - midnight-node       keep < 1.0.0  (1.0.0 is the MAINNET node, not a devnet image)
+#   - indexer-standalone  keep < 4.3.0  (4.3.0+ requires a Blockfrost API key → unusable locally)
+#
+# Dev deploy key: the node's `dev` preset pre-mints NIGHT to a genesis wallet from
+# the well-known seed 0x00...01 (PUBLIC — LOCAL DEVNET ONLY; never on preprod or
+# mainnet). Derive that account + register it for DUST to fund server-side deploys,
+# then set it as the dev DEPLOY_KEY. See README.md.
+
+name: nyx-devnet
+
+services:
+  node:
+    image: midnightntwrk/midnight-node:0.22.5 # cap: < 1.0.0 (1.0.0 = mainnet node)
+    container_name: nyx-devnet-node
+    ports:
+      - "9944:9944" # Lace "Undeployed"-pinned — do not remap
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9944/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    environment:
+      CFG_PRESET: "dev" # pre-mints NIGHT to the genesis seed 0x00...01 (dev only)
+      SIDECHAIN_BLOCK_BENEFICIARY: "04bcf7ad3be7a5c790460be82a713af570f22e0f801f6659ab8e84a52be6969e"
+
+  indexer:
+    image: midnightntwrk/indexer-standalone:4.2.1 # cap: < 4.3.0 (4.3.0+ needs a Blockfrost key)
+    container_name: nyx-devnet-indexer
+    ports:
+      - "8088:8088" # conventional Undeployed indexer — Lace syncs against it, so NOT remapped
+    environment:
+      RUST_LOG: "indexer=info,chain_indexer=info,indexer_api=info,wallet_indexer=info,indexer_common=info,fastrace_opentelemetry=off,info"
+      APP__APPLICATION__NETWORK_ID: "undeployed"
+      APP__INFRA__NODE__URL: "ws://node:9944" # docker-DNS service name, not localhost
+      APP__INFRA__STORAGE__PASSWORD: "indexer" # local devnet only
+      APP__INFRA__PUB_SUB__PASSWORD: "indexer" # local devnet only
+      APP__INFRA__LEDGER_STATE_STORAGE__PASSWORD: "indexer" # local devnet only
+      APP__INFRA__SECRET: "303132333435363738393031323334353637383930313233343536373839303132" # local devnet only
+    healthcheck:
+      test: ["CMD-SHELL", "cat /var/run/indexer-standalone/running"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    depends_on:
+      node:
+        condition: service_healthy
+
+  proof-server:
+    image: midnightntwrk/proof-server:8.1.0
+    container_name: nyx-devnet-proof-server
+    command: ["midnight-proof-server -v"]
+    ports:
+      - "6300:6300" # Lace "Undeployed"-pinned — do not remap
+    environment:
+      RUST_BACKTRACE: "full"

@@ -149,6 +149,12 @@ importers:
         specifier: 4.1.10
         version: 4.1.10(@types/node@26.1.1)(jsdom@29.1.1)(vite@8.1.4(@types/node@26.1.1)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.23.0)(yaml@2.9.0))
 
+  infra:
+    devDependencies:
+      tsx:
+        specifier: ^4.23.0
+        version: 4.23.0
+
   packages/nyxt-vault: {}
 
   packages/protocol:
