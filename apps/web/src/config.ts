@@ -37,8 +37,8 @@ export interface NetworkProfile {
 export const NETWORK_PROFILES = {
   "local-devnet": {
     id: "local-devnet",
-    // TODO(verify T273): confirm the exact "Undeployed" networkId string Lace reports.
-    networkId: "undeployed",
+    // Owner-confirmed (T273): Lace reports "Undeployed" for the Undeployed network.
+    networkId: "Undeployed",
     // Lace-pinned: the local devnet node RPC.
     nodeUrl: "http://localhost:9944",
     // Conventional Undeployed indexer (8088) — Lace syncs against it too, so kept.

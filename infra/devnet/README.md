@@ -66,8 +66,8 @@ are confirmed against the toolchain at wiring, not from memory (constitution I).
 
 ## Owner-gated (T273)
 
-Before relying on the Lace-driven flows (US5 round-trip, US6 deposit, US9 hatch): bring
-the devnet up, point Lace at "Undeployed", and confirm a real-Lace `signData` round-trip.
-Confirm the exact `networkId` string Lace reports for "Undeployed" (currently `"undeployed"`,
-a `TODO(verify)` in the network profiles) and whether Lace exposes an editable indexer
-field or hardcodes `8088`.
+Owner-confirmed against live Lace (2026-07-13): the "Undeployed" `networkId` is
+**`Undeployed`** (now set in the profiles) and Lace's indexer field is **not editable**
+(pinned to `8088`, matching this stack). The one remaining validation is a real-Lace
+`signData` round-trip against the devnet (the US5 Independent Test): bring the devnet up,
+point Lace at "Undeployed", and confirm signing end-to-end.
