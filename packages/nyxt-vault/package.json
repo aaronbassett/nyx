@@ -4,7 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run --passWithNoTests"
+    "compact:build": "compact compile src/nyxt-vault.compact build/nyxt-vault",
+    "compact:check": "compact compile --skip-zk src/nyxt-vault.compact build/nyxt-vault",
+    "typecheck": "if command -v compact >/dev/null 2>&1; then pnpm compact:check && tsc --noEmit; else echo 'nyxt-vault: compact CLI absent - skipping compile+typecheck (SC-024 CI gate is owner-gated; install the Compact toolchain in CI to enable)'; fi",
+    "test": "if command -v compact >/dev/null 2>&1; then pnpm compact:check && vitest run; else echo 'nyxt-vault: compact CLI absent - skipping simulator suite (SC-024 CI gate is owner-gated; install the Compact toolchain in CI to enable)'; fi"
+  },
+  "dependencies": {
+    "@midnight-ntwrk/compact-runtime": "0.16.0"
   }
 }

@@ -1,0 +1,66 @@
+pragma language_version >= 0.23;
+
+import CompactStandardLibrary;
+
+// ── NyxtVault ────────────────────────────────────────────────────────────────
+// The Nyx platform's dogfood deposit contract (US6, decision D45 "Architecture C").
+//
+// One guaranteed-phase circuit, `deposit`, atomically:
+//   1. receives `amount` of unshielded tNIGHT (the native token) into the contract,
+//   2. mints `amount` of the contract's own unshielded fungible token NYXT (1:1)
+//      straight into the contract's own vault (kernel.self()), and
+//   3. records the opaque, orchestrator-issued `depositRef` in public ledger state
+//      so the orchestrator can attribute the deposit off-chain (Compact has no
+//      events and no trustworthy msg.sender — the public record is the only
+//      attribution channel).
+//
+// Duplicate refs are rejected on-chain (idempotency / anti-double-spend guard).
+
+// depositRef  ->  tNIGHT received  (== NYXT minted, 1:1).
+// The value is the on-chain source of truth for the credited amount.
+export ledger deposits: Map<Bytes<32>, Uint<128>>;
+
+// Domain separator for NYXT, this contract's native unshielded fungible token.
+// The token color is deterministic: tokenType(nyxtDomainSep(), kernel.self()).
+pure circuit nyxtDomainSep(): Bytes<32> {
+  return pad(32, "nyx:nyxt:v1");
+}
+
+export circuit deposit(depositRef: Bytes<32>, amount: Uint<128>): [] {
+  // All deposit inputs are public attribution data: the depositRef is written to
+  // public state and the amount drives the public token effects. Disclose each
+  // exactly once, here, then reuse the public bindings downstream.
+  const ref = disclose(depositRef);
+  const amt = disclose(amount);
+
+  // Idempotency / anti-double-spend: a ref may only ever be recorded once.
+  assert(!deposits.member(ref), "NyxtVault: depositRef already present");
+
+  // A deposit must move value; a zero deposit would burn a one-time ref while
+  // crediting nothing.
+  assert(amt > 0, "NyxtVault: amount must be positive");
+
+  // NYXT is minted with a Uint<64> value; cap a single deposit accordingly so the
+  // 1:1 mint stays exact (2^64-1 base units is far above any realistic tNIGHT top-up).
+  assert(amt <= 18446744073709551615, "NyxtVault: amount exceeds per-deposit mint cap");
+
+  // 1. Receive the user's tNIGHT into the contract. tNIGHT is an *external* input
+  //    the user's wallet funds when it balances the transaction, so it must be
+  //    claimed with receiveUnshielded.
+  receiveUnshielded(nativeToken(), amt);
+
+  // 2. Mint NYXT 1:1 straight into the contract's own vault. Minting to
+  //    kernel.self() credits the vault's unshielded balance directly — the
+  //    self-mint IS the deposit into the vault. A trailing receiveUnshielded would
+  //    DOUBLE-COUNT the contract's unshielded input (verified on compiler 0.31.1:
+  //    mint-to-self alone yields input == value; mint-to-self + receive yields
+  //    input == 2*value and overflows at value == 2^64-1).
+  mintUnshieldedToken(
+    nyxtDomainSep(),
+    amt as Uint<64>,
+    left<ContractAddress, UserAddress>(kernel.self()),
+    );
+
+  // 3. Public, append-only attribution record.
+  deposits.insert(ref, amt);
+}
