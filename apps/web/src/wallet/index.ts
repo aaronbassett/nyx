@@ -34,6 +34,7 @@ export type {
   WalletGeneration,
 } from "./types";
 export { buildSiweMessage, logout, requestNonce, resumeSession, signIn } from "./auth";
+export * from "./topup";
 export type {
   Account,
   AuthClientDeps,
