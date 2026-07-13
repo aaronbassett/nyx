@@ -68,7 +68,7 @@ describe("network profile — resolution", () => {
     const config = loadConfig(validEnv());
 
     expect(config.network.id).toBe("local-devnet");
-    expect(config.network.networkId).toBe("undeployed");
+    expect(config.network.networkId).toBe("Undeployed");
     expect(config.network.nodeUrl).toBe("http://localhost:9944");
     expect(config.network.proofServerUrl).toBe("http://localhost:6300");
     expect(config.network.indexerUrl).toBe("http://localhost:8088");
@@ -87,7 +87,7 @@ describe("network profile — resolution", () => {
     // Untouched fields keep the local-devnet defaults.
     expect(config.network.proofServerUrl).toBe("http://localhost:6300");
     expect(config.network.indexerUrl).toBe("http://localhost:8088");
-    expect(config.network.networkId).toBe("undeployed");
+    expect(config.network.networkId).toBe("Undeployed");
   });
 
   it("network URLs flow into the public config (never secret)", () => {

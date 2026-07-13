@@ -42,8 +42,9 @@ export const DEFAULT_NETWORK = "local-devnet";
  */
 const LOCAL_DEVNET: NetworkProfile = {
   id: "local-devnet",
-  // TODO(verify T273): confirm the exact networkId string Lace reports for "Undeployed"
-  networkId: "undeployed",
+  // Owner-confirmed (T273, 2026-07-13): Lace reports "Undeployed" for the Undeployed
+  // network. The wrong-network gate compares this exactly, so the case is load-bearing.
+  networkId: "Undeployed",
   nodeUrl: "http://localhost:9944",
   indexerUrl: "http://localhost:8088",
   proofServerUrl: "http://localhost:6300",
