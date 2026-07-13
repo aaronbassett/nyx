@@ -13,6 +13,8 @@
     "typecheck": "pnpm -r --if-present typecheck",
     "test": "pnpm -r --if-present test",
     "dev": "pnpm -r --if-present --parallel dev",
+    "devnet:up": "tsx infra/devnet/preflight-cli.ts && docker compose -f infra/devnet/docker-compose.yml up",
+    "devnet:down": "docker compose -f infra/devnet/docker-compose.yml down",
     "prepare": "husky"
   },
   "devDependencies": {

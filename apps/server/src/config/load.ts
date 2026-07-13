@@ -8,6 +8,7 @@
 import type { ZodError } from "zod";
 import { ConfigValidationError } from "./errors.js";
 import type { ConfigIssue } from "./errors.js";
+import { resolveNetworkProfile } from "./network.js";
 import { EnvSchema, ModelRoutingTableSchema } from "./schema.js";
 import type { Config, Env, ModelRoutingTable } from "./schema.js";
 
@@ -79,6 +80,7 @@ function deepFreeze<T>(value: T): T {
 function assemble(env: Env, modelRouting: ModelRoutingTable): Config {
   return {
     port: env.PORT,
+    network: resolveNetworkProfile(env),
     mcp: {
       toolchainUrl: env.MCP_TOOLCHAIN_URL,
       tomeUrl: env.MCP_TOME_URL,
