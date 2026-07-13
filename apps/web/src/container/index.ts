@@ -12,6 +12,7 @@ export * from "./ws-client";
 export * from "./boot";
 export * from "./sync";
 export * from "./streams";
+export * from "./testrunner";
 export * from "./env-file";
 export * from "./env";
 export * from "./artifacts";
