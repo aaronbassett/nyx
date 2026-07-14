@@ -212,15 +212,43 @@ export interface TurnCoordinatorDeps {
 }
 
 /**
+ * The turn-observation seam the US8 deploy handler consumes to queue deploys behind an active
+ * turn (EC-40 / FR-058): a deploy must not race an in-flight turn's compile/artifacts, so it
+ * waits for the project's CURRENT turn to settle. The coordinator OWNS this — it is a pure
+ * OBSERVER over the turn loop that never starts, rejects, or otherwise alters a turn. The deploy
+ * handler declares a structurally IDENTICAL `turnGate` shape, so `coordinator.turnGate` wires
+ * straight into `createDeployHandler({ turnGate, … })` with no shared import (both sides couple
+ * on the structure, not a nominal type).
+ */
+export interface TurnGate {
+  /**
+   * Is a real (non-`rejected`) turn currently in flight for `projectId` (D24)? `false` before any
+   * prompt, `true` from the moment a turn begins executing until it settles, `false` again after.
+   * A `rejected` (turn-active) prompt or a project-mismatch never flips it on its own — only a
+   * turn that will actually settle does.
+   */
+  isTurnActive(projectId: string): boolean;
+  /**
+   * Run `fn` once the project is idle: IMMEDIATELY when no turn is in flight, otherwise QUEUED and
+   * fired (FIFO) after the project's current turn settles. Every `fn` is guarded — a throwing
+   * callback is logged loudly and can never break the turn loop or the sibling queued callbacks.
+   */
+  runWhenIdle(projectId: string, fn: () => void): void;
+}
+
+/**
  * The coordinator's public surface. `handlers` is the {@link WsHandlerOptions.handlers}
  * hook the buildServer task passes to `createWsHandler`; `inbox` is exposed so the same
- * task (and tests) can observe/deliver the `test:results` rendezvous directly.
+ * task (and tests) can observe/deliver the `test:results` rendezvous directly; `turnGate`
+ * lets the US8 deploy handler queue deploys behind an active turn (EC-40 / FR-058).
  */
 export interface TurnCoordinator {
   /** Register the coordinator's client→server handlers on a connection's router. */
   readonly handlers: (router: EventRouter) => void;
   /** The `verify:run`/`test:results` rendezvous inbox. */
   readonly inbox: TestResultsInbox;
+  /** The turn-observation seam the US8 deploy handler queues deploys behind (EC-40 / FR-058). */
+  readonly turnGate: TurnGate;
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────────
@@ -408,6 +436,19 @@ interface ProjectTurnState {
   readonly supervisorCtx: SupervisorContext;
   /** The project's CURRENT live connection — swapped on a D40 takeover. */
   liveCtx: ConnectionContext;
+  /**
+   * `true` while a real (non-`rejected`) turn is in flight for this project (EC-40 / FR-058) —
+   * SET when a prompt begins a turn (the project was idle), CLEARED in the run's `finally` when
+   * the turn settles. A `rejected` prompt (the D24 lock already held) never sets it, so the flag
+   * tracks the ONE active turn, never every prompt. Read by {@link TurnGate.isTurnActive}.
+   */
+  turnInFlight: boolean;
+  /**
+   * FIFO queue of idle callbacks (US8 deploys queued behind this turn, EC-40) fired AFTER the
+   * turn's terminal signal. Drained + invoked (each guarded) in the run's `finally`; empty
+   * whenever no turn is in flight. The reference is fixed; only its CONTENTS mutate (push/drain).
+   */
+  readonly idleQueue: (() => void)[];
 }
 
 // ── Factory ──────────────────────────────────────────────────────────────────────
@@ -438,6 +479,19 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
       emit();
     } catch (error) {
       logError("outbound emit failed (dead socket?); continuing the turn", { error });
+    }
+  };
+
+  /**
+   * Invoke one idle callback (a US8 deploy released at turn-idle, EC-40), swallowing a throw so a
+   * faulty deploy callback can NEVER break the turn loop or its sibling queued callbacks. Any
+   * throw is logged LOUDLY (never silently), mirroring {@link safeEmit}'s dead-socket policy.
+   */
+  const runIdleCallback = (fn: () => void): void => {
+    try {
+      fn();
+    } catch (error) {
+      logError("queued idle callback (deploy) threw; continuing the turn loop", { error });
     }
   };
 
@@ -523,6 +577,8 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
     const address = ctx.session.accountAddress;
     const state: ProjectTurnState = {
       liveCtx: ctx,
+      turnInFlight: false,
+      idleQueue: [],
       supervisorCtx: {
         session: { address },
         projectId,
@@ -669,6 +725,16 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
       return;
     }
     const state = projectStateFor(ctx, projectId);
+    // In-flight tracking for the deploy turn-gate (EC-40 / FR-058): this prompt STARTS a turn iff
+    // the project is idle right now. The check-and-claim is synchronous (no await between the read
+    // and the set), so two racing prompts can never both claim; if a turn is already in flight the
+    // supervisor's single-active-turn lock (D24) REJECTS this prompt, so it starts no turn and
+    // must neither set nor clear the flag (a `rejected` outcome owns no in-flight lifecycle). A
+    // project mismatch returned above, so it never reaches — nor flips — the flag either.
+    const startsTurn = !state.turnInFlight;
+    if (startsTurn) {
+      state.turnInFlight = true;
+    }
     try {
       const result = await state.supervisor.handlePrompt(state.supervisorCtx, {
         projectId,
@@ -681,7 +747,39 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
         error,
       });
       await emitTerminalUnlock(state, UNKNOWN_TURN_ID);
+    } finally {
+      if (startsTurn) {
+        // The turn settled — every terminal path (green / exhausted / infra / declined /
+        // insufficient) and the unexpected-throw backstop pass through here. Clear the flag, then
+        // release the deploys queued behind it (EC-40): FIFO, AFTER the terminal signal above, each
+        // guarded so a throwing deploy callback cannot break the turn loop or its siblings. The
+        // queue is DRAINED first so a callback that itself enqueues a deploy defers to a later turn.
+        state.turnInFlight = false;
+        for (const queued of state.idleQueue.splice(0)) {
+          runIdleCallback(queued);
+        }
+      }
     }
+  };
+
+  /**
+   * The turn-observation seam for the US8 deploy handler (EC-40 / FR-058). `isTurnActive` reads
+   * the project's live in-flight flag ({@link ProjectTurnState.turnInFlight}); `runWhenIdle` fires
+   * `fn` IMMEDIATELY when the project is idle (no {@link ProjectTurnState}, or none in flight),
+   * else QUEUES it on the project's `idleQueue` to fire (FIFO, guarded) when the current turn
+   * settles. A pure observer — it never opens, rejects, or otherwise touches a turn.
+   */
+  const turnGate: TurnGate = {
+    isTurnActive: (projectId) => projects.get(projectId)?.turnInFlight === true,
+    runWhenIdle: (projectId, fn) => {
+      const state = projects.get(projectId);
+      // Idle when the project has no state OR no turn in flight → run `fn` now; else queue it.
+      if (state?.turnInFlight !== true) {
+        runIdleCallback(fn);
+        return;
+      }
+      state.idleQueue.push(fn);
+    },
   };
 
   const handlers = (router: EventRouter): void => {
@@ -702,5 +800,5 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
       });
   };
 
-  return { handlers, inbox };
+  return { handlers, inbox, turnGate };
 }

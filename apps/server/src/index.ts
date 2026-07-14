@@ -8,6 +8,7 @@
  * On success: construct the DB handle and MCP clients, wire the Fastify HTTP+WS
  * server, and listen on the validated port.
  */
+import { randomUUID } from "node:crypto";
 import { buildServer } from "./app.js";
 import { createModelRouter } from "./agents/routing.js";
 import { HttpCompileClient } from "./compile/index.js";
@@ -15,6 +16,12 @@ import { ConfigValidationError, loadConfig } from "./config/index.js";
 import type { Config } from "./config/index.js";
 import { providerApiKeys } from "./config/schema.js";
 import { getDb } from "./db/index.js";
+import { createOwnerGatedDeployExecutor } from "./deploy/executor.js";
+import { createDeployHandler } from "./deploy/handler.js";
+import { createDeployPipeline } from "./deploy/pipeline.js";
+import { createDeployRegistry } from "./deploy/registry.js";
+import { createDeployWalletMonitor } from "./deploy/wallet.js";
+import type { WalletAlert } from "./deploy/wallet.js";
 import { createDepositStore, createLedgerStore } from "./ledger/index.js";
 import { createMcpClients } from "./mcp/index.js";
 import { createProjectAuthorizer } from "./projects/authorize.js";
@@ -22,6 +29,26 @@ import { PgChatStore, PgProjectStore } from "./projects/index.js";
 import { createProverClient } from "./prover/index.js";
 import { PgSessionStore, createWsHandler } from "./protocol/index.js";
 import { createTurnCoordinator } from "./turn/coordinator.js";
+
+/**
+ * ⚠️ Owner-gated placeholder (constitution I). The deploy wallet monitors tDUST (D51), which has
+ * NO config tunable yet (`lowBalanceThresholdNyxt` is the USER NYXT low-water mark — wrong units).
+ * Until a tDUST-denominated threshold is added to config, the low-water warn is DISABLED (`0n` =
+ * never "low"); the real operational threshold is owner-gated (never a base-unit magnitude from
+ * memory). `assertCanDeploy` still fails closed on an EMPTY wallet via the per-deploy floor.
+ */
+const DEPLOY_WALLET_LOW_THRESHOLD_TDUST = 0n;
+
+/** Structured, bigint-safe stderr sink for the deploy-wallet balance alerts (FR-059). */
+function logWalletAlert(alert: WalletAlert): void {
+  // `alert` carries its own `level` (`low`/`exhausted`); the log severity is `warn` under a
+  // distinct key so the spread never clobbers it. Bigints (available/threshold) → decimal strings.
+  const line = JSON.stringify(
+    { severity: "warn", source: "deploy-wallet", event: "balance-alert", ...alert },
+    (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value),
+  );
+  process.stderr.write(`${line}\n`);
+}
 
 function loadConfigOrExit(): Config {
   try {
@@ -83,12 +110,62 @@ async function main(): Promise<void> {
     flatReserve: config.tunables.flatReserveNyxt,
   });
 
+  // The US8 deploy loop. All seam construction, no network: the executor, the wallet balance
+  // query, and the latest-green-build lookup are OWNER-GATED / open wiring gaps (flagged below).
+  const deployRegistry = createDeployRegistry(db);
+  // OWNER-GATED (constitution I): the real Midnight-SDK deploy adapter is a stub whose every
+  // method throws — it needs the local devnet + a funded signing credential + mnm-verified SDK
+  // shapes. The signing credential flows ONLY here (D50/constitution III), never client-routed.
+  const deployExecutor = createOwnerGatedDeployExecutor({
+    signingKey: config.secrets.deployKey,
+    network: config.network,
+    proverClient,
+  });
+  const deployWallet = createDeployWalletMonitor({
+    // OWNER-GATED (constitution I): the real tDUST balance read (Midnight SDK/indexer adapter) is
+    // not wired. A rejected query is the loudest "not wired" — `assertCanDeploy` fails closed and
+    // no false balance is ever reported. (Unreached today: `getLatestGreenBuild` rejects first.)
+    queryBalance: () =>
+      Promise.reject(
+        new Error(
+          "owner-gated: deploy-wallet tDUST balance query not wired (needs the SDK/indexer adapter + a funded deploy wallet)",
+        ),
+      ),
+    lowThreshold: DEPLOY_WALLET_LOW_THRESHOLD_TDUST,
+    alert: logWalletAlert,
+  });
+  const deployHandler = createDeployHandler({
+    // Per-request pipeline factory (§2): bind the pipeline's emit sinks to the requesting
+    // connection so its `deploy:status`/`contract:deployed` reach the client that asked to deploy.
+    makePipeline: (sinks) =>
+      createDeployPipeline({
+        executor: deployExecutor,
+        registry: deployRegistry,
+        emit: sinks.emit,
+        emitContractDeployed: sinks.emitContractDeployed,
+      }),
+    // ⚠️ OPEN WIRING GAP: nothing persists the latest green build per project yet. US1's turn loop
+    // produces the `ready` CompileOutcome `urlPrefix` (the green build), but there is no store for
+    // it — so this STUB returns `null` and every deploy fails the FR-054 greenness gate until US1
+    // wires the persisted green build here. Honest failure, never a phantom deploy.
+    getLatestGreenBuild: () => Promise.resolve(null),
+    wallet: deployWallet,
+    // The turn coordinator's turn-observation seam wires straight in (EC-40 / FR-058).
+    turnGate: coordinator.turnGate,
+    newRequestId: () => randomUUID(),
+  });
+
   // Defense 1 (cross-account project-hijack): gate the WS connection on project
   // ownership so a session can only OPEN a socket for a project its account owns (D43).
+  // Both `prompt:submit` (coordinator) and `deploy:request` (deploy handler) register on the ONE
+  // `/ws` router — the WS route takes exactly one handler, so they are combined here.
   const wsHandler = createWsHandler({
     sessionStore,
     config,
-    handlers: coordinator.handlers,
+    handlers: (router) => {
+      coordinator.handlers(router);
+      deployHandler.handlers(router);
+    },
     authorizeProject: createProjectAuthorizer(projectStore),
   });
   const app = await buildServer({
@@ -100,6 +177,8 @@ async function main(): Promise<void> {
     ledgerStore,
     depositStore,
     proverClient,
+    deployRegistry,
+    deployHandler,
   });
 
   await app.listen({ port: config.port, host: "0.0.0.0" });
