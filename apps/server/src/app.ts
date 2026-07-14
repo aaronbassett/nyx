@@ -12,6 +12,9 @@ import { createRequireSession, PgSessionAuthStore, registerAuthRoutes } from "./
 import type { AuthDb, SessionAuthStore } from "./auth/index.js";
 import type { Config } from "./config/index.js";
 import type { Queryable } from "./db/index.js";
+import type { DeployHandler } from "./deploy/handler.js";
+import type { DeployRegistry } from "./deploy/registry.js";
+import { registerDeployRoutes } from "./deploy/routes.js";
 import { registerHealthRoutes } from "./http/health.js";
 import type { DepositStore, LedgerStore } from "./ledger/index.js";
 import { registerLedgerRoutes } from "./ledger/routes.js";
@@ -57,6 +60,21 @@ export interface ServerDeps {
    * session gate, the same-origin `POST /prover/prove` proxy registers behind `requireSession`.
    */
   readonly proverClient?: ProverClient;
+  /**
+   * Optional deploy registry (US8). When present alongside a resolvable project store + a live
+   * session gate, `GET /projects/:id/deploys` registers (behind ownership, SC-027), AND the D49
+   * deletion cascade's contract-teardown seam is back-filled from `teardownProject` (T158/FR-052,
+   * OFF-CHAIN — T155), replacing the US7 no-op stub.
+   */
+  readonly deployRegistry?: Pick<DeployRegistry, "listDeploys" | "teardownProject">;
+  /**
+   * Optional deploy request handler (US8). Its `deploy:request` handler reaches the WS router ONLY
+   * through the COMBINED `wsHandler` (`index.ts` merges `coordinator.handlers` +
+   * `deployHandler.handlers` into the single `/ws` router — the WS route takes exactly one
+   * handler), NOT via a separate registration here. Accepted so the full deploy wiring is
+   * expressed in one `buildServer` call; buildServer only sanity-checks it is reachable.
+   */
+  readonly deployHandler?: DeployHandler;
 }
 
 /** True when `db` can open a transaction (a real `Db`; not the readiness-only stub). */
@@ -113,11 +131,37 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
 
     const projectStore = resolveProjectStore(deps);
     if (projectStore !== undefined) {
-      registerProjectRoutes(app, {
-        store: projectStore,
-        requireSession,
-        cascade: deps.projectCascade ?? createDeletionCascade(),
-      });
+      // D49 deletion cascade: an injected cascade wins; otherwise build the default and BACK-FILL
+      // the T158/FR-052 contract-teardown seam from the deploy registry (OFF-CHAIN — T155: flip
+      // the project's live deploy rows to `torn_down`; the on-chain contracts persist). Replaces
+      // the US7 no-op stub. With no registry the teardown stays a no-op (nothing to tear down).
+      const deployRegistry = deps.deployRegistry;
+      const cascade =
+        deps.projectCascade ??
+        createDeletionCascade(
+          deployRegistry === undefined
+            ? {}
+            : {
+                teardownContracts: async (projectId: string): Promise<void> => {
+                  await deployRegistry.teardownProject(projectId);
+                },
+              },
+        );
+      registerProjectRoutes(app, { store: projectStore, requireSession, cascade });
+
+      // Deploy reads (US8): `GET /projects/:id/deploys`, behind the same session gate + ownership.
+      // Registers only when BOTH the registry and a project store are present — ownership resolves
+      // through the store (SC-027 fail-closed), so a deploy list is never served unauthorized.
+      if (deployRegistry !== undefined) {
+        registerDeployRoutes(app, {
+          registry: deployRegistry,
+          requireSession,
+          resolveOwnedProject: async (id, address) => {
+            const project = await projectStore.getProject(id);
+            return project?.ownerAddress === address;
+          },
+        });
+      }
     }
 
     // Ledger + deposit routes need BOTH stores; register only when both are injected
@@ -140,6 +184,16 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     registerWs(app, "/ws");
   } else {
     registerWs(app, "/ws", deps.wsHandler);
+  }
+
+  // The deploy WS handler is only reachable through the COMBINED `wsHandler` (index.ts merges it
+  // with the turn coordinator's handlers onto the single `/ws` router). A `deployHandler` supplied
+  // WITHOUT a `wsHandler` would mean `deploy:request` is never registered — surface that loudly
+  // (never silently) rather than let it be a silent gap.
+  if (deps.deployHandler !== undefined && deps.wsHandler === undefined) {
+    app.log.warn(
+      "deployHandler supplied without a wsHandler; deploy:request will not be registered",
+    );
   }
 
   return app;

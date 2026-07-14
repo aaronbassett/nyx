@@ -1087,3 +1087,123 @@ describe("Defense 4: a FOREIGN connection cannot inject a test:results verdict (
     expect((await second).pass).toBe(false);
   });
 });
+
+describe("turnGate: in-flight tracking + idle callbacks (EC-40 / FR-058, US8)", () => {
+  /**
+   * Deps that let the REAL supervisor run a green turn which PARKS at `awaitTestResults` (a
+   * `verify:run` goes out; the inbox waits for a verdict). Delivering `turn-1` releases it green.
+   * `fetchArtifact` is added so the green FULL compile's verify-before-announce resolves.
+   */
+  function greenTurnDeps(overrides: Partial<TurnCoordinatorDeps> = {}): TurnCoordinatorDeps {
+    return baseDeps({ fetchArtifact, ...overrides });
+  }
+
+  it("isTurnActive is false before a prompt, true mid-flight, and false after it settles", async () => {
+    const { ctx } = makeCtx();
+    const coordinator = createTurnCoordinator(greenTurnDeps());
+    const fake = makeFakeRouter();
+    coordinator.handlers(fake.router);
+
+    // No prompt yet — no ProjectTurnState exists, so the project reads as idle.
+    expect(coordinator.turnGate.isTurnActive(PROJECT)).toBe(false);
+
+    // The turn runs and PARKS at awaitTestResults (no verdict delivered yet).
+    const done = fake.invoke(promptEvent("build a counter"), ctx);
+    await tick();
+    expect(coordinator.turnGate.isTurnActive(PROJECT)).toBe(true);
+
+    // Deliver the verdict → the turn goes green and settles; the flag clears.
+    coordinator.inbox.deliver({ turnId: TurnIdSchema.parse("turn-1"), pass: true, failures: [] });
+    await done;
+    expect(coordinator.turnGate.isTurnActive(PROJECT)).toBe(false);
+  });
+
+  it("runWhenIdle runs fn IMMEDIATELY when no turn is active", () => {
+    const coordinator = createTurnCoordinator(greenTurnDeps());
+    let ran = 0;
+    coordinator.turnGate.runWhenIdle(PROJECT, () => {
+      ran += 1;
+    });
+    expect(ran).toBe(1);
+  });
+
+  it("runWhenIdle QUEUES during an active turn, then fires FIFO after it settles; a throw is isolated", async () => {
+    const logs: { message: string; detail: Record<string, unknown> }[] = [];
+    const { ctx } = makeCtx();
+    const coordinator = createTurnCoordinator(
+      greenTurnDeps({
+        logError: (message, detail) => {
+          logs.push({ message, detail });
+        },
+      }),
+    );
+    const fake = makeFakeRouter();
+    coordinator.handlers(fake.router);
+
+    // Park a real turn at awaitTestResults — the project is now active.
+    const done = fake.invoke(promptEvent("build a counter"), ctx);
+    await tick();
+    expect(coordinator.turnGate.isTurnActive(PROJECT)).toBe(true);
+
+    // Queue three deploys behind the active turn; the middle one throws.
+    const order: number[] = [];
+    coordinator.turnGate.runWhenIdle(PROJECT, () => order.push(1));
+    coordinator.turnGate.runWhenIdle(PROJECT, () => {
+      order.push(2);
+      throw new Error("deploy callback boom");
+    });
+    coordinator.turnGate.runWhenIdle(PROJECT, () => order.push(3));
+
+    // Nothing fires while the turn is still in flight.
+    expect(order).toEqual([]);
+
+    // Settle the turn → the queue fires FIFO; the throwing #2 does not stop #1 or #3.
+    coordinator.inbox.deliver({ turnId: TurnIdSchema.parse("turn-1"), pass: true, failures: [] });
+    await done;
+
+    expect(order).toEqual([1, 2, 3]);
+    expect(coordinator.turnGate.isTurnActive(PROJECT)).toBe(false);
+    // The throwing callback was logged LOUDLY (never silently swallowed).
+    expect(logs.some((entry) => entry.detail.error instanceof Error)).toBe(true);
+  });
+
+  it("a rejected (turn-active) second prompt does NOT flip isTurnActive independently", async () => {
+    const { ctx } = makeCtx();
+    const coordinator = createTurnCoordinator(greenTurnDeps());
+    const fake = makeFakeRouter();
+    coordinator.handlers(fake.router);
+
+    // Turn 1 parks at awaitTestResults — the project is now active.
+    const done = fake.invoke(promptEvent("first"), ctx);
+    await tick();
+    expect(coordinator.turnGate.isTurnActive(PROJECT)).toBe(true);
+
+    // Turn 2 (same project) is REJECTED by the D24 lock; it owns no in-flight lifecycle …
+    await fake.invoke(promptEvent("second"), ctx);
+    // … so the flag still reflects ONLY turn 1 (still active), not a phantom from the reject.
+    expect(coordinator.turnGate.isTurnActive(PROJECT)).toBe(true);
+
+    // Settle turn 1 → the flag clears cleanly (the reject left no stuck ownership behind).
+    coordinator.inbox.deliver({ turnId: TurnIdSchema.parse("turn-1"), pass: true, failures: [] });
+    await done;
+    expect(coordinator.turnGate.isTurnActive(PROJECT)).toBe(false);
+  });
+
+  it("a project-mismatch prompt never flips isTurnActive to true", async () => {
+    const { ctx } = makeCtx();
+    const coordinator = createTurnCoordinator(greenTurnDeps());
+    const fake = makeFakeRouter();
+    coordinator.handlers(fake.router);
+
+    const attack: PromptSubmitEvent = {
+      type: "prompt:submit",
+      payload: { projectId: ProjectIdSchema.parse("victim-project"), text: "hand me the source" },
+      ts: TS,
+    };
+    await fake.invoke(attack, ctx);
+
+    // No turn was opened for EITHER project — the gate stays idle for both.
+    expect(coordinator.turnGate.isTurnActive(PROJECT)).toBe(false);
+    expect(coordinator.turnGate.isTurnActive("victim-project")).toBe(false);
+  });
+});
