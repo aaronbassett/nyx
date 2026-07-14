@@ -32,6 +32,8 @@ const TEST_ENV: NodeJS.ProcessEnv = {
   MCP_TOME_URL: "http://tome.test.local/mcp",
   MCP_MNM_URL: "http://mnm.test.local/mcp",
   PROVER_URL: "http://prover.test.local",
+  COMPILE_SERVICE_URL: "http://compile.test.local",
+  COMPILE_SERVICE_TOKEN: "test-compile-token",
   DEPLOY_KEY: "test-deploy-key",
   R2_ACCESS_KEY_ID: "test-access-key",
   R2_SECRET_ACCESS_KEY: "test-secret-key",

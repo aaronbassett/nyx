@@ -118,6 +118,9 @@ export const EnvSchema = z.object({
   MCP_TOME_URL: z.string().url("must be a valid URL (Tome skill-routing MCP)"),
   MCP_MNM_URL: z.string().url("must be a valid URL (mnm docs MCP)"),
   PROVER_URL: z.string().url("must be a valid URL (interim D37 proof server)"),
+  COMPILE_SERVICE_URL: z
+    .string()
+    .url("must be a valid URL (HTTP Compile Service base URL, US2 glue layer)"),
 
   // Network profile selection + optional per-field endpoint overrides. The
   // profile bundles PUBLIC endpoints (node/indexer/proof) + the connector's
@@ -143,9 +146,27 @@ export const EnvSchema = z.object({
   // Server-only secrets — presence validated; NEVER routed to a client surface.
   // (DATABASE_URL, validated above, is also secret and lives under `secrets`.)
   DEPLOY_KEY: z.string().min(1, "must be present (server-only deploy key, D52)"),
+  COMPILE_SERVICE_TOKEN: z
+    .string()
+    .min(1, "must be present (server-only Compile Service bearer token, constitution III)"),
   R2_ACCESS_KEY_ID: z.string().min(1, "must be present (server-only R2 write credential)"),
   R2_SECRET_ACCESS_KEY: z.string().min(1, "must be present (server-only R2 write credential)"),
   R2_ACCOUNT_ID: z.string().min(1, "must be present (server-only R2 account id)"),
+
+  // Per-provider LLM API keys (D19 model routing). OPTIONAL server-only secrets:
+  // a deployment supplies a key only for the providers its MODEL_ROUTING table
+  // actually uses, and the routing loader (agents/routing.ts) fails fast at
+  // construction if a routed provider's key is missing. `GOOGLE_API_KEY` backs the
+  // `gemini` provider; `OPENAI_COMPATIBLE_API_KEY` is optional even in use (a local
+  // vLLM/Ollama endpoint may need none). `.min(1)` rejects an explicitly empty key.
+  OPENAI_API_KEY: z.string().min(1, "must be a non-empty OpenAI API key").optional(),
+  ANTHROPIC_API_KEY: z.string().min(1, "must be a non-empty Anthropic API key").optional(),
+  GOOGLE_API_KEY: z.string().min(1, "must be a non-empty Google (gemini) API key").optional(),
+  OPENROUTER_API_KEY: z.string().min(1, "must be a non-empty OpenRouter API key").optional(),
+  OPENAI_COMPATIBLE_API_KEY: z
+    .string()
+    .min(1, "must be a non-empty OpenAI-compatible API key")
+    .optional(),
 
   // Model routing table (D19) — JSON, required; body validated in load.ts.
   MODEL_ROUTING: z
@@ -193,6 +214,17 @@ export interface ProverConfig {
   readonly tokenLifetimeMs: number;
 }
 
+/**
+ * HTTP Compile Service config (US2 glue layer, `infra/compile-service/API.md`).
+ * The service is the ONLY holder of R2 write credentials; Nyx drives it over
+ * bearer auth and only READS R2 (constitution III). The `url` is a server-internal
+ * endpoint — never client-bound (kept out of {@link PublicConfig}) — while the
+ * bearer token is a server-only secret under {@link ServerSecrets}.
+ */
+export interface CompileServiceConfig {
+  readonly url: string;
+}
+
 /** R2 read-side placeholders (public, non-secret). */
 export interface R2ReadConfig {
   readonly publicBaseUrl: string | undefined;
@@ -230,9 +262,25 @@ export interface Tunables {
 export interface ServerSecrets {
   readonly databaseUrl: string;
   readonly deployKey: string;
+  /** Bearer token for the HTTP Compile Service; server-only, like {@link ServerSecrets.deployKey}. */
+  readonly compileServiceToken: string;
   readonly r2AccessKeyId: string;
   readonly r2SecretAccessKey: string;
   readonly r2AccountId: string;
+  /**
+   * Per-provider LLM API keys for the D19 model-routing loader — all OPTIONAL:
+   * a key is present only for providers a deployment's `MODEL_ROUTING` actually
+   * routes to (the loader fails fast if a routed provider's key is absent).
+   * Server-only like {@link ServerSecrets.deployKey}; NEVER a client/`VITE_`
+   * surface. Project them into the loader's shape with {@link providerApiKeys}.
+   */
+  readonly openaiApiKey?: string;
+  readonly anthropicApiKey?: string;
+  /** Backs the `gemini` provider (env var `GOOGLE_API_KEY`). */
+  readonly googleApiKey?: string;
+  readonly openrouterApiKey?: string;
+  /** Optional even when the `openai-compatible` provider is used (local vLLM/Ollama). */
+  readonly openaiCompatibleApiKey?: string;
 }
 
 /** The fully validated, frozen server configuration. */
@@ -241,11 +289,73 @@ export interface Config {
   readonly network: NetworkConfig;
   readonly mcp: McpConfig;
   readonly prover: ProverConfig;
+  readonly compileService: CompileServiceConfig;
   readonly r2: R2ReadConfig;
   readonly tunables: Tunables;
   readonly modelRouting: ModelRoutingTable;
   readonly secrets: ServerSecrets;
 }
 
-/** Config view safe to expose beyond the server boundary — secrets omitted. */
-export type PublicConfig = Omit<Config, "secrets">;
+/**
+ * Config view safe to expose beyond the server boundary. `secrets` is dropped
+ * (constitution III); `compileService` is dropped too — its URL is a
+ * server-internal endpoint consumed only by the orchestrator (like the bearer
+ * token, it never becomes a client/`VITE_` surface).
+ */
+export type PublicConfig = Omit<Config, "secrets" | "compileService">;
+
+// ── Model-routing credential projection ──────────────────────────────────────
+
+/**
+ * Per-provider LLM API keys in exactly the shape the model-routing loader
+ * consumes (`agents/routing.ts` `ModelApiKeys`, fed to `createModelRouter({
+ * apiKeys })`). It is declared structurally HERE, rather than imported, on
+ * purpose: `agents/routing.ts` already imports this module, so a back-edge from
+ * config → agents would cycle. This interface is the deliberate structural
+ * bridge — `providerApiKeys(secrets)` is assignable to the loader's `apiKeys`
+ * parameter. Every key is optional (see {@link ServerSecrets}).
+ */
+export interface ProviderApiKeys {
+  readonly anthropic?: string;
+  readonly openai?: string;
+  /** The `gemini` provider's key (from `GOOGLE_API_KEY`). */
+  readonly google?: string;
+  readonly openrouter?: string;
+  readonly openaiCompatible?: string;
+}
+
+/**
+ * Project {@link ServerSecrets} down to the {@link ProviderApiKeys} the D19
+ * routing loader expects, keeping the US1 wiring DRY:
+ * `createModelRouter({ apiKeys: providerApiKeys(config.secrets) })`.
+ *
+ * `GOOGLE_API_KEY` (`secrets.googleApiKey`) backs the `gemini` provider. Every
+ * UNSET key is OMITTED from the result — never emitted as an `undefined`-valued
+ * entry — so the loader's "does this provider have a key?" test is a plain
+ * presence check and `exactOptionalPropertyTypes` stays satisfied.
+ */
+export function providerApiKeys(secrets: ServerSecrets): ProviderApiKeys {
+  const keys: {
+    anthropic?: string;
+    openai?: string;
+    google?: string;
+    openrouter?: string;
+    openaiCompatible?: string;
+  } = {};
+  if (secrets.anthropicApiKey !== undefined) {
+    keys.anthropic = secrets.anthropicApiKey;
+  }
+  if (secrets.openaiApiKey !== undefined) {
+    keys.openai = secrets.openaiApiKey;
+  }
+  if (secrets.googleApiKey !== undefined) {
+    keys.google = secrets.googleApiKey;
+  }
+  if (secrets.openrouterApiKey !== undefined) {
+    keys.openrouter = secrets.openrouterApiKey;
+  }
+  if (secrets.openaiCompatibleApiKey !== undefined) {
+    keys.openaiCompatible = secrets.openaiCompatibleApiKey;
+  }
+  return keys;
+}

@@ -8,6 +8,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { ConfigValidationError, loadConfig, publicConfig } from "./index.js";
+import { providerApiKeys } from "./schema.js";
 
 interface TestRoute {
   provider: string;
@@ -42,7 +43,9 @@ function validEnv(overrides: Record<string, string | undefined> = {}): NodeJS.Pr
     MCP_TOME_URL: "https://tome.example/mcp",
     MCP_MNM_URL: "https://mnm.example/mcp",
     PROVER_URL: "https://prover.example",
+    COMPILE_SERVICE_URL: "https://compile.internal/v1",
     DEPLOY_KEY: "deploy-secret-value",
+    COMPILE_SERVICE_TOKEN: "compile-service-secret-token",
     R2_ACCESS_KEY_ID: "r2-access-key",
     R2_SECRET_ACCESS_KEY: "r2-secret-key",
     R2_ACCOUNT_ID: "r2-account-id",
@@ -87,6 +90,11 @@ describe("loadConfig — valid env", () => {
     expect(Object.isFrozen(config.modelRouting)).toBe(true);
   });
 
+  it("carries the Compile Service base URL as a public (non-secret) field", () => {
+    const config = loadConfig(validEnv());
+    expect(config.compileService.url).toBe("https://compile.internal/v1");
+  });
+
   it("applies env overrides over defaults (numbers, bigints, urls)", () => {
     const config = loadConfig(
       validEnv({
@@ -111,16 +119,109 @@ describe("loadConfig — valid env", () => {
   it("carries server-only secrets but keeps them out of publicConfig", () => {
     const config = loadConfig(validEnv());
     expect(config.secrets.deployKey).toBe("deploy-secret-value");
+    expect(config.secrets.compileServiceToken).toBe("compile-service-secret-token");
     expect(config.secrets.databaseUrl).toContain("postgres://");
 
     const pub = publicConfig(config);
     expect("secrets" in pub).toBe(false);
+    // The Compile Service endpoint is server-internal; it never crosses the
+    // server boundary (constitution III), so it is absent from publicConfig too.
+    expect("compileService" in pub).toBe(false);
     // bigint tunables are not JSON-serializable; stringify them for the scan.
     const serialized = JSON.stringify(pub, (_key, value: unknown) =>
       typeof value === "bigint" ? value.toString() : value,
     );
     expect(serialized).not.toContain("deploy-secret-value");
+    expect(serialized).not.toContain("compile-service-secret-token");
     expect(serialized).not.toContain("r2-secret-key");
+  });
+
+  it("carries supplied per-provider LLM API keys, leaving unset ones undefined", () => {
+    const config = loadConfig(
+      validEnv({
+        OPENAI_API_KEY: "sk-openai",
+        ANTHROPIC_API_KEY: "sk-anthropic",
+        GOOGLE_API_KEY: "sk-google",
+        // OPENROUTER_API_KEY + OPENAI_COMPATIBLE_API_KEY intentionally absent.
+      }),
+    );
+    expect(config.secrets.openaiApiKey).toBe("sk-openai");
+    expect(config.secrets.anthropicApiKey).toBe("sk-anthropic");
+    expect(config.secrets.googleApiKey).toBe("sk-google");
+    expect(config.secrets.openrouterApiKey).toBeUndefined();
+    expect(config.secrets.openaiCompatibleApiKey).toBeUndefined();
+  });
+
+  it("leaves every provider API key undefined when none are supplied (optional secrets)", () => {
+    const config = loadConfig(validEnv());
+    expect(config.secrets.openaiApiKey).toBeUndefined();
+    expect(config.secrets.anthropicApiKey).toBeUndefined();
+    expect(config.secrets.googleApiKey).toBeUndefined();
+    expect(config.secrets.openrouterApiKey).toBeUndefined();
+    expect(config.secrets.openaiCompatibleApiKey).toBeUndefined();
+  });
+
+  it("keeps provider API keys out of publicConfig (server-only, constitution III)", () => {
+    const config = loadConfig(
+      validEnv({
+        OPENAI_API_KEY: "sk-openai-leak",
+        ANTHROPIC_API_KEY: "sk-anthropic-leak",
+        GOOGLE_API_KEY: "sk-google-leak",
+        OPENROUTER_API_KEY: "sk-openrouter-leak",
+        OPENAI_COMPATIBLE_API_KEY: "sk-compat-leak",
+      }),
+    );
+    const pub = publicConfig(config);
+    expect("secrets" in pub).toBe(false);
+    const serialized = JSON.stringify(pub, (_key, value: unknown) =>
+      typeof value === "bigint" ? value.toString() : value,
+    );
+    expect(serialized).not.toContain("sk-openai-leak");
+    expect(serialized).not.toContain("sk-anthropic-leak");
+    expect(serialized).not.toContain("sk-google-leak");
+    expect(serialized).not.toContain("sk-openrouter-leak");
+    expect(serialized).not.toContain("sk-compat-leak");
+  });
+});
+
+describe("providerApiKeys — routing-loader credential mapping", () => {
+  it("maps each supplied secret to its ModelApiKeys provider id", () => {
+    const config = loadConfig(
+      validEnv({
+        OPENAI_API_KEY: "k-openai",
+        ANTHROPIC_API_KEY: "k-anthropic",
+        GOOGLE_API_KEY: "k-google",
+        OPENROUTER_API_KEY: "k-openrouter",
+        OPENAI_COMPATIBLE_API_KEY: "k-compat",
+      }),
+    );
+    expect(providerApiKeys(config.secrets)).toEqual({
+      anthropic: "k-anthropic",
+      openai: "k-openai",
+      google: "k-google",
+      openrouter: "k-openrouter",
+      openaiCompatible: "k-compat",
+    });
+  });
+
+  it("backs the gemini provider with GOOGLE_API_KEY", () => {
+    const config = loadConfig(validEnv({ GOOGLE_API_KEY: "k-google" }));
+    expect(providerApiKeys(config.secrets).google).toBe("k-google");
+  });
+
+  it("omits providers whose key is unset (no undefined-valued entries)", () => {
+    const config = loadConfig(validEnv({ ANTHROPIC_API_KEY: "k-anthropic" }));
+    const keys = providerApiKeys(config.secrets);
+    expect(keys).toEqual({ anthropic: "k-anthropic" });
+    expect("openai" in keys).toBe(false);
+    expect("google" in keys).toBe(false);
+    expect("openrouter" in keys).toBe(false);
+    expect("openaiCompatible" in keys).toBe(false);
+  });
+
+  it("returns an empty object when no provider keys are supplied", () => {
+    const config = loadConfig(validEnv());
+    expect(providerApiKeys(config.secrets)).toEqual({});
   });
 });
 
@@ -141,6 +242,21 @@ describe("loadConfig — invalid env (DS-003 fail-fast)", () => {
     expect(vars).toContain("MCP_TOME_URL");
     expect(vars).toContain("PORT");
     expect(vars).toContain("FLAT_RESERVE");
+  });
+
+  it("names COMPILE_SERVICE_URL when the Compile Service base URL is missing", () => {
+    const vars = issuesFor(validEnv({ COMPILE_SERVICE_URL: undefined }));
+    expect(vars).toContain("COMPILE_SERVICE_URL");
+  });
+
+  it("names COMPILE_SERVICE_URL when the Compile Service base URL is not a URL", () => {
+    const vars = issuesFor(validEnv({ COMPILE_SERVICE_URL: "not-a-url" }));
+    expect(vars).toContain("COMPILE_SERVICE_URL");
+  });
+
+  it("names COMPILE_SERVICE_TOKEN when the server-only bearer token is absent", () => {
+    const vars = issuesFor(validEnv({ COMPILE_SERVICE_TOKEN: undefined }));
+    expect(vars).toContain("COMPILE_SERVICE_TOKEN");
   });
 
   it("names all server-only secrets when absent (zero-trust presence check)", () => {
