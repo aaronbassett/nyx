@@ -2,6 +2,7 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 
 import {
   ClientToServerEventSchema,
+  encodeTurnSettledEvent,
   parseClientToServerEvent,
   parseEvent,
   parseServerToClientEvent,
@@ -55,7 +56,7 @@ const serverToClientFixtures: Fixture[] = [
     name: "turn:settled (negative balance allowed on overage)",
     event: {
       type: "turn:settled",
-      payload: { turnId: "turn-1", consumed: 250n, balance: -50n },
+      payload: { turnId: "turn-1", consumed: "250", balance: "-50" },
       ts,
     },
   },
@@ -70,6 +71,10 @@ const serverToClientFixtures: Fixture[] = [
       payload: { turnId: "turn-1", role: "assistant", delta: "Sure — " },
       ts,
     },
+  },
+  {
+    name: "verify:run",
+    event: { type: "verify:run", payload: { turnId: "turn-1" }, ts },
   },
   {
     name: "deploy:status (optional detail omitted)",
@@ -89,14 +94,14 @@ const serverToClientFixtures: Fixture[] = [
       type: "ledger:update",
       payload: {
         entry: {
-          id: 42n,
+          id: "42",
           accountAddress: "mn_addr_test1qexample",
           kind: "deposit_credit",
-          amount: 1_000n,
+          amount: "1000",
           ref: "dep-1",
         },
-        available: 1_000n,
-        reserved: 0n,
+        available: "1000",
+        reserved: "0",
       },
       ts,
     },
@@ -186,6 +191,15 @@ describe("ServerToClientEventSchema", () => {
     const result = ServerToClientEventSchema.safeParse({
       type: "turn:settled",
       payload: { turnId: "turn-1", consumed: 250, balance: 750 },
+      ts,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a verify:run missing its turnId", () => {
+    const result = ServerToClientEventSchema.safeParse({
+      type: "verify:run",
+      payload: {},
       ts,
     });
     expect(result.success).toBe(false);
@@ -293,15 +307,20 @@ describe("parse helpers", () => {
 });
 
 describe("type inference round-trip", () => {
-  it("a value built from inferred types parses back to the same type", () => {
+  it("a bigint-typed event encodes, serializes, and decodes back to bigints", () => {
+    // The decode schema takes string money on the wire but yields `bigint` in code,
+    // so a domain-typed event cannot be `.parse()`d directly — it must be encoded first.
     const event: TurnSettledEvent = {
       type: "turn:settled",
       payload: { turnId: TurnIdSchema.parse("turn-1"), consumed: 5n, balance: 10n },
       ts,
     };
-    const parsed = TurnSettledEventSchema.parse(event);
+    const parsed = TurnSettledEventSchema.parse(
+      JSON.parse(JSON.stringify(encodeTurnSettledEvent(event))),
+    );
     expectTypeOf(parsed).toEqualTypeOf<TurnSettledEvent>();
     expect(parsed.payload.consumed).toBe(5n);
+    expect(parsed.payload.balance).toBe(10n);
   });
 
   it("individual event types are assignable to their direction's union only", () => {

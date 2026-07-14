@@ -10,7 +10,7 @@ import { ConfigValidationError } from "./errors.js";
 import type { ConfigIssue } from "./errors.js";
 import { resolveNetworkProfile } from "./network.js";
 import { EnvSchema, ModelRoutingTableSchema } from "./schema.js";
-import type { Config, Env, ModelRoutingTable } from "./schema.js";
+import type { Config, Env, ModelRoutingTable, ServerSecrets } from "./schema.js";
 
 /** Treat empty / whitespace-only env values as unset so defaults apply. */
 function normalizeEnv(env: NodeJS.ProcessEnv): Record<string, unknown> {
@@ -77,6 +77,30 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
+/**
+ * Assemble the server-only {@link ServerSecrets}, including the OPTIONAL
+ * per-provider LLM API keys (D19). Each absent key is OMITTED via conditional
+ * spread — never assigned `undefined` — so `exactOptionalPropertyTypes` holds and
+ * {@link providerApiKeys} sees a plain presence signal.
+ */
+function assembleSecrets(env: Env): ServerSecrets {
+  return {
+    databaseUrl: env.DATABASE_URL,
+    deployKey: env.DEPLOY_KEY,
+    compileServiceToken: env.COMPILE_SERVICE_TOKEN,
+    r2AccessKeyId: env.R2_ACCESS_KEY_ID,
+    r2SecretAccessKey: env.R2_SECRET_ACCESS_KEY,
+    r2AccountId: env.R2_ACCOUNT_ID,
+    ...(env.OPENAI_API_KEY !== undefined ? { openaiApiKey: env.OPENAI_API_KEY } : {}),
+    ...(env.ANTHROPIC_API_KEY !== undefined ? { anthropicApiKey: env.ANTHROPIC_API_KEY } : {}),
+    ...(env.GOOGLE_API_KEY !== undefined ? { googleApiKey: env.GOOGLE_API_KEY } : {}),
+    ...(env.OPENROUTER_API_KEY !== undefined ? { openrouterApiKey: env.OPENROUTER_API_KEY } : {}),
+    ...(env.OPENAI_COMPATIBLE_API_KEY !== undefined
+      ? { openaiCompatibleApiKey: env.OPENAI_COMPATIBLE_API_KEY }
+      : {}),
+  };
+}
+
 function assemble(env: Env, modelRouting: ModelRoutingTable): Config {
   return {
     port: env.PORT,
@@ -93,6 +117,9 @@ function assemble(env: Env, modelRouting: ModelRoutingTable): Config {
       url: env.PROVER_URL,
       rateLimit: { max: env.PROVER_RATE_LIMIT_MAX, windowMs: env.PROVER_RATE_LIMIT_WINDOW_MS },
       tokenLifetimeMs: env.PROVING_TOKEN_LIFETIME_MS,
+    },
+    compileService: {
+      url: env.COMPILE_SERVICE_URL,
     },
     r2: {
       publicBaseUrl: env.R2_PUBLIC_BASE_URL,
@@ -113,13 +140,7 @@ function assemble(env: Env, modelRouting: ModelRoutingTable): Config {
       sessionLifetimeMs: env.SESSION_LIFETIME_MS,
     },
     modelRouting,
-    secrets: {
-      databaseUrl: env.DATABASE_URL,
-      deployKey: env.DEPLOY_KEY,
-      r2AccessKeyId: env.R2_ACCESS_KEY_ID,
-      r2SecretAccessKey: env.R2_SECRET_ACCESS_KEY,
-      r2AccountId: env.R2_ACCOUNT_ID,
-    },
+    secrets: assembleSecrets(env),
   };
 }
 

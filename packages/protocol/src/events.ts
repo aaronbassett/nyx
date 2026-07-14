@@ -12,11 +12,14 @@
  */
 import { z } from "zod";
 
-import { LedgerEntrySchema } from "./entities.js";
+import { encodeLedgerEntry, LedgerEntrySchema } from "./entities.js";
+import type { LedgerEntryWire } from "./entities.js";
 import {
   ContractAddressSchema,
+  encodeNyxtAmount,
   FilePathSchema,
   NyxtAmountSchema,
+  NyxtSignedAmountSchema,
   ProjectIdSchema,
   TimestampMsSchema,
   TurnIdSchema,
@@ -92,17 +95,39 @@ export const TurnActivityEventSchema = eventSchema("turn:activity", TurnActivity
 export type TurnActivityEvent = z.infer<typeof TurnActivityEventSchema>;
 
 /**
- * `turn:settled` — ledger UI update (FR-071). `balance` is the available
- * balance after settlement; may be negative on final-cycle overage (D34).
+ * `turn:settled` — ledger UI update (FR-071). `consumed` is a non-negative
+ * spend; `balance` is the available balance after settlement and may be
+ * negative on final-cycle overage (D34). Both are decimal strings on the wire.
  */
 export const TurnSettledPayloadSchema = z.object({
   turnId: TurnIdSchema,
   consumed: NyxtAmountSchema,
-  balance: NyxtAmountSchema,
+  balance: NyxtSignedAmountSchema,
 });
 export type TurnSettledPayload = z.infer<typeof TurnSettledPayloadSchema>;
 export const TurnSettledEventSchema = eventSchema("turn:settled", TurnSettledPayloadSchema);
 export type TurnSettledEvent = z.infer<typeof TurnSettledEventSchema>;
+
+/** JSON-wire form of {@link TurnSettledPayload}: money fields are decimal strings. */
+export type TurnSettledPayloadWire = Omit<TurnSettledPayload, "consumed" | "balance"> & {
+  consumed: string;
+  balance: string;
+};
+
+/** JSON-wire form of {@link TurnSettledEvent}. */
+export type TurnSettledEventWire = Omit<TurnSettledEvent, "payload"> & {
+  payload: TurnSettledPayloadWire;
+};
+
+/** Encode a {@link TurnSettledEvent} to a JSON-safe outbound frame (never throws). */
+export const encodeTurnSettledEvent = (event: TurnSettledEvent): TurnSettledEventWire => ({
+  ...event,
+  payload: {
+    ...event.payload,
+    consumed: encodeNyxtAmount(event.payload.consumed),
+    balance: encodeNyxtAmount(event.payload.balance),
+  },
+});
 
 /** `session:takeover` — this tab disconnected; show session-moved banner (D40). */
 export const SessionTakeoverPayloadSchema = z.object({});
@@ -129,6 +154,19 @@ export const TurnMessagePayloadSchema = z.object({
 export type TurnMessagePayload = z.infer<typeof TurnMessagePayloadSchema>;
 export const TurnMessageEventSchema = eventSchema("turn:message", TurnMessagePayloadSchema);
 export type TurnMessageEvent = z.infer<typeof TurnMessageEventSchema>;
+
+/**
+ * `verify:run` — signal the client's WebContainer to run the OZ-simulator /
+ * Vitest behavioural suite for this turn (US4, FR-007/FR-020). The server drives
+ * the turn but the CLIENT owns the verify run; it replies with `test:results`
+ * carrying the same `turnId`.
+ */
+export const VerifyRunPayloadSchema = z.object({
+  turnId: TurnIdSchema,
+});
+export type VerifyRunPayload = z.infer<typeof VerifyRunPayloadSchema>;
+export const VerifyRunEventSchema = eventSchema("verify:run", VerifyRunPayloadSchema);
+export type VerifyRunEvent = z.infer<typeof VerifyRunEventSchema>;
 
 /** Deploy pipeline phases surfaced to the client (D62, FR-054). */
 export const DeployStatusPhaseSchema = z.enum([
@@ -157,12 +195,40 @@ export type DeployStatusEvent = z.infer<typeof DeployStatusEventSchema>;
  */
 export const LedgerUpdatePayloadSchema = z.object({
   entry: LedgerEntrySchema,
-  available: NyxtAmountSchema,
+  available: NyxtSignedAmountSchema,
   reserved: NyxtAmountSchema,
 });
 export type LedgerUpdatePayload = z.infer<typeof LedgerUpdatePayloadSchema>;
 export const LedgerUpdateEventSchema = eventSchema("ledger:update", LedgerUpdatePayloadSchema);
 export type LedgerUpdateEvent = z.infer<typeof LedgerUpdateEventSchema>;
+
+/**
+ * JSON-wire form of {@link LedgerUpdatePayload}: the embedded entry's `id`
+ * and `amount`, plus `available` (signed) and `reserved`, are decimal strings.
+ */
+export type LedgerUpdatePayloadWire = Omit<
+  LedgerUpdatePayload,
+  "entry" | "available" | "reserved"
+> & {
+  entry: LedgerEntryWire;
+  available: string;
+  reserved: string;
+};
+
+/** JSON-wire form of {@link LedgerUpdateEvent}. */
+export type LedgerUpdateEventWire = Omit<LedgerUpdateEvent, "payload"> & {
+  payload: LedgerUpdatePayloadWire;
+};
+
+/** Encode a {@link LedgerUpdateEvent} to a JSON-safe outbound frame (never throws). */
+export const encodeLedgerUpdateEvent = (event: LedgerUpdateEvent): LedgerUpdateEventWire => ({
+  ...event,
+  payload: {
+    entry: encodeLedgerEntry(event.payload.entry),
+    available: encodeNyxtAmount(event.payload.available),
+    reserved: encodeNyxtAmount(event.payload.reserved),
+  },
+});
 
 /** Every event the server may send to the client (D12/D62). */
 export const ServerToClientEventSchema = z.discriminatedUnion("type", [
@@ -174,6 +240,7 @@ export const ServerToClientEventSchema = z.discriminatedUnion("type", [
   TurnSettledEventSchema,
   SessionTakeoverEventSchema,
   TurnMessageEventSchema,
+  VerifyRunEventSchema,
   DeployStatusEventSchema,
   LedgerUpdateEventSchema,
 ]);

@@ -144,19 +144,21 @@ describe("project & file DTOs", () => {
 });
 
 describe("ledger & deposit DTOs", () => {
-  it("parses a ledger response with bigint amounts", () => {
+  it("parses a ledger response with decimal-string amounts, decoding to bigints", () => {
+    // Balances are folds (`available` may be negative, D34); entry `amount` is a
+    // non-negative magnitude — the sign is carried by `kind` (FR-043).
     const response: unknown = {
-      available: 750n,
-      reserved: 250n,
+      available: "750",
+      reserved: "250",
       entries: [
         {
-          id: 1n,
+          id: "1",
           accountAddress: "mn_addr_test1qexample",
           kind: "deposit_credit",
-          amount: 1_000n,
+          amount: "1000",
           ref: "dep-1",
         },
-        { id: 2n, accountAddress: "mn_addr_test1qexample", kind: "reserve", amount: -250n },
+        { id: "2", accountAddress: "mn_addr_test1qexample", kind: "reserve", amount: "250" },
       ],
     };
     const result = LedgerResponseSchema.safeParse(response);
@@ -164,6 +166,7 @@ describe("ledger & deposit DTOs", () => {
     if (result.success) {
       expectTypeOf(result.data).toEqualTypeOf<LedgerResponse>();
       expect(result.data.available + result.data.reserved).toBe(1_000n);
+      expect(result.data.entries[0]?.id).toBe(1n);
     }
   });
 
@@ -172,20 +175,38 @@ describe("ledger & deposit DTOs", () => {
     expect(result.success).toBe(false);
   });
 
-  it("rejects unknown ledger entry kinds", () => {
+  it("rejects bigint amounts on the wire — JSON never yields one", () => {
+    const result = LedgerResponseSchema.safeParse({ available: 750n, reserved: 250n, entries: [] });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a negative entry amount — magnitudes are non-negative (sign is in the kind)", () => {
     const result = LedgerResponseSchema.safeParse({
-      available: 0n,
-      reserved: 0n,
-      entries: [{ id: 1n, accountAddress: "mn_addr_test1qexample", kind: "burn", amount: 1n }],
+      available: "0",
+      reserved: "0",
+      entries: [
+        { id: "1", accountAddress: "mn_addr_test1qexample", kind: "reserve", amount: "-250" },
+      ],
     });
     expect(result.success).toBe(false);
   });
 
-  it("requires deposit amounts to be strictly positive bigints", () => {
-    expect(CreateDepositRequestSchema.safeParse({ amount: 100n }).success).toBe(true);
-    expect(CreateDepositRequestSchema.safeParse({ amount: 0n }).success).toBe(false);
-    expect(CreateDepositRequestSchema.safeParse({ amount: -5n }).success).toBe(false);
+  it("rejects unknown ledger entry kinds", () => {
+    const result = LedgerResponseSchema.safeParse({
+      available: "0",
+      reserved: "0",
+      entries: [{ id: "1", accountAddress: "mn_addr_test1qexample", kind: "burn", amount: "1" }],
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("requires deposit amounts to be strictly-positive decimal strings", () => {
+    expect(CreateDepositRequestSchema.safeParse({ amount: "100" }).success).toBe(true);
+    expect(CreateDepositRequestSchema.safeParse({ amount: "0" }).success).toBe(false);
+    expect(CreateDepositRequestSchema.safeParse({ amount: "-5" }).success).toBe(false);
+    expect(CreateDepositRequestSchema.safeParse({ amount: "1.5" }).success).toBe(false);
     expect(CreateDepositRequestSchema.safeParse({ amount: 100 }).success).toBe(false);
+    expect(CreateDepositRequestSchema.safeParse({ amount: 100n }).success).toBe(false);
   });
 
   it("parses deposit creation and status responses", () => {
@@ -206,7 +227,7 @@ describe("deploy read DTOs", () => {
       {
         projectId: "proj-1",
         address: "mn_contract_addr_example",
-        version: 12n,
+        version: "12",
         status: "active",
         deployedAt: now,
         txRef: "0xabc",
@@ -214,20 +235,23 @@ describe("deploy read DTOs", () => {
       {
         projectId: "proj-1",
         address: "mn_contract_addr_old",
-        version: 7n,
+        version: "7",
         status: "superseded",
         deployedAt: now - 1_000,
         txRef: "0xdef",
       },
     ]);
     expect(result.success, result.success ? undefined : result.error.message).toBe(true);
+    if (result.success) {
+      expect(result.data[0]?.version).toBe(12n);
+    }
   });
 
-  it("rejects unknown registry statuses and non-bigint versions", () => {
+  it("rejects unknown registry statuses and version sent as a JSON number", () => {
     const row = {
       projectId: "proj-1",
       address: "mn_contract_addr_example",
-      version: 12n,
+      version: "12",
       status: "active",
       deployedAt: now,
       txRef: "0xabc",

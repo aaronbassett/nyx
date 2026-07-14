@@ -8,8 +8,11 @@
 import { z } from "zod";
 
 import {
+  BigIntStringSchema,
   ContentHashSchema,
   ContractAddressSchema,
+  encodeBigInt,
+  encodeNyxtAmount,
   FilePathSchema,
   MidnightAddressSchema,
   NyxtAmountSchema,
@@ -32,10 +35,14 @@ export const LedgerEntryKindSchema = z.enum([
 ]);
 export type LedgerEntryKind = z.infer<typeof LedgerEntryKindSchema>;
 
-/** One append-only ledger entry. `amount` is signed by kind. */
+/**
+ * One append-only ledger entry. `amount` is a **non-negative magnitude** — the
+ * sign is implied by `kind` (FR-043) — so it uses the unsigned amount schema.
+ * `id` and `amount` are decimal strings on the wire, `bigint`s in code.
+ */
 export const LedgerEntrySchema = z.object({
   /** bigserial primary key — bigint to survive int53 overflow. */
-  id: z.bigint(),
+  id: BigIntStringSchema,
   accountAddress: MidnightAddressSchema,
   kind: LedgerEntryKindSchema,
   amount: NyxtAmountSchema,
@@ -43,6 +50,22 @@ export const LedgerEntrySchema = z.object({
   ref: z.string().optional(),
 });
 export type LedgerEntry = z.infer<typeof LedgerEntrySchema>;
+
+/**
+ * JSON-wire form of {@link LedgerEntry}: the `bigint` `id` and `amount` are
+ * decimal strings; all other fields are unchanged.
+ */
+export type LedgerEntryWire = Omit<LedgerEntry, "id" | "amount"> & {
+  id: string;
+  amount: string;
+};
+
+/** Encode a {@link LedgerEntry} to its JSON-safe wire form (never throws). */
+export const encodeLedgerEntry = (entry: LedgerEntry): LedgerEntryWire => ({
+  ...entry,
+  id: encodeBigInt(entry.id),
+  amount: encodeNyxtAmount(entry.amount),
+});
 
 // --- Projects & files -------------------------------------------------------
 
@@ -93,13 +116,25 @@ export type DeployRegistryStatus = z.infer<typeof DeployRegistryStatusSchema>;
 export const DeployRegistryRowSchema = z.object({
   projectId: ProjectIdSchema,
   address: ContractAddressSchema,
-  /** Project version stamp the deploy was built from (bigint, monotonic). */
-  version: z.bigint(),
+  /** Project version stamp the deploy was built from (monotonic bigint;
+   * decimal string on the wire). */
+  version: BigIntStringSchema,
   status: DeployRegistryStatusSchema,
   deployedAt: TimestampMsSchema,
   txRef: z.string().min(1),
 });
 export type DeployRegistryRow = z.infer<typeof DeployRegistryRowSchema>;
+
+/** JSON-wire form of {@link DeployRegistryRow}: `version` is a decimal string. */
+export type DeployRegistryRowWire = Omit<DeployRegistryRow, "version"> & {
+  version: string;
+};
+
+/** Encode a {@link DeployRegistryRow} to its JSON-safe wire form (never throws). */
+export const encodeDeployRegistryRow = (row: DeployRegistryRow): DeployRegistryRowWire => ({
+  ...row,
+  version: encodeBigInt(row.version),
+});
 
 // --- Deposits ---------------------------------------------------------------
 

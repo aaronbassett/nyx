@@ -17,15 +17,19 @@ import {
   ChatMessageSchema,
   DeployRegistryRowSchema,
   DepositStatusSchema,
+  encodeLedgerEntry,
   LedgerEntrySchema,
   ManifestEntrySchema,
   ProjectSchema,
 } from "./entities.js";
+import type { LedgerEntryWire } from "./entities.js";
 import {
   DepositRefSchema,
+  encodeNyxtAmount,
   FilePathSchema,
   MidnightAddressSchema,
   NyxtAmountSchema,
+  NyxtSignedAmountSchema,
   TimestampMsSchema,
 } from "./primitives.js";
 
@@ -137,20 +141,56 @@ export type ProjectChatResponse = z.infer<typeof ProjectChatResponseSchema>;
 
 /**
  * `GET /ledger` response — balances are server-derived folds over entries;
- * the UI never computes them client-side (FR-070).
+ * the UI never computes them client-side (FR-070). `available` may be negative
+ * (final-cycle overage, D34); `reserved` is non-negative. Amounts are decimal
+ * strings on the wire, `bigint`s in code.
  */
 export const LedgerResponseSchema = z.object({
-  available: NyxtAmountSchema,
+  available: NyxtSignedAmountSchema,
   reserved: NyxtAmountSchema,
   entries: z.array(LedgerEntrySchema),
 });
 export type LedgerResponse = z.infer<typeof LedgerResponseSchema>;
 
-/** `POST /deposits` request — amount in NYXT base units, strictly positive. */
+/** JSON-wire form of {@link LedgerResponse}: balances and entries are string-encoded. */
+export type LedgerResponseWire = Omit<LedgerResponse, "available" | "reserved" | "entries"> & {
+  available: string;
+  reserved: string;
+  entries: LedgerEntryWire[];
+};
+
+/** Encode a {@link LedgerResponse} to its JSON-safe wire form (never throws). */
+export const encodeLedgerResponse = (response: LedgerResponse): LedgerResponseWire => ({
+  ...response,
+  available: encodeNyxtAmount(response.available),
+  reserved: encodeNyxtAmount(response.reserved),
+  entries: response.entries.map(encodeLedgerEntry),
+});
+
+/**
+ * `POST /deposits` request — amount in NYXT base units, strictly positive. A
+ * decimal string on the wire (`"0"` and negatives are rejected), `bigint` in code.
+ */
 export const CreateDepositRequestSchema = z.object({
-  amount: z.bigint().positive(),
+  amount: NyxtAmountSchema.refine(
+    (value) => value > 0n,
+    "deposit amount must be strictly positive",
+  ),
 });
 export type CreateDepositRequest = z.infer<typeof CreateDepositRequestSchema>;
+
+/** JSON-wire form of {@link CreateDepositRequest}: `amount` is a decimal string. */
+export type CreateDepositRequestWire = Omit<CreateDepositRequest, "amount"> & {
+  amount: string;
+};
+
+/** Encode a {@link CreateDepositRequest} to its JSON-safe wire form (never throws). */
+export const encodeCreateDepositRequest = (
+  request: CreateDepositRequest,
+): CreateDepositRequestWire => ({
+  ...request,
+  amount: encodeNyxtAmount(request.amount),
+});
 
 /** `POST /deposits` response — preregisters the ref (D45). */
 export const CreateDepositResponseSchema = z.object({
