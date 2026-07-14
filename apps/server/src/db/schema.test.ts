@@ -51,14 +51,16 @@ async function migrationById(id: number): Promise<Migration> {
 }
 
 describe("migration files (static shape)", () => {
-  it("discovers the initial schema + the ledger-width migration as up/down pairs", async () => {
+  it("discovers the initial schema, ledger-width, and deploy-txref migrations as up/down pairs", async () => {
     const migrations = await loadMigrations();
-    expect(migrations).toHaveLength(2);
-    const [first, second] = migrations;
+    expect(migrations).toHaveLength(3);
+    const [first, second, third] = migrations;
     expect(first?.id).toBe(1);
     expect(first?.name).toBe("initial_schema");
     expect(second?.id).toBe(2);
     expect(second?.name).toBe("ledger_amount_width_and_credit_unique");
+    expect(third?.id).toBe(3);
+    expect(third?.name).toBe("deploy_registry_txref_unique");
     for (const migration of migrations) {
       expect(migration.upSql.length).toBeGreaterThan(0);
       expect(migration.downSql.length).toBeGreaterThan(0);
