@@ -23,6 +23,14 @@ import { createDeployRegistry } from "./deploy/registry.js";
 import { createDeployWalletMonitor } from "./deploy/wallet.js";
 import type { WalletAlert } from "./deploy/wallet.js";
 import { createDepositStore, createLedgerStore } from "./ledger/index.js";
+import {
+  createReconcileJob,
+  createReconcileStore,
+  ownerGatedReconcileSeam,
+  pgLedgerTotals,
+} from "./ledger/reconcile.js";
+import type { ReconcileAlarm } from "./ledger/reconcile.js";
+import { createReconcileScheduler } from "./ledger/reconcile-scheduler.js";
 import { createMcpClients } from "./mcp/index.js";
 import { createProjectAuthorizer } from "./projects/authorize.js";
 import { PgChatStore, PgProjectStore } from "./projects/index.js";
@@ -47,6 +55,28 @@ function logWalletAlert(alert: WalletAlert): void {
     { severity: "warn", source: "deploy-wallet", event: "balance-alert", ...alert },
     (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value),
   );
+  process.stderr.write(`${line}\n`);
+}
+
+/** Structured, bigint-safe stderr sink for the LOUD reconcile drift/skip alarms (FR-067). */
+function logReconcileAlarm(alarm: ReconcileAlarm): void {
+  // Reconcile drift can only mean a bug or tampering (never auto-corrected) — logged at `error`.
+  const line = JSON.stringify(
+    { severity: "error", source: "reconcile", event: "alarm", ...alarm },
+    (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value),
+  );
+  process.stderr.write(`${line}\n`);
+}
+
+/** Stderr sink for a reconcile TICK fault (owner-gated source/seam not wired, or a store error). */
+function logReconcileTickError(error: unknown): void {
+  const detail = error instanceof Error ? error.message : String(error);
+  const line = JSON.stringify({
+    severity: "warn",
+    source: "reconcile",
+    event: "tick-error",
+    detail,
+  });
   process.stderr.write(`${line}\n`);
 }
 
@@ -179,6 +209,39 @@ async function main(): Promise<void> {
     proverClient,
     deployRegistry,
     deployHandler,
+  });
+
+  // US10 reconcile — the LAZY on-chain leg (D13/D55/D56), a background daily job that NEVER
+  // touches a user path (SC-039; it is wired here at the composition root, not in any handler).
+  // Source 1 (ledger totals) is real Postgres; Sources 2/3 + the burn executor + the CANONICAL
+  // watermark source are OWNER-GATED (constitution I — the real indexer/vault-balance/burn/chain
+  // adapters need the local devnet + the deployed vault + the orchestrator burn key). It IS
+  // started here; until the seams are wired every daily tick faults on the gated watermark
+  // source and logs a `tick-error` (the honest "armed but gated" state). NOTE: an in-process
+  // timer cannot guarantee a daily run under scale-to-zero (constitution VI); the `lastRunAt`
+  // catch-up makes a warm instance run as soon as it is overdue, but a hard guarantee needs an
+  // external scheduled trigger (owner-gated deployment wiring).
+  const reconcileStore = createReconcileStore(db);
+  const reconcileJob = createReconcileJob({
+    ledgerTotals: pgLedgerTotals(db),
+    onchainDepositTotal: ownerGatedReconcileSeam("finalized on-chain deposit total"),
+    vaultBalance: ownerGatedReconcileSeam("vault NYXT balance"),
+    executeBurn: ownerGatedReconcileSeam("batched burn executor"),
+    store: reconcileStore,
+    alert: logReconcileAlarm,
+  });
+  const reconcileScheduler = createReconcileScheduler({
+    job: reconcileJob,
+    cadenceMs: config.tunables.reconcileCadenceMs,
+    watermarkSource: ownerGatedReconcileSeam("canonical watermark source"),
+    // Liveness catch-up (scale-to-zero): schedule the first tick from the last reconciled run's
+    // timestamp, so a restart before a full cadence doesn't reset the daily countdown.
+    lastRunAt: async () => (await reconcileStore.lastReconciled())?.ranAt ?? null,
+    onError: logReconcileTickError,
+  });
+  reconcileScheduler.start();
+  app.addHook("onClose", () => {
+    reconcileScheduler.stop();
   });
 
   await app.listen({ port: config.port, host: "0.0.0.0" });

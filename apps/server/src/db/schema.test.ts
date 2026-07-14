@@ -51,16 +51,18 @@ async function migrationById(id: number): Promise<Migration> {
 }
 
 describe("migration files (static shape)", () => {
-  it("discovers the initial schema, ledger-width, and deploy-txref migrations as up/down pairs", async () => {
+  it("discovers the initial schema, ledger-width, deploy-txref, and reconcile-width migrations as up/down pairs", async () => {
     const migrations = await loadMigrations();
-    expect(migrations).toHaveLength(3);
-    const [first, second, third] = migrations;
+    expect(migrations).toHaveLength(4);
+    const [first, second, third, fourth] = migrations;
     expect(first?.id).toBe(1);
     expect(first?.name).toBe("initial_schema");
     expect(second?.id).toBe(2);
     expect(second?.name).toBe("ledger_amount_width_and_credit_unique");
     expect(third?.id).toBe(3);
     expect(third?.name).toBe("deploy_registry_txref_unique");
+    expect(fourth?.id).toBe(4);
+    expect(fourth?.name).toBe("reconcile_amount_width");
     for (const migration of migrations) {
       expect(migration.upSql.length).toBeGreaterThan(0);
       expect(migration.downSql.length).toBeGreaterThan(0);
@@ -287,12 +289,19 @@ describe.skipIf(!hasLiveDatabase)(
     });
 
     it("reverts cleanly all the way down", async () => {
-      // Two migrations are applied; revert both, newest first (0002 narrows the amount
+      // Revert every applied migration newest-first (the amount-width migrations narrow their
       // columns back to bigint — lossless here since the live suite stores only small values).
-      await expect(migrateDown(liveUrl())).resolves.toBe(
-        "0002_ledger_amount_width_and_credit_unique",
-      );
-      await expect(migrateDown(liveUrl())).resolves.toBe("0001_initial_schema");
+      // Generic loop rather than a hardcoded sequence so new migrations stay covered; the last
+      // revert must be the initial schema, after which no data-model table remains.
+      let reverted: string | undefined;
+      let last: string | undefined;
+      do {
+        reverted = await migrateDown(liveUrl());
+        if (reverted !== undefined) {
+          last = reverted;
+        }
+      } while (reverted !== undefined);
+      expect(last).toBe("0001_initial_schema");
       const { rows } = await db.query<{ table_name: string }>(
         `SELECT table_name FROM information_schema.tables
          WHERE table_schema = 'public' AND table_name = ANY($1)`,
