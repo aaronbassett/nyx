@@ -334,13 +334,15 @@ describe("createReconcileJob — record failure after a landed burn (H1)", () =>
     const burnSpy = vi.fn<BurnExecutor>(({ watermark }) =>
       Promise.resolve({ txRef: `tx-${watermark}` }),
     );
+    const alerts: ReconcileAlarm[] = [];
     const job = createReconcileJob({
       ledgerTotals: () => Promise.resolve({ credits: 1_000n, settlements: 300n }),
       onchainDepositTotal: () => Promise.resolve(1_000n),
       vaultBalance: () => Promise.resolve(1_000n),
       executeBurn: burnSpy,
       store: flaky,
-      alert: vi.fn(),
+      alert: (a) => alerts.push(a),
+      retrySleep: () => Promise.resolve(), // no real backoff delay in tests
     });
 
     const result = await job.runReconcile("wm-1");
@@ -348,11 +350,24 @@ describe("createReconcileJob — record failure after a landed burn (H1)", () =>
     if (result.kind !== "record-failed") throw new Error("expected record-failed");
     expect(result.burnTx).toBe("tx-wm-1"); // the burn LANDED
     expect(burnSpy).toHaveBeenCalledTimes(1);
+    // An immediate alarm fires this tick (review H#1), not on the next cadence.
+    expect(alerts.some((a) => a.reason === "burn-unresolved")).toBe(true);
     // A best-effort error row was written so the next run BLOCKS (never re-burns).
     expect((await store.getRun("wm-1"))?.outcome).toBe("error");
     const next = await job.runReconcile("wm-2");
     expect(next.kind).toBe("blocked");
     expect(burnSpy).toHaveBeenCalledTimes(1); // still no second burn
+  });
+});
+
+describe("createReconcileJob — burn-failed alarms immediately (H#1)", () => {
+  it("fires a burn-unresolved alarm on the SAME tick the burn fails", async () => {
+    const h = harness();
+    h.burnSpy.mockRejectedValueOnce(new Error("prover offline"));
+    const result = await h.job.runReconcile("wm-1");
+    expect(result.kind).toBe("burn-failed");
+    // The alarm is not deferred to the next cadence's block check.
+    expect(h.alerts.some((a) => a.reason === "burn-unresolved")).toBe(true);
   });
 });
 

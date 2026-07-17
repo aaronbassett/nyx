@@ -163,9 +163,16 @@ export function createReconcileScheduler(deps: ReconcileSchedulerDeps): Reconcil
         .then((delayMs) => {
           armAfter(gen, delayMs);
         })
-        .catch(() => {
-          // A lastRunAt read failure falls back to a full cadence — never blocks startup.
-          armAfter(gen, deps.cadenceMs);
+        .catch((error: unknown) => {
+          // A lastRunAt read failure falls back to a full cadence — never blocks startup. Guard
+          // the fallback arm too: a custom/test `schedule()` that throws synchronously must not
+          // escape as an unhandled rejection (review #5).
+          deps.onError?.(error);
+          try {
+            armAfter(gen, deps.cadenceMs);
+          } catch (armError) {
+            deps.onError?.(armError);
+          }
         });
     },
     stop(): void {

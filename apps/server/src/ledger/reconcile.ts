@@ -315,6 +315,13 @@ export interface ReconcileJobDeps {
   readonly lagTolerance?: bigint;
   /** Consecutive-skip threshold before alarming (EC-48). Defaults to 3. */
   readonly maxConsecutiveSkips?: number;
+  /**
+   * Backoff between record retries in ms (H1 resilience — a transient DB blip often needs a
+   * beat to recover). Defaults to {@link DEFAULT_RECORD_RETRY_BACKOFF_MS}.
+   */
+  readonly retryBackoffMs?: number;
+  /** Sleep seam for the retry backoff; injected as a no-op in tests. Defaults to a real timer. */
+  readonly retrySleep?: (ms: number) => Promise<void>;
 }
 
 /** The reconcile job — a stateful object (it tracks the consecutive-skip streak, EC-48). */
@@ -333,6 +340,14 @@ export const DEFAULT_MAX_CONSECUTIVE_SKIPS = 3;
 /** How many times to retry persisting the reconciled report after a landed burn (H1). */
 export const RECORD_RETRY_ATTEMPTS = 3;
 
+/** Default backoff between record retries (H1) — a beat for a transient DB fault to recover. */
+export const DEFAULT_RECORD_RETRY_BACKOFF_MS = 100;
+
+/** Default real sleep for the retry backoff (tests inject a no-op). */
+function defaultRetrySleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Build the reconcile job over injected seams. The returned object holds the consecutive-skip
  * streak across calls (the scheduler keeps ONE instance) so EC-48's "alert after N
@@ -346,6 +361,8 @@ export function createReconcileJob(deps: ReconcileJobDeps): ReconcileJob {
     throw new RangeError(`reconcile lagTolerance must be >= 0 (got ${String(lagTolerance)})`);
   }
   const maxConsecutiveSkips = deps.maxConsecutiveSkips ?? DEFAULT_MAX_CONSECUTIVE_SKIPS;
+  const retryBackoffMs = deps.retryBackoffMs ?? DEFAULT_RECORD_RETRY_BACKOFF_MS;
+  const retrySleep = deps.retrySleep ?? defaultRetrySleep;
   let consecutiveSkips = 0;
 
   async function runReconcile(watermark: string): Promise<ReconcileResult> {
@@ -439,7 +456,7 @@ export function createReconcileJob(deps: ReconcileJobDeps): ReconcileJob {
       });
       // Persist the drift report; NO burn. `getRun` already ruled out a replay, but honour the
       // UNIQUE backstop anyway (a concurrent run may have recorded first).
-      await deps.store.insertRun({
+      await persistBestEffort({
         watermark,
         outcome: "drift",
         snapshot,
@@ -465,7 +482,7 @@ export function createReconcileJob(deps: ReconcileJobDeps): ReconcileJob {
           `LEDGER DRIFT at watermark ${watermark} — settlements went BACKWARD ` +
           `(${String(snapshot.ledgerSettlements)} < burned high-water ${String(burnedHighWater)}); NOT auto-corrected`,
       });
-      await deps.store.insertRun({
+      await persistBestEffort({
         watermark,
         outcome: "drift",
         snapshot,
@@ -477,8 +494,9 @@ export function createReconcileJob(deps: ReconcileJobDeps): ReconcileJob {
     }
 
     if (burnAmount === 0n) {
-      // Nothing consumed since the last burn — record equality, no on-chain burn.
-      await deps.store.insertRun({
+      // Nothing consumed since the last burn — record equality, no on-chain burn. Best-effort:
+      // no burn landed, so a dropped audit row on a failing store is tolerable (never rejects).
+      await persistBestEffort({
         watermark,
         outcome: "reconciled",
         snapshot,
@@ -513,6 +531,17 @@ export function createReconcileJob(deps: ReconcileJobDeps): ReconcileJob {
       // `lastReconciled()`/`totalBurned()` exclude `error` rows, so the burned high-water stays
       // UNMOVED while unresolved (the eventual ops-driven retry, or a clear if it never landed).
       await recordErrorBestEffort(watermark, snapshot, creditsVsChainDrift, burnAmount);
+      // Alarm IMMEDIATELY (review H#1): the ops gate must not stay silent until the next daily
+      // tick's `burn-unresolved` check — a money-critical burn fault needs a same-tick alarm.
+      deps.alert({
+        reason: "burn-unresolved",
+        watermark,
+        unresolvedWatermark: watermark,
+        message:
+          `BURN FAILED at watermark ${watermark} (attempted ${String(burnAmount)} NYXT) — recorded ` +
+          `as an error; reconcile is now BLOCKED until ops confirms the on-chain state. ` +
+          `Error: ${errorMessage(error)}`,
+      });
       return {
         kind: "burn-failed",
         watermark,
@@ -538,6 +567,17 @@ export function createReconcileJob(deps: ReconcileJobDeps): ReconcileJob {
       });
     } catch (error) {
       await recordErrorBestEffort(watermark, snapshot, creditsVsChainDrift, burnAmount);
+      // Alarm IMMEDIATELY (review H#1): the burn LANDED but couldn't be recorded — the most
+      // ambiguous state, so ops must be paged this tick, not on the next cadence.
+      deps.alert({
+        reason: "burn-unresolved",
+        watermark,
+        unresolvedWatermark: watermark,
+        message:
+          `BURN LANDED but its report could not be persisted at watermark ${watermark} ` +
+          `(tx ${burnTx}, amount ${String(burnAmount)} NYXT) — wrote a best-effort error row; ` +
+          `reconcile is now BLOCKED until ops confirms. Error: ${errorMessage(error)}`,
+      });
       return {
         kind: "record-failed",
         watermark,
@@ -564,6 +604,9 @@ export function createReconcileJob(deps: ReconcileJobDeps): ReconcileJob {
   async function persistWithRetry(run: ReconcileRunInsert): Promise<void> {
     let lastError: unknown;
     for (let attempt = 0; attempt < RECORD_RETRY_ATTEMPTS; attempt += 1) {
+      if (attempt > 0) {
+        await retrySleep(retryBackoffMs); // a beat for a transient fault to recover (H1)
+      }
       try {
         await deps.store.insertRun(run);
         return;
@@ -572,6 +615,21 @@ export function createReconcileJob(deps: ReconcileJobDeps): ReconcileJob {
       }
     }
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
+  /**
+   * Persist a NON-burn run (drift / zero-burn / equality) best-effort: retry a transient fault,
+   * then SWALLOW (never reject out of `runReconcile`, honouring the "typed results only"
+   * contract — review #4). Safe because no burn landed on these paths, and drift alarms fire
+   * BEFORE the persist, so a lost audit row never means a silently-lost alarm.
+   */
+  async function persistBestEffort(run: ReconcileRunInsert): Promise<void> {
+    try {
+      await persistWithRetry(run);
+    } catch {
+      // Swallowed by design (non-burn path): the run's outcome is already returned + (for
+      // drift) already alarmed; a dropped audit row on a genuinely-failing store is tolerable.
+    }
   }
 
   /**
@@ -776,6 +834,12 @@ export class PgReconcileStore implements ReconcileStore {
       return { inserted: true };
     } catch (error) {
       // The watermark UNIQUE backstop (SC-037): a concurrent/replayed run already recorded it.
+      // FOLLOW-UP (review #2, owner-gated): this swallows the 23505 without checking which
+      // outcome actually landed, so under a TRUE multi-instance race on the SAME canonical
+      // watermark (not possible until `executeBurn`/`watermarkSource` are wired) a caller could
+      // see `reconciled` while the persisted row is `error`. Resolves correctly (totalBurned
+      // counts only reconciled) but the log/row could diverge — reconcile the winning outcome
+      // here when the real multi-instance seams land.
       if (isUniqueViolationError(error)) {
         return { inserted: false };
       }
