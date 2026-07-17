@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { NyxtVaultSimulator, ref } from "./nyxt-vault-simulator.js";
+import {
+  ABSENT_ORCHESTRATOR_SECRET,
+  DEFAULT_ORCHESTRATOR_SECRET,
+  NyxtVaultSimulator,
+  nyxtTokenColor,
+  ref,
+} from "./nyxt-vault-simulator.js";
 
 // The per-deposit mint cap: NYXT is minted with a Uint<64> value.
 const MAX_MINT = (1n << 64n) - 1n; // 2^64 - 1
@@ -145,6 +151,216 @@ describe("NyxtVault.deposit", () => {
       const effects = vault.deposit(ref("color"), 5n);
       expect(effects.nyxtColor).toMatch(/^[0-9a-f]{64}$/);
       expect(effects.nyxtColor).not.toBe("0".repeat(64));
+    });
+  });
+});
+
+describe("NyxtVault.burn", () => {
+  // A comfortable seeded NYXT balance for happy-path burns. On-chain this is what
+  // the vault's persistent unshielded balance would be after prior deposits; the
+  // simulator seeds it because the balance guard reads kernel.balance at the start
+  // of the transaction, which the runtime does not carry across separate calls.
+  const VAULT_BALANCE = 10_000n;
+
+  describe("orchestrator-only authorization (the core security gate)", () => {
+    it("accepts a burn from the pinned orchestrator secret", () => {
+      const vault = new NyxtVaultSimulator(); // pinned to DEFAULT_ORCHESTRATOR_SECRET
+      const effects = vault.burn(300n, ref("w-ok"), { vaultNyxtBalance: VAULT_BALANCE });
+      expect(effects.nyxtBurned).toBe(300n);
+      expect(vault.ledger().burnedWatermarks.member(ref("w-ok"))).toBe(true);
+    });
+
+    it("rejects a burn from a WRONG orchestrator secret", () => {
+      const vault = new NyxtVaultSimulator();
+      const wrong = new Uint8Array(32).fill(0x99);
+      expect(() =>
+        vault.burn(300n, ref("w-wrong"), {
+          proverSecret: wrong,
+          vaultNyxtBalance: VAULT_BALANCE,
+        }),
+      ).toThrow("NyxtVault: caller is not the orchestrator");
+    });
+
+    it("rejects a burn from an ABSENT (all-zero) secret at the witness weak-key guard (M1)", () => {
+      const vault = new NyxtVaultSimulator();
+      // The all-zero secret is refused by the witness BEFORE the circuit auth assert — a
+      // stronger, earlier rejection than a wrong-but-valid secret (security review M1: an
+      // all-zero default secret would otherwise be a publicly-reproducible known preimage).
+      expect(() =>
+        vault.burn(300n, ref("w-absent"), {
+          proverSecret: ABSENT_ORCHESTRATOR_SECRET,
+          vaultNyxtBalance: VAULT_BALANCE,
+        }),
+      ).toThrow(/refusing all-zero\/default secret/);
+    });
+
+    it("refuses to CONSTRUCT with an all-zero orchestrator secret (M1)", () => {
+      // The witness guard also fires at construction (the constructor pins the authority from
+      // the secret), so a vault can never be deployed with the weak default secret.
+      expect(() => new NyxtVaultSimulator(ABSENT_ORCHESTRATOR_SECRET)).toThrow(
+        /refusing all-zero\/default secret/,
+      );
+    });
+
+    it("binds authorization to the secret pinned at construction, not a fixed key", () => {
+      const secretB = new Uint8Array(32).fill(0x22);
+      const vault = new NyxtVaultSimulator(secretB); // authority pinned to secretB
+      // The DEFAULT secret cannot burn this vault…
+      expect(() =>
+        vault.burn(300n, ref("w-bind"), {
+          proverSecret: DEFAULT_ORCHESTRATOR_SECRET,
+          vaultNyxtBalance: VAULT_BALANCE,
+        }),
+      ).toThrow("NyxtVault: caller is not the orchestrator");
+      // …but secretB (the pinned one) can.
+      const effects = vault.burn(300n, ref("w-bind"), {
+        proverSecret: secretB,
+        vaultNyxtBalance: VAULT_BALANCE,
+      });
+      expect(effects.nyxtBurned).toBe(300n);
+    });
+
+    it("does not record a watermark for an unauthorized burn", () => {
+      const vault = new NyxtVaultSimulator();
+      const wrong = new Uint8Array(32).fill(0x99);
+      expect(() =>
+        vault.burn(300n, ref("w-unauth"), {
+          proverSecret: wrong,
+          vaultNyxtBalance: VAULT_BALANCE,
+        }),
+      ).toThrow();
+      expect(vault.ledger().burnedWatermarks.member(ref("w-unauth"))).toBe(false);
+      expect(vault.ledger().burnedWatermarks.isEmpty()).toBe(true);
+    });
+  });
+
+  describe("burn reduces the vault balance", () => {
+    it("removes exactly `amount` NYXT from the vault (unshielded output)", () => {
+      const vault = new NyxtVaultSimulator();
+      const effects = vault.burn(2500n, ref("w-amt"), { vaultNyxtBalance: VAULT_BALANCE });
+      expect(effects.nyxtBurned).toBe(2500n);
+      expect(effects.nyxtColor).toBe(nyxtTokenColor());
+    });
+
+    it("burns the NYXT color, never native tNIGHT", () => {
+      const vault = new NyxtVaultSimulator();
+      const effects = vault.burn(1n, ref("w-color"), { vaultNyxtBalance: VAULT_BALANCE });
+      expect(effects.nyxtColor).toMatch(/^[0-9a-f]{64}$/);
+      expect(effects.nyxtColor).not.toBe("0".repeat(64));
+    });
+  });
+
+  describe("balance guard (reject burning more than the vault holds)", () => {
+    it("rejects a burn against a zero-balance vault", () => {
+      const vault = new NyxtVaultSimulator();
+      expect(() => vault.burn(1n, ref("w-zero-bal"))).toThrow(
+        "NyxtVault: burn exceeds vault balance",
+      );
+    });
+
+    it("rejects a burn one unit over the vault balance", () => {
+      const vault = new NyxtVaultSimulator();
+      expect(() => vault.burn(1001n, ref("w-over"), { vaultNyxtBalance: 1000n })).toThrow(
+        "NyxtVault: burn exceeds vault balance",
+      );
+    });
+
+    it("accepts a burn of exactly the vault balance (boundary)", () => {
+      const vault = new NyxtVaultSimulator();
+      const effects = vault.burn(1000n, ref("w-exact"), { vaultNyxtBalance: 1000n });
+      expect(effects.nyxtBurned).toBe(1000n);
+    });
+
+    it("does not record a watermark for an over-balance burn", () => {
+      const vault = new NyxtVaultSimulator();
+      expect(() => vault.burn(1001n, ref("w-over2"), { vaultNyxtBalance: 1000n })).toThrow();
+      expect(vault.ledger().burnedWatermarks.member(ref("w-over2"))).toBe(false);
+    });
+  });
+
+  describe("amount validation", () => {
+    it("rejects a zero-amount burn", () => {
+      const vault = new NyxtVaultSimulator();
+      expect(() => vault.burn(0n, ref("w-zero"), { vaultNyxtBalance: VAULT_BALANCE })).toThrow(
+        "NyxtVault: amount must be positive",
+      );
+    });
+  });
+
+  describe("watermark idempotency (exactly-once per watermark)", () => {
+    it("rejects a second burn that reuses a recorded watermark", () => {
+      const vault = new NyxtVaultSimulator();
+      vault.burn(100n, ref("w-dup"), { vaultNyxtBalance: VAULT_BALANCE });
+      expect(() => vault.burn(100n, ref("w-dup"), { vaultNyxtBalance: VAULT_BALANCE })).toThrow(
+        "NyxtVault: watermark already burned",
+      );
+    });
+
+    it("rejects a duplicate even when the amount differs", () => {
+      const vault = new NyxtVaultSimulator();
+      vault.burn(100n, ref("w-dup-amt"), { vaultNyxtBalance: VAULT_BALANCE });
+      expect(() => vault.burn(250n, ref("w-dup-amt"), { vaultNyxtBalance: VAULT_BALANCE })).toThrow(
+        "NyxtVault: watermark already burned",
+      );
+    });
+
+    it("still accepts a fresh watermark after a duplicate was rejected", () => {
+      const vault = new NyxtVaultSimulator();
+      vault.burn(100n, ref("w-first"), { vaultNyxtBalance: VAULT_BALANCE });
+      expect(() => vault.burn(100n, ref("w-first"), { vaultNyxtBalance: VAULT_BALANCE })).toThrow();
+      const effects = vault.burn(200n, ref("w-second"), { vaultNyxtBalance: VAULT_BALANCE });
+      expect(effects.nyxtBurned).toBe(200n);
+      expect(vault.ledger().burnedWatermarks.size()).toBe(2n);
+    });
+
+    it("accumulates distinct burned watermarks", () => {
+      const vault = new NyxtVaultSimulator();
+      vault.burn(10n, ref("w-a"), { vaultNyxtBalance: VAULT_BALANCE });
+      vault.burn(20n, ref("w-b"), { vaultNyxtBalance: VAULT_BALANCE });
+      vault.burn(30n, ref("w-c"), { vaultNyxtBalance: VAULT_BALANCE });
+      const { burnedWatermarks } = vault.ledger();
+      expect(burnedWatermarks.size()).toBe(3n);
+      expect(burnedWatermarks.member(ref("w-a"))).toBe(true);
+      expect(burnedWatermarks.member(ref("w-b"))).toBe(true);
+      expect(burnedWatermarks.member(ref("w-c"))).toBe(true);
+    });
+  });
+
+  describe("construction pins a stable orchestrator authority", () => {
+    it("exposes a non-zero orchestrator authority commitment", () => {
+      const vault = new NyxtVaultSimulator();
+      const auth = vault.ledger().orchestratorAuthority.bytes;
+      expect(auth.length).toBe(32);
+      expect(Buffer.from(auth).toString("hex")).not.toBe("0".repeat(64));
+    });
+
+    it("pins distinct commitments for distinct secrets", () => {
+      const a = new NyxtVaultSimulator(new Uint8Array(32).fill(0x11));
+      const b = new NyxtVaultSimulator(new Uint8Array(32).fill(0x22));
+      const ha = Buffer.from(a.ledger().orchestratorAuthority.bytes).toString("hex");
+      const hb = Buffer.from(b.ledger().orchestratorAuthority.bytes).toString("hex");
+      expect(ha).not.toBe(hb);
+    });
+  });
+
+  describe("deposit and burn coexist (deposit path unchanged)", () => {
+    it("records + mints a deposit unchanged after burn was added", () => {
+      const vault = new NyxtVaultSimulator();
+      const dep = vault.deposit(ref("coexist"), 4242n);
+      expect(dep.nyxtMinted).toBe(4242n);
+      expect(dep.nyxtVaultCredited).toBe(4242n);
+      expect(vault.ledger().deposits.lookup(ref("coexist"))).toBe(4242n);
+    });
+
+    it("keeps deposit refs and burn watermarks as independent namespaces", () => {
+      const vault = new NyxtVaultSimulator();
+      vault.deposit(ref("shared"), 500n);
+      // The same 32-byte label used as a watermark is NOT a duplicate — the deposits
+      // Map and the burnedWatermarks Set are separate ledger fields.
+      const effects = vault.burn(100n, ref("shared"), { vaultNyxtBalance: VAULT_BALANCE });
+      expect(effects.nyxtBurned).toBe(100n);
+      expect(vault.ledger().deposits.member(ref("shared"))).toBe(true);
+      expect(vault.ledger().burnedWatermarks.member(ref("shared"))).toBe(true);
     });
   });
 });
