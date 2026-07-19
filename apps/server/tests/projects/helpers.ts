@@ -35,14 +35,16 @@ import { createMcpClients } from "../../src/mcp/index.js";
 import type { McpSession } from "../../src/mcp/index.js";
 import type { Queryable } from "../../src/db/index.js";
 import { SESSION_COOKIE_NAME } from "../../src/protocol/index.js";
-import { computeContentHash } from "../../src/projects/index.js";
+import { computeContentHash, defaultCloneTokenGenerator } from "../../src/projects/index.js";
 import type {
   ChatWrite,
   CommitRequest,
   CommitResult,
   DeletionCascade,
   FileAuthor,
+  HandoffFile,
   ProjectStore,
+  VersionSnapshot,
 } from "../../src/projects/index.js";
 import {
   FileTooLargeError,
@@ -89,6 +91,8 @@ export interface InMemoryProjectStoreOptions {
   readonly versionRetentionCount: number;
   readonly versionRetentionDays: number;
   readonly deletionRecoveryDays: number;
+  /** Clone-token generator (D58); injectable for deterministic tokens. Default: random. */
+  readonly tokenGenerator?: () => string;
 }
 
 interface ProjectRecord {
@@ -97,6 +101,8 @@ interface ProjectRecord {
   name: string;
   createdAtMs: number;
   deletedAtMs: number | null;
+  cloneToken: string | null;
+  cloneMaterializedAtVersion: number | null;
 }
 
 interface FileRecord {
@@ -163,8 +169,11 @@ export class InMemoryProjectStore implements ProjectStore {
 
   private seq = 0;
   private faultAfterWrites: number | undefined;
+  private readonly tokenGenerator: () => string;
 
-  constructor(private readonly opts: InMemoryProjectStoreOptions) {}
+  constructor(private readonly opts: InMemoryProjectStoreOptions) {
+    this.tokenGenerator = opts.tokenGenerator ?? defaultCloneTokenGenerator;
+  }
 
   /** Arm a one-shot fault that throws after `writes` file rows are applied (SC-026). */
   failNextCommitAfter(writes: number): void {
@@ -220,6 +229,8 @@ export class InMemoryProjectStore implements ProjectStore {
       name,
       createdAtMs: this.now(),
       deletedAtMs: null,
+      cloneToken: null,
+      cloneMaterializedAtVersion: null,
     };
     this.projects.set(id, record);
     this.files.set(id, new Map());
@@ -367,6 +378,90 @@ export class InMemoryProjectStore implements ProjectStore {
         ? null
         : ProjectFileResponseSchema.parse({ path, content: record.content }),
     );
+  }
+
+  getFiles(projectId: string): Promise<HandoffFile[]> {
+    const fileMap = this.files.get(projectId) ?? new Map<string, FileRecord>();
+    const files = [...fileMap.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([path, record]) => ({
+        path,
+        content: record.content,
+        contentHash: record.contentHash,
+      }));
+    return Promise.resolve(files);
+  }
+
+  getVersionHistory(projectId: string): Promise<VersionSnapshot[]> {
+    const history = this.versions.get(projectId) ?? [];
+    const byVersion = new Map<
+      number,
+      { author: FileAuthor; createdAt: number; files: HandoffFile[] }
+    >();
+    for (const record of history) {
+      let bucket = byVersion.get(record.version);
+      if (bucket === undefined) {
+        bucket = { author: record.author, createdAt: record.createdAtMs, files: [] };
+        byVersion.set(record.version, bucket);
+      }
+      bucket.files.push({
+        path: record.path,
+        content: record.content,
+        contentHash: record.contentHash,
+      });
+    }
+    return Promise.resolve(
+      [...byVersion.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([version, bucket]) => ({
+          version,
+          author: bucket.author,
+          createdAt: bucket.createdAt,
+          files: bucket.files,
+        })),
+    );
+  }
+
+  mintCloneToken(projectId: string): Promise<string> {
+    const record = this.projects.get(projectId);
+    if (record === undefined) {
+      return Promise.reject(new ProjectNotFoundError(projectId));
+    }
+    const token = this.tokenGenerator();
+    record.cloneToken = token;
+    return Promise.resolve(token);
+  }
+
+  revokeCloneToken(projectId: string): Promise<void> {
+    const record = this.projects.get(projectId);
+    if (record === undefined) {
+      return Promise.reject(new ProjectNotFoundError(projectId));
+    }
+    record.cloneToken = null; // Immediate: the next lookup by this token resolves null (SC-043).
+    return Promise.resolve();
+  }
+
+  getProjectByCloneToken(token: string): Promise<Project | null> {
+    for (const record of this.projects.values()) {
+      if (record.cloneToken === token) {
+        return Promise.resolve(mapProject(record)); // Incl. soft-deleted, like the Pg store.
+      }
+    }
+    return Promise.resolve(null);
+  }
+
+  getCloneMaterializedVersion(projectId: string): Promise<number | null> {
+    const record = this.projects.get(projectId);
+    return Promise.resolve(record === undefined ? null : record.cloneMaterializedAtVersion);
+  }
+
+  setCloneMaterializedVersion(projectId: string, version: number): Promise<void> {
+    const record = this.projects.get(projectId);
+    if (record === undefined) {
+      return Promise.reject(new ProjectNotFoundError(projectId));
+    }
+    record.cloneMaterializedAtVersion = version;
+    return Promise.resolve();
   }
 
   purgeDeletedProjects(): Promise<number> {

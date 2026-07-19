@@ -21,7 +21,7 @@
  * enforced at the write origin (the agent/editor layer), not here — this store
  * persists exactly the paths it is handed.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { ManifestEntrySchema, ProjectFileResponseSchema, ProjectSchema } from "@nyx/protocol";
 import type { ChatMessage, ManifestEntry, Project, ProjectFileResponse } from "@nyx/protocol";
 import type { Queryable } from "../db/index.js";
@@ -63,6 +63,26 @@ export interface CommitResult {
   readonly version: number;
 }
 
+/** One current file with its content + server-computed hash — the handoff read shape (US13). */
+export interface HandoffFile {
+  readonly path: string;
+  readonly content: string;
+  readonly contentHash: string;
+}
+
+/**
+ * One turn/user-edit COMMIT version (D48) carrying the files CHANGED at that version — the
+ * source the git materializer folds cumulatively into one synthesized commit each (D59/FR-076).
+ */
+export interface VersionSnapshot {
+  readonly version: number;
+  readonly author: FileAuthor;
+  /** Epoch-ms of the commit (the DB clock). */
+  readonly createdAt: number;
+  /** Files changed at this version (a git commit's tree accretes these across versions). */
+  readonly files: readonly HandoffFile[];
+}
+
 /** The write + read surface US7 depends on; extends the chat surface (T055). */
 export interface ProjectStore extends ChatStore {
   /** The owner's live (non-deleted) projects, oldest first. */
@@ -83,6 +103,20 @@ export interface ProjectStore extends ChatStore {
   getManifest(projectId: string): Promise<ManifestEntry[]>;
   /** Current content for one path, or `null` if it does not exist. */
   getFile(projectId: string, path: string): Promise<ProjectFileResponse | null>;
+  /** All current files with content + hash, ordered by path — the archive source (FR-074). */
+  getFiles(projectId: string): Promise<HandoffFile[]>;
+  /** Turn/user-edit versions oldest-first, files changed per version — git-synthesis source (D48/D59). */
+  getVersionHistory(projectId: string): Promise<VersionSnapshot[]>;
+  /** Mint + persist a fresh clone token for a project, replacing any prior one (D58). */
+  mintCloneToken(projectId: string): Promise<string>;
+  /** Null the clone token — revocation takes effect immediately (SC-043). */
+  revokeCloneToken(projectId: string): Promise<void>;
+  /** Resolve a clone token to its project (incl. soft-deleted), or `null` if unknown/revoked. */
+  getProjectByCloneToken(token: string): Promise<Project | null>;
+  /** Read the repo materialization watermark, or `null` if never materialized (EC-56). */
+  getCloneMaterializedVersion(projectId: string): Promise<number | null>;
+  /** Persist the repo materialization watermark (the version last materialized) (EC-56). */
+  setCloneMaterializedVersion(projectId: string, version: number): Promise<void>;
   /** Hard-delete projects whose recovery window has lapsed; returns the count. */
   purgeDeletedProjects(): Promise<number>;
   /** Prune history beyond the retention count AND age, keeping current; returns count. */
@@ -103,10 +137,17 @@ export interface PgProjectStoreOptions {
   readonly versionRetentionDays: number;
   /** Soft-deleted projects are recoverable for this many days (D49). Default 30. */
   readonly deletionRecoveryDays?: number;
+  /** Clone-token generator (D58); injectable for determinism. Default: 32 random bytes. */
+  readonly tokenGenerator?: () => string;
 }
 
 /** Default soft-delete recovery window — 30 days (D49). No config tunable owns this. */
 export const DEFAULT_DELETION_RECOVERY_DAYS = 30;
+
+/** Default clone-token generator — 32 unguessable bytes as url-safe base64 (D58). */
+export function defaultCloneTokenGenerator(): string {
+  return randomBytes(32).toString("base64url");
+}
 
 /** Deterministic server-side content hash — same content ⇒ same hash (D38). */
 export function computeContentHash(content: string): string {
@@ -158,6 +199,7 @@ export class PgProjectStore implements ProjectStore {
   private readonly versionRetentionCount: number;
   private readonly versionRetentionDays: number;
   private readonly deletionRecoveryDays: number;
+  private readonly tokenGenerator: () => string;
 
   constructor(
     private readonly db: ProjectDb,
@@ -170,6 +212,7 @@ export class PgProjectStore implements ProjectStore {
     this.versionRetentionCount = options.versionRetentionCount;
     this.versionRetentionDays = options.versionRetentionDays;
     this.deletionRecoveryDays = options.deletionRecoveryDays ?? DEFAULT_DELETION_RECOVERY_DAYS;
+    this.tokenGenerator = options.tokenGenerator ?? defaultCloneTokenGenerator;
   }
 
   appendChat(projectId: string, message: ChatWrite): Promise<ChatMessage> {
@@ -388,6 +431,139 @@ export class PgProjectStore implements ProjectStore {
     return row === undefined
       ? null
       : ProjectFileResponseSchema.parse({ path: row.path, content: row.content });
+  }
+
+  async getFiles(projectId: string): Promise<HandoffFile[]> {
+    const { rows } = await this.db.query<{ path: string; content: string; content_hash: string }>(
+      `SELECT path, content, content_hash FROM project_files WHERE project_id = $1 ORDER BY path`,
+      [projectId],
+    );
+    return rows.map((row) => ({
+      path: row.path,
+      content: row.content,
+      contentHash: row.content_hash,
+    }));
+  }
+
+  async getVersionHistory(projectId: string): Promise<VersionSnapshot[]> {
+    // Each row is one path's content at the version it CHANGED; group by version (oldest-first)
+    // so the git materializer folds them into one synthesized commit each (D48/D59).
+    const { rows } = await this.db.query<{
+      version: number;
+      path: string;
+      content: string;
+      content_hash: string;
+      author: FileAuthor;
+      created_at_ms: string;
+    }>(
+      `SELECT version::int AS version, path, content, content_hash, author,
+              (extract(epoch from created_at) * 1000)::bigint AS created_at_ms
+         FROM project_file_versions
+        WHERE project_id = $1
+        ORDER BY version, path`,
+      [projectId],
+    );
+    const byVersion = new Map<
+      number,
+      { author: FileAuthor; createdAt: number; files: HandoffFile[] }
+    >();
+    for (const row of rows) {
+      let bucket = byVersion.get(row.version);
+      if (bucket === undefined) {
+        bucket = { author: row.author, createdAt: Number(row.created_at_ms), files: [] };
+        byVersion.set(row.version, bucket);
+      }
+      bucket.files.push({ path: row.path, content: row.content, contentHash: row.content_hash });
+    }
+    return [...byVersion.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([version, bucket]) => ({
+        version,
+        author: bucket.author,
+        createdAt: bucket.createdAt,
+        files: bucket.files,
+      }));
+  }
+
+  async mintCloneToken(projectId: string): Promise<string> {
+    const token = this.tokenGenerator();
+    try {
+      const { rows } = await this.db.query<{ id: string }>(
+        `UPDATE projects SET clone_token = $2 WHERE id = $1 RETURNING id`,
+        [projectId, token],
+      );
+      if (rows[0] === undefined) {
+        throw new ProjectNotFoundError(projectId);
+      }
+      return token;
+    } catch (error) {
+      // A malformed (non-uuid) id is "not found", not a 500 (mirrors getProject).
+      if (isInvalidUuidError(error)) {
+        throw new ProjectNotFoundError(projectId);
+      }
+      throw error;
+    }
+  }
+
+  async revokeCloneToken(projectId: string): Promise<void> {
+    try {
+      const { rows } = await this.db.query<{ id: string }>(
+        `UPDATE projects SET clone_token = NULL WHERE id = $1 RETURNING id`,
+        [projectId],
+      );
+      if (rows[0] === undefined) {
+        throw new ProjectNotFoundError(projectId);
+      }
+    } catch (error) {
+      if (isInvalidUuidError(error)) {
+        throw new ProjectNotFoundError(projectId);
+      }
+      throw error;
+    }
+  }
+
+  async getProjectByCloneToken(token: string): Promise<Project | null> {
+    // The partial-unique index makes this at most one row; soft-deleted rows still resolve
+    // so the service can raise a DISABLED signal rather than leak the project's existence.
+    const { rows } = await this.db.query<ProjectRow>(
+      `SELECT ${PROJECT_COLUMNS} FROM projects WHERE clone_token = $1`,
+      [token],
+    );
+    const row = rows[0];
+    return row === undefined ? null : mapProject(row);
+  }
+
+  async getCloneMaterializedVersion(projectId: string): Promise<number | null> {
+    try {
+      const { rows } = await this.db.query<{ watermark: string | null }>(
+        `SELECT clone_materialized_at_version AS watermark FROM projects WHERE id = $1`,
+        [projectId],
+      );
+      const watermark = rows[0]?.watermark ?? null;
+      return watermark === null ? null : Number(watermark);
+    } catch (error) {
+      if (isInvalidUuidError(error)) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  async setCloneMaterializedVersion(projectId: string, version: number): Promise<void> {
+    try {
+      const { rows } = await this.db.query<{ id: string }>(
+        `UPDATE projects SET clone_materialized_at_version = $2 WHERE id = $1 RETURNING id`,
+        [projectId, version],
+      );
+      if (rows[0] === undefined) {
+        throw new ProjectNotFoundError(projectId);
+      }
+    } catch (error) {
+      if (isInvalidUuidError(error)) {
+        throw new ProjectNotFoundError(projectId);
+      }
+      throw error;
+    }
   }
 
   async purgeDeletedProjects(): Promise<number> {

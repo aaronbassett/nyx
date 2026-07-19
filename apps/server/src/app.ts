@@ -6,7 +6,7 @@
  * config loading, dependency construction, and `listen`.
  */
 import Fastify from "fastify";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest, FastifyServerOptions } from "fastify";
 import fastifyWebsocket from "@fastify/websocket";
 import { createRequireSession, PgSessionAuthStore, registerAuthRoutes } from "./auth/index.js";
 import type { AuthDb, SessionAuthStore } from "./auth/index.js";
@@ -19,8 +19,16 @@ import { registerHealthRoutes } from "./http/health.js";
 import type { DepositStore, LedgerStore } from "./ledger/index.js";
 import { registerLedgerRoutes } from "./ledger/routes.js";
 import type { McpClients } from "./mcp/index.js";
-import { createDeletionCascade, PgProjectStore, registerProjectRoutes } from "./projects/index.js";
-import type { DeletionCascade, ProjectStore } from "./projects/index.js";
+import {
+  createCloneService,
+  createDeletionCascade,
+  createInMemoryRepoCache,
+  createTokenBucketLimiter,
+  PgProjectStore,
+  registerGitHttpRoutes,
+  registerProjectRoutes,
+} from "./projects/index.js";
+import type { CloneService, DeletionCascade, ProjectStore } from "./projects/index.js";
 import { registerProverRoutes } from "./prover/index.js";
 import type { ProverClient } from "./prover/index.js";
 import { registerWs } from "./ws/index.js";
@@ -47,6 +55,13 @@ export interface ServerDeps {
   readonly projectStore?: ProjectStore;
   /** Optional soft-delete cascade (US7); defaults to the no-op seams for now (D49). */
   readonly projectCascade?: DeletionCascade;
+  /**
+   * Optional clone/handoff service (US13). When omitted, a default is constructed from the
+   * resolved project store + config rate-limit tunables (ONE shared repo cache + limiter for
+   * the process). `index.ts` injects one explicitly so the same instance backs both the
+   * session-gated handoff routes and the token-gated git-HTTP scope.
+   */
+  readonly cloneService?: CloneService;
   /**
    * Optional NYXT ledger store (US1/US6). When present alongside {@link ServerDeps.depositStore}
    * and a live session gate, the `GET /ledger` + `POST /deposits` + `GET /deposits/:ref`
@@ -111,9 +126,69 @@ function resolveProjectStore(deps: ServerDeps): ProjectStore | undefined {
     : undefined;
 }
 
+/**
+ * Resolve the clone/handoff service: an injected one (index.ts shares a single process-wide
+ * instance), else a default built from the project store + config rate-limit tunables. The
+ * default's repo cache + token bucket are scoped to this server instance, which is exactly
+ * what the deterministic route tests need (they inject their own when they must control it).
+ */
+function resolveCloneService(deps: ServerDeps, store: ProjectStore): CloneService {
+  if (deps.cloneService !== undefined) {
+    return deps.cloneService;
+  }
+  const { tunables } = deps.config;
+  return createCloneService({
+    store,
+    rateLimiter: createTokenBucketLimiter({
+      capacity: tunables.cloneRateCapacity,
+      refillTokens: tunables.cloneRateRefill,
+      intervalMs: tunables.cloneRateIntervalMs,
+      clock: () => Date.now(),
+    }),
+    cache: createInMemoryRepoCache(),
+  });
+}
+
+/**
+ * Mask the clone token in a request URL for logging. A URL of the form /git/TOKEN/info/refs
+ * becomes /git/***\/info/refs. The clone token is a BEARER credential carried in the URL PATH
+ * (D58), so the default request logger would otherwise write it verbatim on every clone. Only
+ * the token segment is masked; all other URLs pass through unchanged.
+ */
+export function maskCloneToken(url: string): string {
+  return url.replace(/(\/git\/)[^/?#]+/, "$1***");
+}
+
+/**
+ * Fastify server options (exported so the hardening is unit-testable without capturing logs):
+ *  - trustProxy: Nyx runs behind Fly's trusted edge, so request.ip must reflect the real client
+ *    via X-Forwarded-For rather than the proxy; otherwise the EC-55 per-IP clone rate-limit
+ *    bucket collapses to a single global bucket.
+ *  - logger.serializers.req: masks the clone-token path segment (a bearer-in-URL credential) in
+ *    every logged request line.
+ */
+export const serverOptions: FastifyServerOptions = {
+  trustProxy: true,
+  logger: {
+    serializers: {
+      req: (request: FastifyRequest) => {
+        const remotePort = request.socket.remotePort;
+        return {
+          method: request.method,
+          url: maskCloneToken(request.url),
+          host: request.hostname,
+          remoteAddress: request.ip,
+          // Only when defined: `exactOptionalPropertyTypes` forbids an explicit `undefined`.
+          ...(remotePort === undefined ? {} : { remotePort }),
+        };
+      },
+    },
+  },
+};
+
 /** Build a fully-wired (but not-yet-listening) Fastify instance. */
 export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
-  const app = Fastify({ logger: true });
+  const app = Fastify(serverOptions);
 
   await app.register(fastifyWebsocket);
 
@@ -147,7 +222,16 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
                 },
               },
         );
-      registerProjectRoutes(app, { store: projectStore, requireSession, cascade });
+      // US13 handoff: ONE clone service backs both the session-gated archive/clone-token
+      // routes and the token-gated git-HTTP scope, so they share a rate limiter + repo cache.
+      const cloneService = resolveCloneService(deps, projectStore);
+      registerProjectRoutes(app, { store: projectStore, requireSession, cascade, cloneService });
+
+      // Token-gated (NOT session-gated) smart-HTTP git surface. Registered as a SEPARATE
+      // encapsulated scope (like the prover proxy) because `handleGitHttp` enforces the token +
+      // rate limit + soft-delete itself — `requireSession` must NOT gate it (a `git clone`
+      // carries no session cookie, only the clone token in the path).
+      registerGitHttpRoutes(app, { cloneService });
 
       // Deploy reads (US8): `GET /projects/:id/deploys`, behind the same session gate + ownership.
       // Registers only when BOTH the registry and a project store are present — ownership resolves

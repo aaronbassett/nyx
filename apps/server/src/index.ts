@@ -33,7 +33,13 @@ import type { ReconcileAlarm } from "./ledger/reconcile.js";
 import { createReconcileScheduler } from "./ledger/reconcile-scheduler.js";
 import { createMcpClients } from "./mcp/index.js";
 import { createProjectAuthorizer } from "./projects/authorize.js";
-import { PgChatStore, PgProjectStore } from "./projects/index.js";
+import {
+  createCloneService,
+  createInMemoryRepoCache,
+  createTokenBucketLimiter,
+  PgChatStore,
+  PgProjectStore,
+} from "./projects/index.js";
 import { createProverClient } from "./prover/index.js";
 import { PgSessionStore, createWsHandler } from "./protocol/index.js";
 import { createTurnCoordinator } from "./turn/coordinator.js";
@@ -130,6 +136,20 @@ async function main(): Promise<void> {
   const proverClient = createProverClient({ baseUrl: config.prover.url });
   const chat = new PgChatStore(db);
 
+  // US13 handoff: ONE clone service for the whole process — a single shared repo-materialization
+  // cache (EC-56) + a single token/IP rate-limit bucket (EC-55) back BOTH the session-gated
+  // archive/clone-token routes and the token-gated git-HTTP scope. Pure construction, no network.
+  const cloneService = createCloneService({
+    store: projectStore,
+    rateLimiter: createTokenBucketLimiter({
+      capacity: config.tunables.cloneRateCapacity,
+      refillTokens: config.tunables.cloneRateRefill,
+      intervalMs: config.tunables.cloneRateIntervalMs,
+      clock: () => Date.now(),
+    }),
+    cache: createInMemoryRepoCache(),
+  });
+
   // The supervisor turn loop (D34): its `handlers` drive one turn per `prompt:submit`.
   const coordinator = createTurnCoordinator({
     modelRouter,
@@ -204,6 +224,7 @@ async function main(): Promise<void> {
     mcp,
     wsHandler,
     projectStore,
+    cloneService,
     ledgerStore,
     depositStore,
     proverClient,

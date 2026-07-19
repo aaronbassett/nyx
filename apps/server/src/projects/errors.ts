@@ -59,3 +59,35 @@ export class RestoreWindowExpiredError extends Error {
     this.name = "RestoreWindowExpiredError";
   }
 }
+
+/**
+ * Handoff was attempted for a soft-deleted project (US13/D58). A deleted project's
+ * clone token is still resolvable, so this is a distinct DISABLED signal rather than a
+ * not-found — the route can tell the owner their handoff paused with the project.
+ */
+export class HandoffDisabledError extends Error {
+  constructor(readonly projectId: string) {
+    super(`handoff disabled for deleted project: ${projectId}`);
+    this.name = "HandoffDisabledError";
+  }
+}
+
+/**
+ * A clone token that resolved to nothing — never minted, or REVOKED (D58/SC-043).
+ * Carries no project id so a probing attacker learns nothing beyond "no such token";
+ * revocation takes effect the instant the token column is nulled.
+ */
+export class CloneTokenNotFoundError extends Error {
+  constructor() {
+    super("clone token not found");
+    this.name = "CloneTokenNotFoundError";
+  }
+}
+
+/** Too many clone-auth attempts for one token/IP within the window (EC-55). */
+export class CloneRateLimitError extends Error {
+  constructor(readonly clientKey: string) {
+    super("clone rate limit exceeded");
+    this.name = "CloneRateLimitError";
+  }
+}
