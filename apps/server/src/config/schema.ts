@@ -185,6 +185,13 @@ export const EnvSchema = z.object({
   VERSION_RETENTION_DAYS: positiveInt.default(30), // days retained (D48)
   DEPOSIT_REF_TTL_MS: positiveInt.default(3_600_000), // 1 h deposit-ref TTL (D45)
   RECONCILE_CADENCE_MS: positiveInt.default(86_400_000), // daily reconcile (D56)
+  // Clone/handoff git-HTTP rate limit (US13/EC-55) — a token/IP token bucket. All three
+  // are OPTIONAL with sane defaults, so no NEW required env var (adding one would break
+  // every server test fixture). A ~30-attempt burst refilling 30/min throttles a token
+  // brute-force cheaply while never blocking an ordinary `git clone`.
+  CLONE_RATE_CAPACITY: positiveInt.default(30), // burst of clone-auth attempts before throttling
+  CLONE_RATE_REFILL: positiveInt.default(30), // attempts replenished per interval
+  CLONE_RATE_INTERVAL_MS: positiveInt.default(60_000), // 1 min refill window
   PROVER_RATE_LIMIT_MAX: positiveInt.default(60), // requests per window per session (D52)
   PROVER_RATE_LIMIT_WINDOW_MS: positiveInt.default(60_000), // 1 min rate-limit window (D52)
   SESSION_LIFETIME_MS: positiveInt.default(604_800_000), // 7-day sliding session (D44)
@@ -252,6 +259,12 @@ export interface Tunables {
   readonly depositRefTtlMs: number;
   readonly reconcileCadenceMs: number;
   readonly sessionLifetimeMs: number;
+  /** Clone/handoff git-HTTP rate-limit bucket capacity (burst) (EC-55). */
+  readonly cloneRateCapacity: number;
+  /** Clone/handoff attempts replenished per {@link Tunables.cloneRateIntervalMs} (EC-55). */
+  readonly cloneRateRefill: number;
+  /** Clone/handoff rate-limit refill window, in ms (EC-55). */
+  readonly cloneRateIntervalMs: number;
 }
 
 /**
