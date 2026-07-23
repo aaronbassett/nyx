@@ -117,6 +117,12 @@ importers:
 
   apps/web:
     dependencies:
+      '@midnight-ntwrk/ledger-v8':
+        specifier: 8.1.0
+        version: 8.1.0
+      '@midnight-ntwrk/wallet-sdk-address-format':
+        specifier: 3.1.2
+        version: 3.1.2
       '@monaco-editor/react':
         specifier: ^4.7.0
         version: 4.7.0(monaco-editor@0.55.1)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
