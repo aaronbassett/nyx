@@ -78,6 +78,7 @@ import { ArtifactOrchestrator } from "../compile/index.js";
 import type { CheckRequest, CompileClient, CompileTurnInput } from "../compile/index.js";
 import type { LedgerStore } from "../ledger/ledger.js";
 import type { ChatStore } from "../projects/chat.js";
+import type { ProjectStore } from "../projects/store.js";
 import type { ConnectionContext, EventRouter } from "../protocol/router.js";
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -178,6 +179,8 @@ export interface TurnCoordinatorDeps {
   readonly ledger: LedgerStore;
   /** Chat persistence + rehydration (D23); the cold-start signal (FR-003). */
   readonly chat: ChatStore;
+  /** Turn-end file persistence (US7 store; the US13 exports + US14 editor read path depend on it). */
+  readonly projectStore: Pick<ProjectStore, "commit">;
   /** The three named MCP clients the swarm retrieves + compiles through. */
   readonly mcp: TurnCoordinatorMcp;
   /** The flat pre-turn reserve in NYXT base units (D34/D47). */
@@ -595,6 +598,11 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
         flatReserve: deps.flatReserve,
         classifyIntent,
         subAgents,
+        // Turn-end file persistence: commit the turn's accumulated files as ONE
+        // agent-authored batch at the last committed version (US7 SC-026) so a settled
+        // turn is never hollow (the US13 exports + US14 editor read these rows).
+        commitFiles: (projectId, files) =>
+          deps.projectStore.commit(projectId, { author: "agent", files }),
         // The per-cycle CHECK is the fast path: adapt the input and hand back the service's
         // `{ ok, diagnostics, … }` verbatim (a structural superset of `CheckOutcome`).
         checkCompile: (input) => deps.compileClient.check(toCheckRequest(input)),

@@ -72,6 +72,7 @@ import type {
 } from "@nyx/protocol";
 import type { CompileOutcome, CompileTurnInput, Diagnostic, SourceFile } from "../compile/index.js";
 import type { ChatStore } from "../projects/chat.js";
+import type { CommitResult, FileWrite } from "../projects/store.js";
 import type { Balance, LedgerStore } from "../ledger/ledger.js";
 import { InsufficientAvailableError } from "../ledger/ledger.js";
 import { capTestResults } from "./coverage.js";
@@ -242,6 +243,13 @@ export interface SupervisorDeps {
   readonly runFullCompile: FullCompiler;
   /** Chat persistence + rehydration (D23); also the cold-start signal (FR-003). */
   readonly chat: ChatStore;
+  /**
+   * Persist a turn's accumulated files as ONE agent-authored commit (SC-026) at every
+   * turn ending that reached the verify loop. REQUIRED — the US13 exports and the US14
+   * editor read the resulting `project_file_versions` rows; a settled turn must never be
+   * hollow. Production wires it to {@link ProjectStore.commit} with `author: "agent"`.
+   */
+  readonly commitFiles: (projectId: string, files: readonly FileWrite[]) => Promise<CommitResult>;
   /** The flat pre-turn reserve in NYXT base units (D34/D47). */
   readonly flatReserve: bigint;
   /** Intent classification (D25). */
@@ -629,6 +637,9 @@ class TurnSupervisor implements Supervisor {
     let cycles = 0;
     let compileDiagnostics: readonly Diagnostic[] = [];
     let testFailures: readonly TestFailure[] = [];
+    // The turn's accumulated files across ALL cycles (a later cycle overrides an earlier
+    // one per path), persisted as ONE agent commit at every ending that reaches the loop.
+    const turnFiles = new Map<string, FileWrite>();
 
     try {
       for (;;) {
@@ -647,6 +658,7 @@ class TurnSupervisor implements Supervisor {
         const work = await this.runCycleAgents(ctx, cycleCtx, coldStart);
         totalTokens += work.tokens;
         for (const file of work.files) {
+          turnFiles.set(file.path, { path: file.path, content: file.content });
           await this.emitFileWrite(ctx, file);
         }
 
@@ -672,6 +684,7 @@ class TurnSupervisor implements Supervisor {
           });
           const decision = budget.recordTestResult(false, check.diagnostics);
           if (decision.kind === "exhausted") {
+            await this.persistTurnFiles(ctx, turnId, projectId, turnFiles);
             return await this.exhaustedEnding(ctx, {
               params,
               consumed: totalTokens,
@@ -693,9 +706,11 @@ class TurnSupervisor implements Supervisor {
           // (D35/FR-029) — never a mere check-pass, never before the tests run. Then the
           // done-presentation.
           await trigger.triggerOnGreen(decision, compileInput);
+          await this.persistTurnFiles(ctx, turnId, projectId, turnFiles);
           return await this.greenEnding(ctx, { params, consumed: totalTokens, cycles });
         }
         if (decision.kind === "exhausted") {
+          await this.persistTurnFiles(ctx, turnId, projectId, turnFiles);
           return await this.exhaustedEnding(ctx, {
             params,
             consumed: totalTokens,
@@ -715,6 +730,7 @@ class TurnSupervisor implements Supervisor {
       }
     } catch (error) {
       if (error instanceof InfraFailureError) {
+        await this.persistTurnFiles(ctx, turnId, projectId, turnFiles);
         return await this.infraEnding(ctx, {
           params,
           consumed: totalTokens,
@@ -723,6 +739,32 @@ class TurnSupervisor implements Supervisor {
         });
       }
       throw error;
+    }
+  }
+
+  /**
+   * Persist the turn's accumulated files as one agent commit (SC-026). Persistence must
+   * NEVER break the money path: a failed commit is logged onto the activity feed and
+   * swallowed — the turn still settles, the files still live in the client VFS. An empty
+   * turn (no files produced) writes nothing (no phantom empty version).
+   */
+  private async persistTurnFiles(
+    ctx: SupervisorContext,
+    turnId: string,
+    projectId: string,
+    turnFiles: ReadonlyMap<string, FileWrite>,
+  ): Promise<void> {
+    if (turnFiles.size === 0) {
+      return;
+    }
+    try {
+      await this.deps.commitFiles(projectId, [...turnFiles.values()]);
+    } catch (error) {
+      await this.emitActivity(ctx, turnId, {
+        agent: "supervisor",
+        phase: "persist",
+        detail: `file persistence failed (${error instanceof Error ? error.message : String(error)}); files remain in the container only`,
+      });
     }
   }
 

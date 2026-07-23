@@ -156,6 +156,9 @@ async function main(): Promise<void> {
     compileClient,
     ledger: ledgerStore,
     chat,
+    // Turn-end file persistence (US7): a settled turn commits its files as one agent
+    // batch so the US13 exports + US14 editor read real rows, not a hollow project.
+    projectStore,
     mcp,
     flatReserve: config.tunables.flatReserveNyxt,
   });
