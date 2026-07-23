@@ -8,6 +8,7 @@
   },
   "scripts": {
     "lint": "eslint . --max-warnings 0",
+    "check:sfw": "node scripts/check-sfw.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "typecheck": "pnpm -r --if-present typecheck",
