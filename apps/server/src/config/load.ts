@@ -87,10 +87,6 @@ function assembleSecrets(env: Env): ServerSecrets {
   return {
     databaseUrl: env.DATABASE_URL,
     deployKey: env.DEPLOY_KEY,
-    compileServiceToken: env.COMPILE_SERVICE_TOKEN,
-    r2AccessKeyId: env.R2_ACCESS_KEY_ID,
-    r2SecretAccessKey: env.R2_SECRET_ACCESS_KEY,
-    r2AccountId: env.R2_ACCOUNT_ID,
     ...(env.OPENAI_API_KEY !== undefined ? { openaiApiKey: env.OPENAI_API_KEY } : {}),
     ...(env.ANTHROPIC_API_KEY !== undefined ? { anthropicApiKey: env.ANTHROPIC_API_KEY } : {}),
     ...(env.GOOGLE_API_KEY !== undefined ? { googleApiKey: env.GOOGLE_API_KEY } : {}),
@@ -109,7 +105,6 @@ function assemble(env: Env, modelRouting: ModelRoutingTable): Config {
     publicOrigin: env.PUBLIC_ORIGIN ?? `http://localhost:${String(env.PORT)}`,
     network: resolveNetworkProfile(env),
     mcp: {
-      toolchainUrl: env.MCP_TOOLCHAIN_URL,
       tomeUrl: env.MCP_TOME_URL,
       mnmUrl: env.MCP_MNM_URL,
       timeoutMs: env.MCP_TIMEOUT_MS,
@@ -121,12 +116,13 @@ function assemble(env: Env, modelRouting: ModelRoutingTable): Config {
       rateLimit: { max: env.PROVER_RATE_LIMIT_MAX, windowMs: env.PROVER_RATE_LIMIT_WINDOW_MS },
       tokenLifetimeMs: env.PROVING_TOKEN_LIFETIME_MS,
     },
-    compileService: {
-      url: env.COMPILE_SERVICE_URL,
-    },
-    r2: {
-      publicBaseUrl: env.R2_PUBLIC_BASE_URL,
-      bucket: env.R2_BUCKET,
+    artifacts: {
+      rootDir: env.ARTIFACT_STORE_ROOT,
+      maxFileBytes: env.ARTIFACT_MAX_FILE_BYTES,
+      maxBundleBytes: env.ARTIFACT_MAX_BUNDLE_BYTES,
+      // Conditional so `exactOptionalPropertyTypes` holds — a `string | undefined` field is
+      // fine to assign directly, but keep the explicit value for the optional SRS cache dir.
+      srsCacheDir: env.SRS_CACHE_DIR,
     },
     tunables: {
       exchangeRateNyxtPerTnight: env.NYXT_EXCHANGE_RATE,
@@ -141,6 +137,8 @@ function assemble(env: Env, modelRouting: ModelRoutingTable): Config {
       depositRefTtlMs: env.DEPOSIT_REF_TTL_MS,
       reconcileCadenceMs: env.RECONCILE_CADENCE_MS,
       sessionLifetimeMs: env.SESSION_LIFETIME_MS,
+      compileCheckTimeoutMs: env.COMPILE_CHECK_TIMEOUT_MS,
+      compileFullTimeoutMs: env.COMPILE_FULL_TIMEOUT_MS,
       cloneRateCapacity: env.CLONE_RATE_CAPACITY,
       cloneRateRefill: env.CLONE_RATE_REFILL,
       cloneRateIntervalMs: env.CLONE_RATE_INTERVAL_MS,

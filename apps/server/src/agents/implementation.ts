@@ -4,37 +4,32 @@
  * The build step of a verify cycle: it writes the privacy-preserving Compact contract
  * + witnesses, the React frontend, and the behavioural tests for the plan — GROUNDED
  * in retrieval (the Midnight Manual `mnm` + the example corpus `tome`), never
- * hand-written from memory (D3, constitution I). Before it surfaces Compact it
- * COMPILES via the compiler MCP (FR-002): a `compile_check` tool wraps
- * {@link McpClient.call} on the `toolchain` client so the agent can iterate against
- * real diagnostics mid-loop, and — because FR-002 is a MUST — a guaranteed
- * compile-before-surface check runs on the produced Compact after the model finishes.
- * The SUPERVISOR still runs the authoritative per-cycle check; this agent's compile is
- * self-grounding (scenario 2).
+ * hand-written from memory (D3, constitution I).
  *
- * This module is the DETERMINISTIC core. The real LLM + the real MCP servers (mnm,
- * tome, the compiler toolchain) are OWNER-GATED, so everything here is exercised with a
+ * ⚠️ P2 — the compiler MCP is retired: user contracts compile in the USER'S BROWSER
+ * (`@nyx/compact-wasm`), so there is no compile-check tool here anymore. The authoritative
+ * compile feedback is the SUPERVISOR's per-cycle CHECK through the `CompileClient` seam
+ * (which now delegates to the browser toolchain); its diagnostics are fed forward into the
+ * next cycle's prompt (scenario 3) so the agent iterates against real compiler output.
+ *
+ * This module is the DETERMINISTIC core. The real LLM + the real retrieval MCP servers
+ * (mnm, tome) are OWNER-GATED, so everything here is exercised with a
  * {@link MockLanguageModelV4} and fake clients (constitution III/IV):
- *  - the Vercel AI SDK v7 {@link ToolLoopAgent} tool-wiring — `retrieve_manual` (mnm),
- *    `retrieve_examples` (tome), and `compile_check` (toolchain), each wrapping
- *    {@link McpClient.call} (preserving its D31 bounded-concurrency + deadlines);
- *  - FR-002 compile-before-surface: a guaranteed `toolchain.call(check, …)` on the
- *    produced Compact before the file set is returned;
+ *  - the Vercel AI SDK v7 {@link ToolLoopAgent} tool-wiring — `retrieve_manual` (mnm) and
+ *    `retrieve_examples` (tome), each wrapping {@link McpClient.call} (preserving its D31
+ *    bounded-concurrency + deadlines);
  *  - the typed {@link Output.object} file set → {@link SubAgentWork.files};
  *  - token accounting from the model usage → a `bigint` base-unit count (D34);
  *  - the fed-forward-diagnostics handling (a retry folds the prior cycle's compile
  *    diagnostics + failing tests into the prompt so the agent consults retrieval + the
  *    diagnostics rather than regenerating from memory — scenario 3);
- *  - loud propagation: an MCP fault (retrieval OR compile) NEVER gets swallowed — it
- *    re-throws so the supervisor's infra-retry owns it.
+ *  - loud propagation: a retrieval MCP fault NEVER gets swallowed — it re-throws so the
+ *    supervisor's infra-retry owns it.
  *
  * ⚠️ Assumed MCP tool contracts (flag — verify vs the live MCP servers before
  * un-gating, constitution I): the retrieval tool name is assumed
- * {@link MNM_RETRIEVAL_TOOL}/{@link TOME_RETRIEVAL_TOOL} (`"search"`, `{ query }`) and
- * the compiler tool name {@link TOOLCHAIN_CHECK_TOOL} (`"check"`, `{ files }`). NOTE the
- * real `compact-mcp` exposes `compile`/`diagnostics` (not `check`) and the Compile
- * Service exposes `/v1/check` — the exact MCP tool name + arg shape are unverified; all
- * are overridable via {@link ImplementationAgentDeps} so the owner can reconcile them.
+ * {@link MNM_RETRIEVAL_TOOL}/{@link TOME_RETRIEVAL_TOOL} (`"search"`, `{ query }`),
+ * overridable via {@link ImplementationAgentDeps} so the owner can reconcile them.
  */
 import { isStepCount, Output, tool, ToolLoopAgent } from "ai";
 import type { LanguageModel, LanguageModelUsage } from "ai";
@@ -56,9 +51,6 @@ export const MANUAL_RETRIEVAL_TOOL = "retrieve_manual";
 /** AI SDK tool name the model calls to search the example corpus (tome-backed). */
 export const EXAMPLES_RETRIEVAL_TOOL = "retrieve_examples";
 
-/** AI SDK tool name the model calls to compile-check the Compact draft (toolchain-backed). */
-export const COMPILE_CHECK_TOOL = "compile_check";
-
 /**
  * The MCP tool name invoked on the `mnm` client. ASSUMED `"search"` with a `{ query }`
  * argument — VERIFY against the live Midnight Manual MCP; overridable via
@@ -73,15 +65,7 @@ export const MNM_RETRIEVAL_TOOL = "search";
  */
 export const TOME_RETRIEVAL_TOOL = "search";
 
-/**
- * The MCP tool name invoked on the `toolchain` client for the fast compile CHECK.
- * ASSUMED `"check"` with a `{ files }` argument — the real `compact-mcp` exposes
- * `compile`/`diagnostics` and the Compile Service `/v1/check`, so this is UNVERIFIED;
- * overridable via {@link ImplementationAgentDeps.toolchainCheckTool} (constitution I).
- */
-export const TOOLCHAIN_CHECK_TOOL = "check";
-
-/** Default ToolLoopAgent step budget (retrieval + compile iterations + the final files). */
+/** Default ToolLoopAgent step budget (retrieval iterations + the final files). */
 export const DEFAULT_IMPLEMENTATION_STEPS = 12;
 
 // ── Seam types ─────────────────────────────────────────────────────────────────
@@ -102,8 +86,6 @@ export interface ImplementationAgentDeps {
   readonly mnm: McpCallable;
   /** The example-corpus retrieval client (required grounding source, D3). */
   readonly tome: McpCallable;
-  /** The compiler toolchain MCP client — compile-before-surface (FR-002). */
-  readonly toolchain: McpCallable;
   /** Max ToolLoopAgent steps; default {@link DEFAULT_IMPLEMENTATION_STEPS}. */
   readonly maxSteps?: number;
   /**
@@ -118,8 +100,6 @@ export interface ImplementationAgentDeps {
   readonly mnmRetrievalTool?: string;
   /** Override the assumed tome MCP tool name; default {@link TOME_RETRIEVAL_TOOL}. */
   readonly tomeRetrievalTool?: string;
-  /** Override the assumed compiler MCP tool name; default {@link TOOLCHAIN_CHECK_TOOL}. */
-  readonly toolchainCheckTool?: string;
 }
 
 // ── Structured output schema ─────────────────────────────────────────────────────
@@ -143,17 +123,16 @@ type ImplementationOutput = z.infer<typeof ImplementationOutputSchema>;
 /** A guard wrapping an MCP call: records the first fault so it can re-throw later. */
 type McpGuard = <T>(op: () => Promise<T>) => Promise<T>;
 
-/** The implementation system prompt — mandates retrieval grounding + a compile check. */
+/** The implementation system prompt — mandates retrieval grounding for every Compact/SDK shape. */
 const IMPLEMENTATION_INSTRUCTIONS = [
   "You are the Implementation agent for Nyx, a prompt-to-DApp builder for Midnight.",
   "Write the privacy-preserving Compact contract and witnesses, the React frontend, and the",
   "behavioural tests for the plan. GROUND every Compact and SDK shape in retrieval: call",
   "retrieve_manual (the Midnight Manual) and retrieve_examples (the example corpus) before you",
   "write any contract, ledger ADT, stdlib call, witness, or SDK API. Never write Compact or SDK",
-  "code from memory. Before surfacing Compact, call compile_check to compile it via the compiler",
-  "MCP and iterate on any diagnostics. If prior compile diagnostics or failing tests are",
-  "provided, fix them — re-consult retrieval for the exact shapes and re-run compile_check.",
-  "Return the full file set with a narration and an activity list.",
+  "code from memory. Your Compact is compiled in the user's browser toolchain each cycle; if",
+  "prior compile diagnostics or failing tests are provided, fix them — re-consult retrieval for",
+  "the exact shapes. Return the full file set with a narration and an activity list.",
 ].join(" ");
 
 /** The separator between the agent's base instructions and any appended platform steering. */
@@ -170,11 +149,6 @@ function composeInstructions(base: string, steering: string | undefined): string
   return steering === undefined || steering.length === 0
     ? base
     : `${base}${STEERING_SEPARATOR}${steering}`;
-}
-
-/** True when the change set carries a Compact source file (compile-before-surface, FR-002). */
-function hasCompactFile(files: readonly SourceFile[]): boolean {
-  return files.some((file) => file.path.endsWith(".compact"));
 }
 
 /** Build a retrieval tool over an MCP client, routing faults through the guard. */
@@ -274,10 +248,10 @@ function buildWork(
 
 /**
  * Construct the implementation sub-agent — the supervisor's
- * {@link SubAgents.implementation} seam (T140). Each invocation grounds in retrieval,
- * produces the file set, and — when the change set includes Compact — runs a guaranteed
- * compile-before-surface check (FR-002). Any MCP fault (retrieval or compile) re-throws
- * so the supervisor's infra-retry owns it.
+ * {@link SubAgents.implementation} seam (T140). Each invocation grounds in retrieval and
+ * produces the file set; the browser toolchain compiles the produced Compact each cycle
+ * (P2), so there is no in-agent compile step. Any retrieval MCP fault re-throws so the
+ * supervisor's infra-retry owns it.
  */
 export function createImplementationAgent(
   deps: ImplementationAgentDeps,
@@ -285,7 +259,6 @@ export function createImplementationAgent(
   const maxSteps = deps.maxSteps ?? DEFAULT_IMPLEMENTATION_STEPS;
   const mnmTool = deps.mnmRetrievalTool ?? MNM_RETRIEVAL_TOOL;
   const tomeTool = deps.tomeRetrievalTool ?? TOME_RETRIEVAL_TOOL;
-  const toolchainCheckTool = deps.toolchainCheckTool ?? TOOLCHAIN_CHECK_TOOL;
   // Stable across every invocation (ctx-independent): the base instructions augmented by
   // any injected platform steering (`@nyx/scaffold` house rules).
   const instructions = composeInstructions(IMPLEMENTATION_INSTRUCTIONS, deps.steering);
@@ -319,14 +292,6 @@ export function createImplementationAgent(
         "Search the Midnight example corpus for working contract/frontend patterns.",
         guard,
       ),
-      [COMPILE_CHECK_TOOL]: tool({
-        description:
-          "Compile the current Compact draft via the compiler MCP and return its diagnostics. " +
-          "Call this before surfacing Compact and iterate until it is clean (FR-002).",
-        inputSchema: z.object({ files: z.array(OutputFileSchema) }),
-        execute: (input) =>
-          guard(() => deps.toolchain.call(toolchainCheckTool, { files: input.files })),
-      }),
     };
 
     const agent = new ToolLoopAgent({
@@ -351,15 +316,6 @@ export function createImplementationAgent(
       throwCaptured(capturedMcpError);
     }
 
-    const work = buildWork(result.output, "implementation", ctx.cycle, usageToTokens(result.usage));
-
-    // FR-002 (MUST) — compile-before-surface: compile the produced Compact via the
-    // compiler MCP so no Compact is surfaced un-compiled. A transport/service fault
-    // throws naturally into the supervisor's infra path.
-    if (hasCompactFile(work.files)) {
-      await deps.toolchain.call(toolchainCheckTool, { files: work.files });
-    }
-
-    return work;
+    return buildWork(result.output, "implementation", ctx.cycle, usageToTokens(result.usage));
   };
 }

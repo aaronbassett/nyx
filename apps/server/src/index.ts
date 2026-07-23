@@ -11,6 +11,7 @@
 import { randomUUID } from "node:crypto";
 import { buildServer } from "./app.js";
 import { createModelRouter } from "./agents/routing.js";
+import { createLocalArtifactStore, storeFetchAdapter } from "./artifacts/index.js";
 import { createBrowserCompileClient, createCompileResultsInbox } from "./compile/index.js";
 import type { BrowserCompileSession } from "./compile/index.js";
 import { ConfigValidationError, loadConfig } from "./config/index.js";
@@ -53,15 +54,6 @@ import { createTurnCoordinator } from "./turn/coordinator.js";
  * memory). `assertCanDeploy` still fails closed on an EMPTY wallet via the per-deploy floor.
  */
 const DEPLOY_WALLET_LOW_THRESHOLD_TDUST = 0n;
-
-/**
- * No-hang backstops (D42) for the browser-delegated compile: a dead/silent tab that never
- * replies `compile:results` resolves as a FAILED verdict after these bounds (a failing check
- * or a `CompileJobTimeoutError` the orchestrator maps to `timeout`), never an infinite wait.
- * Generous ceilings — the real verdict lands first on any live browser; owner-tunable later.
- */
-const BROWSER_CHECK_TIMEOUT_MS = 180_000;
-const BROWSER_FULL_TIMEOUT_MS = 180_000;
 
 /** Unref'd delay so a bounded compile-inbox wait never pins the process (mirrors the coordinator). */
 function unrefDelay(ms: number): Promise<void> {
@@ -142,18 +134,28 @@ async function main(): Promise<void> {
     apiKeys: providerApiKeys(config.secrets),
   });
   // P2 browser-compile wiring: the per-cycle CHECK + the green FULL compile now run in the
-  // USER'S browser (the retired server-side Compile Service + R2-write path is gone). ONE shared
-  // rendezvous inbox backs both the per-turn client (which awaits `compile:results`) and the WS
-  // handler (which delivers to it, ownership-gated). `config.publicOrigin` builds the artifact
-  // URLs the orchestrator reads over its `fetch` seam before announcing `artifacts:ready`.
+  // USER'S browser (the retired server-side Compile Service + R2-write path is gone). The
+  // browser uploads its green artifacts to the server's OWN durable {@link ArtifactStore}
+  // (content-hash-addressed, size-capped from config); `storeFetchAdapter` gives the
+  // orchestrator an IN-PROCESS `fetch` over that same store so verify-before-announce reads the
+  // committed prefix without HTTP-ing the server's own artifact route.
+  const artifactStore = createLocalArtifactStore({
+    rootDir: config.artifacts.rootDir,
+    maxFileBytes: config.artifacts.maxFileBytes,
+    maxBundleBytes: config.artifacts.maxBundleBytes,
+  });
+  // ONE shared rendezvous inbox backs both the per-turn client (which awaits `compile:results`)
+  // and the WS handler (which delivers to it, ownership-gated). `config.publicOrigin` builds the
+  // artifact URLs the orchestrator resolves through `fetchArtifact` before announcing
+  // `artifacts:ready`; the bounded CHECK/FULL waits are config tunables (D42 no-hang backstops).
   const compileInbox = createCompileResultsInbox({ delay: unrefDelay });
   const makeCompileClient = (session: BrowserCompileSession) =>
     createBrowserCompileClient({
       inbox: compileInbox,
       session,
       publicOrigin: config.publicOrigin,
-      checkTimeoutMs: BROWSER_CHECK_TIMEOUT_MS,
-      fullTimeoutMs: BROWSER_FULL_TIMEOUT_MS,
+      checkTimeoutMs: config.tunables.compileCheckTimeoutMs,
+      fullTimeoutMs: config.tunables.compileFullTimeoutMs,
     });
   const ledgerStore = createLedgerStore(db, { flatReserve: config.tunables.flatReserveNyxt });
   const depositStore = createDepositStore(db, ledgerStore, {
@@ -189,6 +191,10 @@ async function main(): Promise<void> {
     projectStore,
     mcp,
     flatReserve: config.tunables.flatReserveNyxt,
+    // Verify-before-announce reads the browser-uploaded artifacts from the server's OWN store
+    // over an in-process `fetch` — with browser compile the urlPrefix points at the server's own
+    // artifact route, so a real `fetch` would HTTP itself; the store adapter reads it directly.
+    fetchArtifact: storeFetchAdapter(artifactStore),
   });
 
   // The US8 deploy loop. All seam construction, no network: the executor, the wallet balance
@@ -255,6 +261,11 @@ async function main(): Promise<void> {
     mcp,
     wsHandler,
     projectStore,
+    // The durable, size-capped artifact store the browser publishes green compiles to (P2) —
+    // the SAME instance the coordinator reads through `storeFetchAdapter`, so an upload the WS
+    // route commits is exactly what verify-before-announce sees. buildServer's in-memory default
+    // is only for tests.
+    artifactStore,
     cloneService,
     ledgerStore,
     depositStore,

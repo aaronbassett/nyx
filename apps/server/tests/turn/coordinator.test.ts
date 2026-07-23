@@ -94,7 +94,6 @@ const stubModelRouter: ModelRouter = {
 
 /** MCP clients that fail loudly if called (the swarm is overridden in these tests). */
 const stubMcp: TurnCoordinatorMcp = {
-  toolchain: { call: () => Promise.reject(new Error("toolchain.call unexpected")) },
   tome: { call: () => Promise.reject(new Error("tome.call unexpected")) },
   mnm: { call: () => Promise.reject(new Error("mnm.call unexpected")) },
 };
@@ -693,7 +692,6 @@ describe("default swarm steering injection (@nyx/scaffold, US1 D3/FR-003/FR-080)
 
     // Resolving MCP fakes (the default build wires these into every sub-agent).
     const routedMcp: TurnCoordinatorMcp = {
-      toolchain: { call: () => Promise.resolve({ ok: true, diagnostics: [] }) },
       tome: { call: () => Promise.resolve({ skills: [] }) },
       mnm: { call: () => Promise.resolve({ docs: [] }) },
     };

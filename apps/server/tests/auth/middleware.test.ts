@@ -25,16 +25,10 @@ const SESSION_LIFETIME_MS = 604_800_000; // 7 days (D44).
 
 const TEST_ENV: NodeJS.ProcessEnv = {
   DATABASE_URL: "postgres://user:pass@localhost:5432/nyx_test",
-  MCP_TOOLCHAIN_URL: "http://toolchain.test.local/mcp",
   MCP_TOME_URL: "http://tome.test.local/mcp",
   MCP_MNM_URL: "http://mnm.test.local/mcp",
   PROVER_URL: "http://prover.test.local",
-  COMPILE_SERVICE_URL: "http://compile.test.local",
-  COMPILE_SERVICE_TOKEN: "test-compile-token",
   DEPLOY_KEY: "test-deploy-key",
-  R2_ACCESS_KEY_ID: "test-access-key",
-  R2_SECRET_ACCESS_KEY: "test-secret-key",
-  R2_ACCOUNT_ID: "test-account-id",
   MODEL_ROUTING: JSON.stringify({
     supervisor: { provider: "anthropic", model: "claude" },
     scaffolding: { provider: "anthropic", model: "claude" },

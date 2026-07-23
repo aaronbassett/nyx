@@ -1,17 +1,13 @@
 /**
- * Compile Service HTTP client (US2 — compile pipeline, T066).
+ * The {@link CompileClient} interface + the {@link runCompileJob} submit→poll loop
+ * (US2 — compile pipeline, T066).
  *
- * The Nyx-side client for the owner-built Compile Service (`infra/compile-service/
- * API.md`). Nyx does NOT compile or write R2 — the service holds the only R2 write
- * credentials (constitution III); Nyx authenticates with a server-only bearer
- * token (`COMPILE_SERVICE_TOKEN`) that grants compile+publish, not raw R2 access.
- *
- * Injectable transport mirrors the web auth client (`apps/web/src/wallet/auth.ts`):
- * `{ fetch, baseUrl, token }` — relative `/v1/*` paths under the base, a mockable
- * `fetch`, no real service in tests. The four endpoint methods (`check`,
- * `compile`, `pollCompile`, `version`) validate every 2xx body against the §3/§4
- * contract schemas. A compile FAILURE is DATA (`ok:false` / job `status:"failed"`)
- * — only transport/service faults throw a named {@link CompileServiceError}.
+ * P2 retired the HTTP Compile Service: the concrete client is now
+ * {@link createBrowserCompileClient} (`./browser-client.ts`), which delegates the compile
+ * to the user's browser toolchain (`@nyx/compact-wasm`). This module keeps only the
+ * TRANSPORT-AGNOSTIC contract every compile client satisfies — the {@link CompileClient}
+ * interface the orchestrator/supervisor drive — plus {@link runCompileJob}, the submit→poll
+ * loop the orchestrator wraps a full compile in.
  *
  * {@link runCompileJob} is the submit→poll loop (§4.2→§4.3): it surfaces
  * queued/running `progress` and enforces a BOUNDED max wait with an INJECTABLE
@@ -19,19 +15,7 @@
  * deterministically testable and a hung job raises {@link CompileJobTimeoutError}
  * rather than looping forever.
  */
-import {
-  CompileJobTimeoutError,
-  CompileServiceProtocolError,
-  CompileServiceResponseError,
-  CompileServiceUnavailableError,
-} from "./errors.js";
-import {
-  CheckResponseSchema,
-  CompileJobSchema,
-  CompileSubmitResponseSchema,
-  CompilerVersionsSchema,
-  ServiceErrorBodySchema,
-} from "./schemas.js";
+import { CompileJobTimeoutError } from "./errors.js";
 import type {
   CheckRequest,
   CheckResponse,
@@ -43,25 +27,6 @@ import type {
   JobStatus,
 } from "./schemas.js";
 
-/** A minimal zod schema surface the client uses to validate a response body. */
-interface ResponseSchema<T> {
-  safeParse(data: unknown): { success: true; data: T } | { success: false; error: unknown };
-}
-
-/**
- * Injectable transport. `token` is the server-only bearer (required); `fetch`
- * defaults to the global and `baseUrl` to `""` so tests drive relative paths
- * against a mock, and a deployment points at the private `.flycast` service.
- */
-export interface CompileServiceClientDeps {
-  /** The server-only `COMPILE_SERVICE_TOKEN` sent as `Authorization: Bearer`. */
-  readonly token: string;
-  /** `fetch` implementation; defaults to `globalThis.fetch`. */
-  readonly fetch?: typeof fetch;
-  /** Base URL prefixed to the relative `/v1/*` paths; defaults to `""`. */
-  readonly baseUrl?: string;
-}
-
 /** The four endpoint methods Nyx consumes (§4). Terminal outcomes are read by polling. */
 export interface CompileClient {
   /** §4.1 — fast static validity (no keygen, no upload). A failure is `ok:false`. */
@@ -72,108 +37,6 @@ export interface CompileClient {
   pollCompile(jobId: string): Promise<CompileJob>;
   /** §4.4 — the pinned toolchain versions (D6). */
   version(): Promise<CompilerVersions>;
-}
-
-const CHECK_PATH = "/v1/check";
-const COMPILE_PATH = "/v1/compile";
-const VERSION_PATH = "/v1/version";
-
-/** The Streamable-HTTP client for the Compile Service. Stateless; safe to share. */
-export class HttpCompileClient implements CompileClient {
-  private readonly fetchImpl: typeof fetch;
-  private readonly baseUrl: string;
-  private readonly token: string;
-
-  constructor(deps: CompileServiceClientDeps) {
-    this.fetchImpl = deps.fetch ?? globalThis.fetch;
-    this.baseUrl = deps.baseUrl ?? "";
-    this.token = deps.token;
-  }
-
-  /** Issue a request, mapping a `fetch` throw to a named unreachable error. */
-  private async send(path: string, method: "GET" | "POST", body?: unknown): Promise<Response> {
-    const headers: Record<string, string> = {
-      authorization: `Bearer ${this.token}`,
-      accept: "application/json",
-    };
-    if (body !== undefined) {
-      headers["content-type"] = "application/json";
-    }
-    try {
-      return await this.fetchImpl(`${this.baseUrl}${path}`, {
-        method,
-        headers,
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      });
-    } catch (error) {
-      throw new CompileServiceUnavailableError(path, error);
-    }
-  }
-
-  /** Validate a 2xx body against `schema`, raising a protocol error on a mismatch. */
-  private async parse<T>(path: string, response: Response, schema: ResponseSchema<T>): Promise<T> {
-    let json: unknown;
-    try {
-      json = await response.json();
-    } catch (error) {
-      throw new CompileServiceProtocolError(path, error);
-    }
-    const result = schema.safeParse(json);
-    if (!result.success) {
-      throw new CompileServiceProtocolError(path, result.error);
-    }
-    return result.data;
-  }
-
-  /** Raise a {@link CompileServiceResponseError} for a non-2xx status (§4 envelope). */
-  private async fail(path: string, response: Response): Promise<never> {
-    let detail = response.statusText;
-    let code: string | undefined;
-    try {
-      const parsed = ServiceErrorBodySchema.safeParse(await response.json());
-      if (parsed.success) {
-        detail = parsed.data.error.message;
-        code = parsed.data.error.code;
-      }
-    } catch {
-      // No body / non-JSON — keep the status text as the detail.
-    }
-    throw new CompileServiceResponseError(path, response.status, detail, code);
-  }
-
-  async check(req: CheckRequest): Promise<CheckResponse> {
-    const response = await this.send(CHECK_PATH, "POST", req);
-    if (!response.ok) {
-      return this.fail(CHECK_PATH, response);
-    }
-    return this.parse(CHECK_PATH, response, CheckResponseSchema);
-  }
-
-  async compile(req: CompileRequest): Promise<CompileSubmitResponse> {
-    // Both 202 (work started) and 200 (terminal immediately) are `ok`.
-    const response = await this.send(COMPILE_PATH, "POST", req);
-    if (!response.ok) {
-      return this.fail(COMPILE_PATH, response);
-    }
-    return this.parse(COMPILE_PATH, response, CompileSubmitResponseSchema);
-  }
-
-  async pollCompile(jobId: string): Promise<CompileJob> {
-    const path = `${COMPILE_PATH}/${encodeURIComponent(jobId)}`;
-    const response = await this.send(path, "GET");
-    if (!response.ok) {
-      return this.fail(path, response);
-    }
-    return this.parse(path, response, CompileJobSchema);
-  }
-
-  async version(): Promise<CompilerVersions> {
-    const response = await this.send(VERSION_PATH, "GET");
-    if (!response.ok) {
-      return this.fail(VERSION_PATH, response);
-    }
-    return this.parse(VERSION_PATH, response, CompilerVersionsSchema);
-  }
 }
 
 /** Default poll cadence between job GETs (production; tests inject their own). */

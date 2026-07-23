@@ -149,7 +149,6 @@ describe("McpClient — call behaviour", () => {
 
 describe("createMcpClients + probeMcp", () => {
   const mcpConfig: McpConfig = {
-    toolchainUrl: "http://toolchain.test.local/mcp",
     tomeUrl: "http://tome.test.local/mcp",
     mnmUrl: "http://mnm.test.local/mcp",
     timeoutMs: 40,
@@ -157,18 +156,17 @@ describe("createMcpClients + probeMcp", () => {
     maxConcurrency: 4,
   };
 
-  it("builds the three named clients from config endpoints", () => {
+  it("builds the named retrieval clients from config endpoints", () => {
     const clients = createMcpClients(mcpConfig, okFactory);
-    expect(clients.toolchain.name).toBe("toolchain");
     expect(clients.tome.name).toBe("tome");
     expect(clients.mnm.name).toBe("mnm");
-    expect(clients.toolchain.endpoint).toBe("http://toolchain.test.local/mcp");
+    expect(clients.tome.endpoint).toBe("http://tome.test.local/mcp");
   });
 
-  it("aggregates health across all three without throwing when unreachable", async () => {
+  it("aggregates health across every client without throwing when unreachable", async () => {
     const clients = createMcpClients(mcpConfig, refusedFactory);
     const probes = await probeMcp(clients);
-    expect(probes.map((p) => p.name).sort()).toEqual(["mnm", "tome", "toolchain"]);
+    expect(probes.map((p) => p.name).sort()).toEqual(["mnm", "tome"]);
     expect(probes.every((p) => !p.reachable)).toBe(true);
   });
 });

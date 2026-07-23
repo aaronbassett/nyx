@@ -39,16 +39,10 @@ function routingJson(routing: TestRouting = baseRouting()): string {
 function validEnv(overrides: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
   return {
     DATABASE_URL: "postgres://user:pass@localhost:5432/nyx",
-    MCP_TOOLCHAIN_URL: "http://nyx-toolchain.flycast:8080/mcp",
     MCP_TOME_URL: "https://tome.example/mcp",
     MCP_MNM_URL: "https://mnm.example/mcp",
     PROVER_URL: "https://prover.example",
-    COMPILE_SERVICE_URL: "https://compile.internal/v1",
     DEPLOY_KEY: "deploy-secret-value",
-    COMPILE_SERVICE_TOKEN: "compile-service-secret-token",
-    R2_ACCESS_KEY_ID: "r2-access-key",
-    R2_SECRET_ACCESS_KEY: "r2-secret-key",
-    R2_ACCOUNT_ID: "r2-account-id",
     MODEL_ROUTING: routingJson(),
     ...overrides,
   };
@@ -90,9 +84,37 @@ describe("loadConfig — valid env", () => {
     expect(Object.isFrozen(config.modelRouting)).toBe(true);
   });
 
-  it("carries the Compile Service base URL as a public (non-secret) field", () => {
+  it("resolves the durable artifact store root + size caps with documented defaults (P2)", () => {
     const config = loadConfig(validEnv());
-    expect(config.compileService.url).toBe("https://compile.internal/v1");
+    expect(config.artifacts.rootDir).toBe("./data/artifacts");
+    expect(config.artifacts.maxFileBytes).toBe(16_777_216);
+    expect(config.artifacts.maxBundleBytes).toBe(134_217_728);
+    expect(config.artifacts.srsCacheDir).toBeUndefined();
+  });
+
+  it("resolves the browser-compile CHECK/FULL timeout tunables with defaults (D42 no-hang)", () => {
+    const config = loadConfig(validEnv());
+    expect(config.tunables.compileCheckTimeoutMs).toBe(30_000);
+    expect(config.tunables.compileFullTimeoutMs).toBe(300_000);
+  });
+
+  it("applies overrides for the artifact caps + SRS cache dir", () => {
+    const config = loadConfig(
+      validEnv({
+        ARTIFACT_STORE_ROOT: "/srv/artifacts",
+        ARTIFACT_MAX_FILE_BYTES: "1024",
+        ARTIFACT_MAX_BUNDLE_BYTES: "4096",
+        SRS_CACHE_DIR: "/srv/srs",
+        COMPILE_CHECK_TIMEOUT_MS: "15000",
+        COMPILE_FULL_TIMEOUT_MS: "600000",
+      }),
+    );
+    expect(config.artifacts.rootDir).toBe("/srv/artifacts");
+    expect(config.artifacts.maxFileBytes).toBe(1024);
+    expect(config.artifacts.maxBundleBytes).toBe(4096);
+    expect(config.artifacts.srsCacheDir).toBe("/srv/srs");
+    expect(config.tunables.compileCheckTimeoutMs).toBe(15_000);
+    expect(config.tunables.compileFullTimeoutMs).toBe(600_000);
   });
 
   it("derives publicOrigin from PORT when PUBLIC_ORIGIN is unset (P2 browser-compile artifact URLs)", () => {
@@ -124,29 +146,23 @@ describe("loadConfig — valid env", () => {
   });
 
   it("treats empty / whitespace env values as unset so defaults apply", () => {
-    const config = loadConfig(validEnv({ PORT: "", R2_BUCKET: "   " }));
+    const config = loadConfig(validEnv({ PORT: "", SRS_CACHE_DIR: "   " }));
     expect(config.port).toBe(8080);
-    expect(config.r2.bucket).toBeUndefined();
+    expect(config.artifacts.srsCacheDir).toBeUndefined();
   });
 
   it("carries server-only secrets but keeps them out of publicConfig", () => {
     const config = loadConfig(validEnv());
     expect(config.secrets.deployKey).toBe("deploy-secret-value");
-    expect(config.secrets.compileServiceToken).toBe("compile-service-secret-token");
     expect(config.secrets.databaseUrl).toContain("postgres://");
 
     const pub = publicConfig(config);
     expect("secrets" in pub).toBe(false);
-    // The Compile Service endpoint is server-internal; it never crosses the
-    // server boundary (constitution III), so it is absent from publicConfig too.
-    expect("compileService" in pub).toBe(false);
     // bigint tunables are not JSON-serializable; stringify them for the scan.
     const serialized = JSON.stringify(pub, (_key, value: unknown) =>
       typeof value === "bigint" ? value.toString() : value,
     );
     expect(serialized).not.toContain("deploy-secret-value");
-    expect(serialized).not.toContain("compile-service-secret-token");
-    expect(serialized).not.toContain("r2-secret-key");
   });
 
   it("carries supplied per-provider LLM API keys, leaving unset ones undefined", () => {
@@ -262,32 +278,9 @@ describe("loadConfig — invalid env (DS-003 fail-fast)", () => {
     expect(vars).toContain("PUBLIC_ORIGIN");
   });
 
-  it("names COMPILE_SERVICE_URL when the Compile Service base URL is missing", () => {
-    const vars = issuesFor(validEnv({ COMPILE_SERVICE_URL: undefined }));
-    expect(vars).toContain("COMPILE_SERVICE_URL");
-  });
-
-  it("names COMPILE_SERVICE_URL when the Compile Service base URL is not a URL", () => {
-    const vars = issuesFor(validEnv({ COMPILE_SERVICE_URL: "not-a-url" }));
-    expect(vars).toContain("COMPILE_SERVICE_URL");
-  });
-
-  it("names COMPILE_SERVICE_TOKEN when the server-only bearer token is absent", () => {
-    const vars = issuesFor(validEnv({ COMPILE_SERVICE_TOKEN: undefined }));
-    expect(vars).toContain("COMPILE_SERVICE_TOKEN");
-  });
-
-  it("names all server-only secrets when absent (zero-trust presence check)", () => {
-    const vars = issuesFor(
-      validEnv({
-        R2_ACCESS_KEY_ID: undefined,
-        R2_SECRET_ACCESS_KEY: undefined,
-        R2_ACCOUNT_ID: undefined,
-      }),
-    );
-    expect(vars).toEqual(
-      expect.arrayContaining(["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_ACCOUNT_ID"]),
-    );
+  it("names DEPLOY_KEY when the server-only deploy key is absent (zero-trust presence check)", () => {
+    const vars = issuesFor(validEnv({ DEPLOY_KEY: undefined }));
+    expect(vars).toContain("DEPLOY_KEY");
   });
 });
 

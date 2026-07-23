@@ -85,7 +85,6 @@ const stubModelRouter = {
 
 /** MCP clients that fail loudly if called (the swarm is overridden). */
 const stubMcp: TurnCoordinatorMcp = {
-  toolchain: { call: () => Promise.reject(new Error("toolchain.call unexpected")) },
   tome: { call: () => Promise.reject(new Error("tome.call unexpected")) },
   mnm: { call: () => Promise.reject(new Error("mnm.call unexpected")) },
 };

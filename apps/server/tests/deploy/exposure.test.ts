@@ -89,16 +89,10 @@ function routingJson(): string {
 function validEnv(): NodeJS.ProcessEnv {
   return {
     DATABASE_URL: "postgres://user:pass@localhost:5432/nyx",
-    MCP_TOOLCHAIN_URL: "http://nyx-toolchain.flycast:8080/mcp",
     MCP_TOME_URL: "https://tome.example/mcp",
     MCP_MNM_URL: "https://mnm.example/mcp",
     PROVER_URL: "https://prover.example",
-    COMPILE_SERVICE_URL: "https://compile.internal/v1",
     DEPLOY_KEY: "deploy-secret-value",
-    COMPILE_SERVICE_TOKEN: "compile-service-secret-token",
-    R2_ACCESS_KEY_ID: "r2-access-key",
-    R2_SECRET_ACCESS_KEY: "r2-secret-key",
-    R2_ACCOUNT_ID: "r2-account-id",
     MODEL_ROUTING: routingJson(),
   };
 }

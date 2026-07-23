@@ -3,8 +3,8 @@
  *
  * `loadConfig` is the pure, testable validator; `publicConfig` is the only safe
  * way to project config beyond the server boundary — it drops `secrets`
- * entirely so deploy keys and R2 write credentials can never be serialized to a
- * client surface (constitution III, D52).
+ * entirely so deploy keys can never be serialized to a client surface
+ * (constitution III, D52).
  */
 import type { Config, PublicConfig } from "./schema.js";
 
@@ -19,6 +19,7 @@ export {
   ModelRoutingTableSchema,
 } from "./schema.js";
 export type {
+  ArtifactStoreConfig,
   Config,
   Env,
   McpConfig,
@@ -30,7 +31,6 @@ export type {
   NyxtAmount,
   ProverConfig,
   PublicConfig,
-  R2ReadConfig,
   ServerSecrets,
   Tunables,
 } from "./schema.js";
@@ -48,6 +48,6 @@ export type { NetworkEnv, NetworkProfile } from "./network.js";
  * this cannot leak them (constitution III).
  */
 export function publicConfig(config: Config): PublicConfig {
-  const { port, publicOrigin, network, mcp, prover, r2, tunables, modelRouting } = config;
-  return { port, publicOrigin, network, mcp, prover, r2, tunables, modelRouting };
+  const { port, publicOrigin, network, mcp, prover, artifacts, tunables, modelRouting } = config;
+  return { port, publicOrigin, network, mcp, prover, artifacts, tunables, modelRouting };
 }

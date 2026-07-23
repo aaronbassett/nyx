@@ -5,8 +5,8 @@
  * the server and — projected via `publicConfig` — the client need in order to
  * talk to a specific Midnight network. `networkId` is the string the wallet
  * connector reports; it drives the wrong-network gate on the client. These URLs
- * are endpoints, not credentials, so the whole profile is treated like
- * `R2ReadConfig`: public, and it must NEVER live under `secrets`.
+ * are endpoints, not credentials, so the whole profile is PUBLIC (it flows into
+ * `publicConfig`) and it must NEVER live under `secrets`.
  *
  * Two profiles ship built in — `local-devnet` (the default) and `preprod`.
  * `resolveNetworkProfile` selects one by `NYX_NETWORK` and layers OPTIONAL

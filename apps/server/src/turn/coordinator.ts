@@ -138,17 +138,15 @@ export const PROJECT_MISMATCH_MESSAGE =
 /**
  * The narrow MCP surface each sub-agent needs — just {@link McpClient.call}. The real
  * `McpClient` satisfies it structurally; tests inject a fake `{ call }`. Matches the
- * per-agent `McpCallable` in `agents/*.ts` so `mcp.tome`/`mnm`/`toolchain` wire straight
- * into every sub-agent factory.
+ * per-agent `McpCallable` in `agents/*.ts` so `mcp.tome`/`mnm` wire straight into every
+ * sub-agent factory.
  */
 export interface McpCallable {
   call(tool: string, args?: Record<string, unknown>): Promise<unknown>;
 }
 
-/** The three named MCP clients the swarm consumes (a subset of {@link McpClients}). */
+/** The named MCP retrieval clients the swarm consumes (a subset of {@link McpClients}). */
 export interface TurnCoordinatorMcp {
-  /** The compiler toolchain client — the Implementation agent's compile-before-surface. */
-  readonly toolchain: McpCallable;
   /** The Tome skill/example retrieval client (scaffolding + planning + implementation). */
   readonly tome: McpCallable;
   /** The Midnight Manual retrieval client (planning + implementation + review). */
@@ -486,7 +484,6 @@ function buildDefaultAgents(deps: TurnCoordinatorDeps): {
       model: modelRouter.model("implementation"),
       mnm: mcp.mnm,
       tome: mcp.tome,
-      toolchain: mcp.toolchain,
       steering: buildImplementationInstructions(),
     }),
     review: createReviewAgent({
