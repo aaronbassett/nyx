@@ -10,7 +10,9 @@
 
 ## Global Constraints
 
-- Design doc: `docs/superpowers/specs/2026-07-23-demo-ready-local-mode-design.md` (§4 is this plan's spec). SPIKE reports `docs/superpowers/plans/retros/SPIKE1_REPORT.md` / `SPIKE2_REPORT.md` are AUTHORITATIVE for the compiler pin, vendor source commit, and toolchain version metadata — Task 0 folds them in; never invent versions.
+- Design doc: `docs/superpowers/specs/2026-07-23-demo-ready-local-mode-design.md` (§4 is this plan's spec). SPIKE reports `docs/superpowers/plans/retros/SPIKE1_REPORT.md` / `SPIKE2_REPORT.md` are AUTHORITATIVE for the compiler pin, vendor source commit, and toolchain version metadata. **Folded in (Task 0, 2026-07-23):** the wasm compiler is pinned at the **`compactc-v0.31.1` release, commit `0da5b0452eb0c1053d42418bf34b12cc29c7d63e`** (SPIKE-1 §Compiler pin decision) — rebuilt at that pin its generated JS, ZKIR, and keys are **byte-identical to the native 0.31.1 toolchain** (SPIKE-1 §6); toolchain versions: compiler `0.31.1`, language `0.23.0`, runtime `0.16.0` (`checkRuntimeVersion('0.16.0')` — matches the repo's pinned `@midnight-ntwrk/compact-runtime@0.16.0`), zkir `2.1.0` (v2.0 JSON IR; zkir-v3 REJECTS it). Never bump any of these alone — compiler pin, compact-runtime, onchain-runtime, midnight-js, ledger/proof-server/node move as ONE lockstep row (SPIKE-1 §Runtime-version strategy).
+- **NO `checkRuntimeVersion` bypass/stripping ANYWHERE** (SPIKE-1): at the 0.31.1 pin generated code asserts `0.16.0` and that is what is installed — the bypass is not needed, and at other pins it does not even suffice (real signature incompatibility). Treat a version-check failure as a stack-drift signal, never strip it. Any shim/loader that patches `checkRuntimeVersion` out is a defect.
+- Supply-chain (P0 retro): pnpm is `10.34.5` (`packageManager`), `minimumReleaseAge` 10080 min (7 days) — any dependency published < 7 days ago is refused (scoped `minimumReleaseAgeExclude` with justification, never a global lowering). Any NEW dependency needing a lifecycle/build script must be added to `onlyBuiltDependencies` in `pnpm-workspace.yaml` with a justification comment. The vendored wasm artifacts are prebuilt + committed precisely so no install-time build script is needed.
 - Trust model: user code compiles on the user's machine; artifacts cross to the server ONLY for deploys, via an ownership-gated, size-capped upload. Ownership denials are **404, never 403** (SC-027).
 - `@nyx/protocol` is imported `workspace:*`, JIT source-pointing exports, no build step. New package `@nyx/compact-wasm` follows the same pattern; its tsconfig must NOT set `rootDir: "src"` and must set `noEmit`.
 - Compile failure is DATA (`ok:false` / `status:"failed"`), never a throw. D35: green tests are the sole full-compile trigger — this plan changes WHO compiles, never WHEN.
@@ -149,7 +151,7 @@ describe("compile:run / compile:results (P2 browser compile)", () => {
             span: { start: { line: 3, column: 7 } },
           },
         ],
-        compilerVersion: "0.0.0-spike1",
+        compilerVersion: "0.31.1",
         durationMs: 812,
       },
       ts: 1,
@@ -165,7 +167,7 @@ describe("compile:run / compile:results (P2 browser compile)", () => {
         kind: "full",
         ok: true,
         diagnostics: [],
-        compilerVersion: "0.0.0-spike1",
+        compilerVersion: "0.31.1",
         durationMs: 4021,
         sourceHash: "a".repeat(64),
         circuits: [{ name: "deposit", proof: true }],
@@ -183,7 +185,7 @@ describe("compile:run / compile:results (P2 browser compile)", () => {
         kind: "full",
         ok: true,
         diagnostics: [],
-        compilerVersion: "0.0.0-spike1",
+        compilerVersion: "0.31.1",
         durationMs: 4021,
       },
       ts: 1,
@@ -198,7 +200,7 @@ describe("compile:run / compile:results (P2 browser compile)", () => {
 Run: `sfw pnpm --filter @nyx/protocol test`
 Expected: FAIL (unknown event type `compile:run`).
 
-- [ ] **Step 3: Implement the schemas** in `packages/protocol/src/events.ts`. Place `CompileRunPayloadSchema`/event with the server→client block (near `VerifyRunEventSchema`, `events.ts:159`), and `CompileResultsPayloadSchema`/event with the client→server block (near `TestResultsEventSchema`, `events.ts:274`):
+- [ ] **Step 3: Implement the schemas** in `packages/protocol/src/events.ts`. Place `CompileRunPayloadSchema`/event with the server→client block (near `VerifyRunEventSchema`, `events.ts:168`), and `CompileResultsPayloadSchema`/event with the client→server block (near `TestResultsEventSchema`, `events.ts:281`):
 
 ```ts
 /** Compile kinds (P2): a fast per-cycle `check` vs the green-only `full` compile (D35). */
@@ -284,7 +286,9 @@ Register `CompileRunEventSchema` in `ServerToClientEventSchema` (`events.ts:234`
 Run: `sfw pnpm --filter @nyx/protocol test`
 Expected: PASS (all protocol tests, existing + new).
 
-- [ ] **Step 5: Gates + commit**
+- [ ] **Step 5 (OPTIONAL but recommended — coverage-protocol enrichment, P1 retro F1):** while touching `events.ts`, add an OPTIONAL `passedNames?: z.array(z.string())` field to `TestResultsPayloadSchema` (additive, backward-compatible — existing emitters/parsers unaffected). Grounding: the P1 review found the FR-032 coverage telemetry is information-free on real green runs because the wire DTO carries FAILING names only (`failures[]`) — green ⇒ no names ⇒ all-uncovered report (see the honest-gap comment at `apps/server/src/turn/coordinator.ts:765-771`). The consuming changes (web `container/testrunner.ts` emitting passing names from the vitest JSON report; server `agents/coverage.ts` `testNamesFromResults` folding them; `capTestResults` cap interaction) are scheduled in P6 — this step only lands the protocol field so P6's change is non-breaking. If skipped, record why in the retro.
+
+- [ ] **Step 6: Gates + commit**
 
 ```bash
 sfw pnpm --filter @nyx/protocol lint && sfw pnpm --filter @nyx/protocol typecheck
@@ -301,9 +305,17 @@ git add packages/protocol && git commit -m "feat(protocol): add compile:run and 
 - Modify: `pnpm-workspace.yaml` (only if `packages/*` is not already globbed — check first), root `.gitignore`/eslint/prettier ignore files (add `packages/compact-wasm/vendor/**` to LINT ignores, NOT to `.gitignore` — vendor is committed)
 - Test: `packages/compact-wasm/tests/source-hash.test.ts`, `packages/compact-wasm/tests/compiler-facade.test.ts`, `packages/compact-wasm/tests/vendored.integration.test.ts` (guarded)
 
+**SPIKE-1 facts this task builds on (all verified by execution — see SPIKE1_REPORT.md):**
+
+- **The vendored artifacts MUST come from a REBUILD of the PoC at compact commit `0da5b0452eb0c1053d42418bf34b12cc29c7d63e` (`compactc-v0.31.1`)** — the PoC repo's committed `web/` artifacts are the HEAD pin (compiler 0.33.109, runtime 0.18.101) whose generated JS hard-fails on the devnet's `compact-runtime@0.16.0` stack. The rebuilt outputs land in `build/out/compactc.{js,wasm,data}` (wasm ~775 KB, boot file ~4.18 MB); the PoC's Node CLI auto-prefers `build/out/`.
+- **Build recipe deltas** (Debian/Ubuntu, emscripten 3.1.69 apt, clang-19 — SPIKE-1 §Compiler pin decision): set `COMPACT_REV` in `scripts/00-env.sh`; guard the stage-03 SHA-256 patch on its anchor being present (0.31.1 predates manifest hashing); stage-04 needs the `minify_html` patch guarded, `~/.emscripten-compactc` set to `LLVM_ADD_VERSION/CLANG_ADD_VERSION = '19'`, and the hardcoded `clang-15` → `clang-19`. Stage 03 (whole-program pb compile) takes >10 min — run it in the background, it is incremental and safe to rerun. Verify with the recompile-diff: rebuilt-wasm output vs native `~/.compact/versions/0.31.1` compactc must be **byte-identical** (generated `contract/index.js` incl. `checkRuntimeVersion('0.16.0')`, ZKIR for every circuit).
+- **0.31.1 emits NO `contract-manifest.json`** (no output hashing at all) — Nyx computes its OWN hashes (the Task 4 upload manifest + Task 5 store verification already do; nothing may assume a compiler-emitted manifest).
+- **`--skip-zk` output has no keys and no `.bzkir`** — keys/`.bzkir` come from a SEPARATE zkir step (`zkir compile-many` semantics, zkir **2.1.0**); the SDK's `NodeZkConfigProvider`-style layout wants `keys/<circuit>.prover|.verifier` + `zkir/<circuit>.bzkir`, which is also Nyx's artifact-prefix layout. Budget the keygen step: `deposit.prover` 2.8 MB, `burn.prover` 5.2 MB, SRS download on first use (served via the Task 9 `/srs/*` route).
+- **Browser keygen is GATED, not assumed** (SPIKE-1 risk 1): the published `@midnightntwrk/zkir-v2@2.1.0` wasm has NO `keygen` export; the PoC's keygen-patched build (`scripts/07-build-zkir-wasm.sh`) pins `LEDGER_TAG=ledger-9.1.0.0-rc.3`. SPIKE-2 §F is a strong prior (that ledger-9-rc keygen build produced verifier keys byte-identical to the native toolchain and its keys deployed+proved on devnet), but the SHIPPING gate is: **rebuild the patched zkir wasm at a ledger-8 tag (e.g. `ledger-8.0.2`, the compiler's own pin) and byte-compare its keys against toolchain `zkir compile-many` 2.1.0 output** for the reference circuits — the PoC README documents key-format drift between zkir builds ("v1 prover key" rejections), so same-crate-version is not proof of same-format. If the gate fails, the designed fallback (SPIKE-1 §Runtime-version strategy) is server/compile-time keygen with the toolchain zkir — record whichever path ships in the retro.
+
 **Interfaces:**
 
-- Consumes: SPIKE1_REPORT.md (vendor source repo + commit pin + verified toolchain version strings + the wasm module's real entry shape).
+- Consumes: SPIKE1_REPORT.md (vendor source repo + commit pin + verified toolchain version strings + the wasm module's real entry shape); SPIKE2_REPORT.md §F (keygen-build prior).
 - Produces:
   - `interface CompilerEngine { check(sources: WasmSourceFile[]): Promise<EngineCheckResult>; compile(sources: WasmSourceFile[]): Promise<EngineCompileResult> }` — the raw seam the vendored wasm adapter implements and tests fake.
   - `type WasmSourceFile = { path: string; content: string }`
@@ -313,7 +325,7 @@ git add packages/protocol && git commit -m "feat(protocol): add compile:run and 
   - `type EngineCompileResult = { ok: boolean; diagnostics: WasmDiagnostic[]; files: CompiledFile[]; circuits: { name: string; proof: boolean }[] }`
   - `createCompiler(deps: { engine: CompilerEngine; now?: () => number }): { check(sources): Promise<{ ok; diagnostics; compilerVersion; durationMs }>; compileFull(sources): Promise<{ ok; diagnostics; compilerVersion; durationMs; sourceHash?; files?; circuits? }> }`
   - `computeSourceHash(sources: WasmSourceFile[], compilerVersion: string, flags: readonly string[]): string` (lowercase sha-256 hex; sorts by path; stable JSON canonicalization)
-  - `COMPACT_WASM_META` from `src/meta.ts`: `{ compilerVersion, languageVersion, ledger, runtime, cli, compactp }` — every value READ from `vendor/meta.json` (written by the vendor script from SPIKE-1 evidence), never hardcoded in TS.
+  - `COMPACT_WASM_META` from `src/meta.ts`: `{ compilerVersion: "0.31.1", languageVersion: "0.23.0", runtimeVersion: "0.16.0", zkirVersion: "2.1.0", compactRev }` — every value READ from `vendor/meta.json` (written by the vendor script from SPIKE-1 evidence), never hardcoded in TS.
   - `loadVendoredEngine(): Promise<CompilerEngine>` — throws a named `VendoredToolchainMissingError` when `vendor/` is absent.
 
 - [ ] **Step 1: Scaffold the package.** `package.json` (JIT pattern — mirror `packages/protocol/package.json` exports style; check it first with `cat packages/protocol/package.json`):
@@ -368,20 +380,27 @@ Implement with `node:crypto` `createHash("sha256")` over `JSON.stringify({ files
 
 - [ ] **Step 3: TDD the `createCompiler` facade** against a fake `CompilerEngine` (`tests/compiler-facade.test.ts`): assert (a) `check` returns `ok`/`diagnostics` from the engine plus `compilerVersion` from meta and a `durationMs` measured with an injected `now`; (b) `compileFull` on `ok:true` computes `sourceHash` via `computeSourceHash` and passes through `files`/`circuits`; (c) `compileFull` on `ok:false` returns diagnostics with NO `sourceHash`/`files`; (d) an engine THROW is caught and surfaced as `ok:false` with a single synthesized `severity:"error", source:"compactc"` diagnostic whose message includes the thrown message (a compile failure is data — the turn loop must never crash on a wasm fault). Implement `src/index.ts` minimally to pass.
 
-- [ ] **Step 4: Vendor script + config.** `vendor.config.json` is the SPIKE-1 parameter surface:
+- [ ] **Step 4: Vendor script + config.** `vendor.config.json` is the SPIKE-1 parameter surface. ⚠️ Two pins live here: the PoC REPO commit to clone, and the COMPACT source rev the rebuild uses (`COMPACT_REV` in the PoC's `scripts/00-env.sh`) — the latter is the load-bearing `compactc-v0.31.1` pin:
 
 ```json
 {
   "sourceRepo": "https://github.com/aaronbassett/compactc-wasm.git",
-  "commit": "FILL-FROM-SPIKE1_REPORT",
-  "artifacts": ["web/compactc.js", "web/compactc.wasm", "web/compactc.data"],
-  "zkirArtifactsDir": "vendor/zkir-v2-keygen"
+  "compactRev": "0da5b0452eb0c1053d42418bf34b12cc29c7d63e",
+  "artifacts": ["build/out/compactc.js", "build/out/compactc.wasm", "build/out/compactc.data"],
+  "zkirArtifactsDir": "vendor/zkir-v2-keygen",
+  "meta": {
+    "compilerVersion": "0.31.1",
+    "languageVersion": "0.23.0",
+    "runtimeVersion": "0.16.0",
+    "zkirVersion": "2.1.0",
+    "compactRev": "0da5b0452eb0c1053d42418bf34b12cc29c7d63e"
+  }
 }
 ```
 
-Task 0's re-planning subagent replaces `FILL-FROM-SPIKE1_REPORT` with the pinned commit from SPIKE1_REPORT.md — if it is still the placeholder when you reach this step, STOP and read SPIKE1_REPORT.md yourself and set it (that report exists; P1 produced it). `scripts/vendor.mjs`: clone the pinned commit to a temp dir, copy the listed artifacts into `packages/compact-wasm/vendor/`, and write `vendor/meta.json` with the toolchain versions EXACTLY as recorded in SPIKE1_REPORT.md (the script embeds them from `vendor.config.json` — add a `"meta"` object there holding the report's verified version strings). Run it; commit the vendored files.
+(Set the PoC repo commit to whatever the clone resolves at vendoring time and record it too.) The artifacts are NOT the repo's committed `web/*` files (those are the unusable HEAD pin) — they are the `build/out/` outputs of the 0.31.1 REBUILD (facts block above): the vendor flow is clone → set `COMPACT_REV` → run stages 01→04 with the documented emscripten/clang-19 fixups → recompile-diff against the native 0.31.1 toolchain (byte-identical or STOP) → copy `build/out/compactc.{js,wasm,data}` into `packages/compact-wasm/vendor/` → write `vendor/meta.json` from `vendor.config.json.meta`. The zkir keygen wasm is vendored ONLY after the ledger-8 rebuild + byte-compare gate passes (facts block above); until then `zkirArtifactsDir` may be absent and the loader must surface that honestly (a named error, not a silent stub). Run it; commit the vendored files (design: consumers never run the build pipeline).
 
-- [ ] **Step 5: Vendored engine adapter (`src/vendored.ts`).** Constitution I procedure — do NOT write this from memory: first `Read` the vendored `vendor/compactc.js` module surface AND the PoC's Node driver at the pinned commit (`node/compactc.mjs` in the cloned temp dir — the vendor script keeps a copy at `vendor/reference/compactc.mjs` for this purpose; add that to the script) to learn the REAL invocation shape (Emscripten module factory, MEMFS in/out paths, argv convention, `--skip-zk` flag, where TypeScript/ZKIR/metadata outputs land). Then implement `loadVendoredEngine()` mapping that real shape onto `CompilerEngine`, translating raw compiler output into `WasmDiagnostic[]` (reuse the PoC's parsing where it exists; keep the adapter thin). `tests/vendored.integration.test.ts` guards like nyxt-vault (`packages/nyxt-vault/package.json:9` pattern), but on file presence:
+- [ ] **Step 5: Vendored engine adapter (`src/vendored.ts`).** Constitution I procedure — do NOT write this from memory: first `Read` the vendored `vendor/compactc.js` module surface AND the PoC's Node driver at the pinned commit (`node/compactc.mjs` in the cloned temp dir — the vendor script keeps a copy at `vendor/reference/compactc.mjs` for this purpose; add that to the script) to learn the REAL invocation shape (Emscripten module factory, MEMFS in/out paths, argv convention, `--skip-zk` flag, where JS/ZKIR/metadata outputs land — SPIKE-1 §1 shows `compactc.mjs --skip-zk <src> <out>` writing `contract-info.json` + per-circuit zkir). The adapter must PASS THROUGH the generated JS's `checkRuntimeVersion('0.16.0')` untouched (no-bypass rule, Global Constraints). The full-compile path additionally produces keys/`.bzkir` per circuit via the zkir 2.1.0 step (facts block above — gated keygen wasm, or the recorded fallback). Then implement `loadVendoredEngine()` mapping that real shape onto `CompilerEngine`, translating raw compiler output into `WasmDiagnostic[]` (reuse the PoC's parsing where it exists; keep the adapter thin). `tests/vendored.integration.test.ts` guards like nyxt-vault (`packages/nyxt-vault/package.json:9` pattern), but on file presence:
 
 ```ts
 import { existsSync } from "node:fs";
@@ -398,7 +417,7 @@ describe.skipIf(!vendored)("vendored engine (integration)", () => {
 });
 ```
 
-`KNOWN_GOOD`/`KNOWN_BAD` come from SPIKE1_REPORT.md's proven example contract (never write fresh Compact from memory). Since vendor/ is committed, this integration test RUNS in CI — that is intentional (it is deterministic and offline).
+`KNOWN_GOOD` comes from SPIKE-1's proven inputs — the PoC's `web/examples/counter.compact` or the repo's `packages/nyxt-vault/src/nyxt-vault.compact` (`pragma language_version >= 0.23`; both compiled clean at the 0.31.1 pin, SPIKE-1 §1/§6); `KNOWN_BAD` is a mechanical corruption of it (never write fresh Compact from memory). Since vendor/ is committed, this integration test RUNS in CI — that is intentional (it is deterministic and offline).
 
 - [ ] **Step 6: Gates + commit**
 
@@ -426,7 +445,7 @@ git commit -m "feat(compact-wasm): vendored browser toolchain package"
   - `src/compile/messages.ts`: `type CompileWorkerRequest = { id: number; op: "check" | "full"; sources: WasmSourceFile[] }`; `type CompileWorkerResponse = { id: number; result: CheckOutput | FullOutput } | { id: number; error: string }` where `CheckOutput = { ok; diagnostics; compilerVersion; durationMs }` and `FullOutput = CheckOutput & { sourceHash?; circuits?; files?: { path: string; bytes: Uint8Array; contentType: string }[] }`.
   - `src/compile/client.ts`: `interface WorkerLike { postMessage(msg: unknown, transfer?: Transferable[]): void; onmessage: ((e: { data: unknown }) => void) | null; terminate(): void }`; `createCompileWorkerClient(deps?: { worker?: WorkerLike }): CompileWorkerClient`; `interface CompileWorkerClient { check(sources: WasmSourceFile[]): Promise<CheckOutput>; compileFull(sources: WasmSourceFile[]): Promise<FullOutput>; dispose(): void }`.
 
-- [ ] **Step 1: Write failing client tests** driving `createCompileWorkerClient` against a fake `WorkerLike` (echoing scripted responses): request/response correlation by `id` (two in-flight checks resolve to their own callers), an `error` response rejects that call only, `dispose()` terminates. Run `sfw pnpm --filter web test` (use the actual workspace package name — check `apps/web/package.json` `"name"` first); expect FAIL.
+- [ ] **Step 1: Write failing client tests** driving `createCompileWorkerClient` against a fake `WorkerLike` (echoing scripted responses): request/response correlation by `id` (two in-flight checks resolve to their own callers), an `error` response rejects that call only, `dispose()` terminates. Run `sfw pnpm --filter @nyx/web test` (verified workspace name: `@nyx/web`); expect FAIL.
 - [ ] **Step 2: Implement `messages.ts` + `client.ts`** — a promise-map over `postMessage`, monotonically increasing `id`, default worker factory `new Worker(new URL("./worker.ts", import.meta.url), { type: "module" })` (the standard Vite worker idiom). `Uint8Array` file bytes pass structured-clone; pass their `.buffer`s in the transfer list for the full-compile response path.
 - [ ] **Step 3: Implement `worker.ts`** — a thin host: lazily `loadVendoredEngine()` + `createCompiler` on first request, then dispatch `check`/`full` and post the response. Wrap EVERYTHING in try/catch → `{ id, error: String(err) }`; the worker must never die silently. No test drives the real worker (browser-only) — the deterministic suite covers the client against the fake, and the P5 demo smoke exercises the real one.
 - [ ] **Step 4: Gates + commit** (`feat(web): compile worker client over @nyx/compact-wasm`).
@@ -447,7 +466,7 @@ git commit -m "feat(compact-wasm): vendored browser toolchain package"
   - `upload.ts`: `uploadArtifacts(deps: { fetch?: typeof fetch; baseUrl?: string }, args: { projectId: string; sourceHash: string; compilerVersion: string; files: { path; bytes; contentType }[]; circuits: { name; proof }[] }): Promise<void>` — PUTs every file to `/projects/<projectId>/artifacts/<sourceHash>/files/<path>` (raw body, `content-type` header per file, `credentials: "same-origin"`), then POSTs the manifest to `/projects/<projectId>/artifacts/<sourceHash>/commit` LAST (manifest-last completeness marker, Task 5/6 contract). The manifest body is the §5 shape: `{ sourceHash, compilerVersion, circuits, files: [{ path, sha256, bytes, contentType }] }` with `sha256` computed via `crypto.subtle.digest("SHA-256", bytes)` hex-encoded. A non-2xx on ANY request throws a named `ArtifactUploadError` carrying `path`/`status`.
   - `handlers.ts`: `registerCompileHandlers(deps: { bridge: PreviewBridge; worker: CompileWorkerClient; projectId: string; getSources: () => Promise<WasmSourceFile[]>; upload?: typeof uploadArtifacts; now?: () => number }): Unsubscribe`.
 
-- [ ] **Step 1: TDD `upload.ts`** with an injected fetch mock: correct URLs (path segments percent-encoded per segment, not whole-path), file PUTs happen BEFORE the commit POST, commit body matches the §5 manifest schema (`ArtifactManifestSchema` from `apps/web/src/artifacts/manifest.ts` — parse the recorded body with it in the test), a 413 on a PUT throws `ArtifactUploadError` and NO commit is sent.
+- [ ] **Step 1: TDD `upload.ts`** with an injected fetch mock: correct URLs (path segments percent-encoded per segment, not whole-path), file PUTs happen BEFORE the commit POST, commit body matches the §5 manifest shape — NOTE the web side has NO zod manifest schema (type-only `ArtifactManifest` at `apps/web/src/artifacts/manifest.ts:45`; zod stays out of the web bundle by rule), so assert the recorded body structurally against that type (`sourceHash`/`compilerVersion`/`circuits` + per-file `path`/`sha256`/`bytes`/`contentType`) — the server's `ArtifactManifestSchema` (`apps/server/src/compile/schemas.ts:224`) is the wire authority the Task 6 commit route enforces. A 413 on a PUT throws `ArtifactUploadError` and NO commit is sent.
 - [ ] **Step 2: TDD `handlers.ts`** with a fake bridge + fake worker: a `compile:run {kind:"check"}` event → `worker.check(await getSources())` → bridge sends `compile:results` echoing `turnId`, `kind:"check"`, worker verdict; a `{kind:"full"}` green run → upload called with worker outputs → results sent with `sourceHash`+`circuits` AFTER upload resolves; upload FAILURE → results sent with `ok:false` and one synthesized diagnostic naming the upload error (the server must receive a verdict either way — a missing reply would burn the server-side timeout); worker/getSources throw → same `ok:false` synthesized-diagnostic path. Assert the unsubscribe detaches.
 - [ ] **Step 3: Implement both minimally; run; pass.**
 - [ ] **Step 4: Wire registration point.** Read `apps/web/src/container/preview.ts` (`createPreview`/`launchPreview` coordinator) and register `registerCompileHandlers` where the existing `verify:run`-adjacent handlers are wired, constructing the worker client once per preview session and disposing on teardown. Follow the exact wiring idiom found there; add/extend its tests accordingly.
@@ -540,7 +559,7 @@ Named errors in `errors.ts`: `ArtifactFileTooLargeError(path, limit)`, `Artifact
 
 **Interfaces:**
 
-- Consumes: `CompileResultsPayload` (Task 1), `CompileClient`/`CheckResponse`/`CompileJob` shapes (`compile/client.ts:66`, `compile/schemas.ts`), `CompileJobTimeoutError` (`compile/errors.ts`), the `PendingTestResultsInbox` pattern (`turn/coordinator.ts:331` — projectId-bound ownership, bounded race, `finally` cleanup; copy the pattern, adapt the key).
+- Consumes: `CompileResultsPayload` (Task 1), `CompileClient`/`CheckResponse`/`CompileJob` shapes (`compile/client.ts:66`, `compile/schemas.ts`), `CompileJobTimeoutError` (`compile/errors.ts`), the `PendingTestResultsInbox` pattern (`turn/coordinator.ts:385` — projectId-bound ownership, bounded race, `finally` cleanup; copy the pattern, adapt the key).
 - Produces:
 
 ```ts
@@ -610,16 +629,16 @@ Semantics (the whole task hangs on these):
 readonly makeCompileClient: (session: BrowserCompileSession) => { forTurn(turnId: string): CompileClient };
 ```
 
-and gains `compileInbox: CompileResultsInbox`. Coordinator wiring changes (`coordinator.ts:546,600-603`):
+and gains `compileInbox: CompileResultsInbox`. Coordinator wiring changes (post-P1 anchors — `checkCompile` at `coordinator.ts:732`, `runFullCompile` at `coordinator.ts:748`, `orchestratorFor` at `coordinator.ts:635`):
 
 - `checkCompile: (input) => makeClientForProject().forTurn(input.turnId).check(toCheckRequest(input))`
-- `runFullCompile: (input) => new ArtifactOrchestrator({ client: makeClientForProject().forTurn(input.turnId), … }).runTurn(input)` — where `makeClientForProject()` builds ONE factory per project state bound to a `BrowserCompileSession` whose `emitCompileRun` wire-encodes a `compile:run` frame through `sendOutbound(state.liveCtx, …)` (the same live-ctx binding `orchestratorFor` at `coordinator.ts:546` already uses — reuse that exact mechanism).
-- Register the `compile:results` client→server handler alongside `test:results`: `router.on("compile:results", (payload, ctx) => { deps.compileInbox.deliver(payload, ctx.projectId); })` — the projectId binding is the cross-tenant guard; mirror the exact registration + zod plumbing the `test:results` handler uses.
+- `runFullCompile`: **⚠️ P1 changed this seam — it is NO LONGER a bare orchestrator call.** The current `runFullCompile` (coordinator.ts:748-791) wraps `orchestratorFor(...).runTurn(input)` in a post-`ready` block that (a) persists the green build via `recordGreenBuildWithinBound` (I2 bounded await, FR-054) and (b) emits FR-032 coverage telemetry — the WHOLE block inside ONE throw-proof guard (I1: an escaping throw would make the supervisor's `withInfraRetry` re-run the compile → duplicate `artifacts:ready`, a D35 breach; proven load-bearing by a P1 test reproducing the 4× retry storm). **This task swaps ONLY where the orchestrator's `client` comes from** — `orchestratorFor` gains the per-turn client (`makeClientForProject().forTurn(input.turnId)` instead of `deps.compileClient`) — and MUST leave the record/coverage guard block byte-for-byte intact. Note `TurnCoordinatorDeps.projectStore` is `Pick<ProjectStore, "commit" | "recordGreenBuild">` (coordinator.ts:200) — untouched here. `makeClientForProject()` builds ONE factory per project state bound to a `BrowserCompileSession` whose `emitCompileRun` wire-encodes a `compile:run` frame through `safeEmit`/`sendOutbound(state.liveCtx, …)` (the same live-ctx deferred-closure binding `orchestratorFor(() => state.liveCtx)` already uses — reuse that exact mechanism).
+- Register the `compile:results` client→server handler alongside `test:results` (`coordinator.ts:976-990`): `router.on("compile:results", (payload, ctx) => { deps.compileInbox.deliver(payload, ctx.projectId); })` — the projectId binding is the cross-tenant guard; mirror the exact registration + zod plumbing the `test:results` handler uses.
 
 - [ ] **Step 1: Add `turnId` to `CompileTurnInput`**; fix every construction site (supervisor) and every test fixture that builds one (grep `changedPaths:` under `apps/server`). The orchestrator itself never reads it — no orchestrator behavior change, existing orchestrator tests only need the added field.
-- [ ] **Step 2: TDD the coordinator changes**: existing coordinator tests swap `compileClient: fake` → `makeCompileClient: () => ({ forTurn: () => fake })` (mechanical; grep `compileClient` in tests). NEW tests: (a) a turn's check emits a `compile:run {kind:"check"}` frame on the project's connection with the ACTIVE turn's id; (b) a delivered `compile:results` from the owning project resolves the in-flight check; (c) a `compile:results` delivered on a DIFFERENT project's connection is ignored (cross-tenant); (d) no delivery → the check resolves as failing after the injected timeout and the cycle proceeds (turn settles; never hangs).
+- [ ] **Step 2: TDD the coordinator changes**: existing coordinator tests swap `compileClient: fake` → `makeCompileClient: () => ({ forTurn: () => fake })` (mechanical; grep `compileClient` in tests). NEW tests: (a) a turn's check emits a `compile:run {kind:"check"}` frame on the project's connection with the ACTIVE turn's id; (b) a delivered `compile:results` from the owning project resolves the in-flight check; (c) a `compile:results` delivered on a DIFFERENT project's connection is ignored (cross-tenant); (d) no delivery → the check resolves as failing after the injected timeout and the cycle proceeds (turn settles; never hangs); (e) **P1-guard regression: a green full compile through the browser client still records the green build (`projectStore.recordGreenBuild` called once with the outcome's `urlPrefix`/`compilerVersion`) and still survives an injected throwing `logCoverage` without a second compile/`artifacts:ready`** — the P1 tests for this exist (`apps/server/tests/turn/`); they must stay green with only the mechanical seam swap.
 - [ ] **Step 3: Implement; run; pass.**
-- [ ] **Step 4: Full server suite** (`sfw pnpm --filter <server-package-name> test`) — this task touches the money path's turn loop; every existing turn/settle/security test must stay green untouched EXCEPT the mechanical fixture swap. Any behavioral test change beyond the seam swap is a red flag — stop and re-examine.
+- [ ] **Step 4: Full server suite** (`sfw pnpm --filter @nyx/server test`) — this task touches the money path's turn loop; every existing turn/settle/security test must stay green untouched EXCEPT the mechanical fixture swap. Any behavioral test change beyond the seam swap is a red flag — stop and re-examine.
 - [ ] **Step 5: Gates + commit** (`feat(server): delegate turn compiles to the browser toolchain`).
 
 ---
@@ -629,7 +648,7 @@ and gains `compileInbox: CompileResultsInbox`. Coordinator wiring changes (`coor
 **Files:**
 
 - Modify: `apps/server/src/config/schema.ts` (remove `COMPILE_SERVICE_URL` `:121`, `COMPILE_SERVICE_TOKEN` `:149`, `R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`/`R2_ACCOUNT_ID` `:152-154`, `R2_PUBLIC_BASE_URL`/`R2_BUCKET` `:143-144`, `MCP_TOOLCHAIN_URL` `:117`; remove `CompileServiceConfig`, `R2ReadConfig`, `secrets.compileServiceToken`, `secrets.r2*`, `mcp.toolchainUrl`; ADD `PUBLIC_ORIGIN` (url, default `http://localhost:8080`) → `config.publicOrigin`, `ARTIFACT_STORE_ROOT` (default `./data/artifacts`), `ARTIFACT_MAX_FILE_BYTES` (default `16_777_216`), `ARTIFACT_MAX_BUNDLE_BYTES` (default `134_217_728`), `COMPILE_CHECK_TIMEOUT_MS` (default `30_000`), `COMPILE_FULL_TIMEOUT_MS` (default `300_000`), `SRS_CACHE_DIR` (optional) — all NEW vars have defaults or are optional, so fixtures need only DELETIONS)
-- Modify: `apps/server/src/config/load.ts` (follow the removals through — read it first), `apps/server/src/index.ts:14,127-130` (drop `HttpCompileClient` import/construction; construct `createLocalArtifactStore`, `createCompileResultsInbox`, `makeCompileClient`, pass `artifacts` + new deps into `buildServer`/coordinator), `apps/server/src/mcp/` (remove the toolchain client from `createMcpClients` — read `mcp/index.ts`), `apps/server/src/turn/coordinator.ts:130-136` (`TurnCoordinatorMcp` drops `toolchain`), `apps/server/src/agents/implementation.ts` (remove the toolchain-MCP compile tool — the per-cycle browser check is now the compile feedback; read the agent to remove the tool + its instructions references cleanly), `apps/server/src/compile/client.ts` (delete `HttpCompileClient` + `CompileServiceClientDeps`; KEEP `CompileClient`, `runCompileJob`, constants), `infra/compile-service/API.md` (prepend banner)
+- Modify: `apps/server/src/config/load.ts` (follow the removals through — read it first), `apps/server/src/index.ts:14,127-130` (drop `HttpCompileClient` import/construction; construct `createLocalArtifactStore`, `createCompileResultsInbox`, `makeCompileClient`, pass `artifacts` + new deps into `buildServer`/coordinator), `apps/server/src/mcp/clients.ts` (remove the `toolchain` member from `McpClients`/`createMcpClients`/`probeMcp`/`closeMcpClients` — `clients.ts:16,25,39,51,56`), `apps/server/src/turn/coordinator.ts:143-150` (`TurnCoordinatorMcp` drops `toolchain`), `apps/server/src/agents/implementation.ts` (remove the toolchain-MCP compile tool — `toolchain` dep at `implementation.ts:105-106`, `toolchainCheckTool` at `:122`, the compile-check tool + its instructions references; the per-cycle browser check is now the compile feedback), `apps/server/src/compile/client.ts` (delete `HttpCompileClient` + `CompileServiceClientDeps`; KEEP `CompileClient`, `runCompileJob`, constants), `infra/compile-service/API.md` (prepend banner)
 - Test: every fixture the env-var removals break (grep-driven, below), `apps/server/tests/config/` updates
 
 **Interfaces:**
@@ -665,7 +684,7 @@ const makeCompileClient = (session: BrowserCompileSession) =>
   });
 ```
 
-(`defaultDelay`: reuse/extract the unref'd-timer delay from `coordinator.ts:257` into a shared util rather than duplicating.) Pass `makeCompileClient` + `compileInbox` to `createTurnCoordinator`, `artifactStore` + `storeFetchAdapter(artifactStore)` into the coordinator's orchestrator deps (`fetchArtifact`), and `artifacts: artifactStore` into `buildServer`.
+(`defaultDelay`: reuse/extract the unref'd-timer delay from `coordinator.ts:292` into a shared util rather than duplicating.) Pass `makeCompileClient` + `compileInbox` to `createTurnCoordinator`, `artifactStore` + `storeFetchAdapter(artifactStore)` into the coordinator's orchestrator deps (`fetchArtifact`), and `artifacts: artifactStore` into `buildServer`.
 
 - [ ] **Step 5: Toolchain MCP removal** — implementation-agent tool + `TurnCoordinatorMcp.toolchain` + `createMcpClients` + config, with their tests. The agent's instructions text mentioning the toolchain tool must be updated in the same commit (grep the agent's instruction builder for "toolchain"/"compile").
 - [ ] **Step 6: SUPERSEDED banner** at the very top of `infra/compile-service/API.md`:
@@ -687,7 +706,7 @@ const makeCompileClient = (session: BrowserCompileSession) =>
 **Files:**
 
 - Modify: `apps/web/src/artifacts/fetch.ts:1-36` (doc comment only — the fetch logic is prefix-generic and stays), `apps/web/src/container/artifacts.ts` (verify the repointer is prefix-generic; doc comment), any `R2_`/"R2" references under `apps/web/src` (grep-driven docs cleanup — no behavior change)
-- Test: `apps/web/tests/artifacts/` — ADD one case proving a same-origin `/artifacts/...` prefix flows through `fetchArtifacts` + `artifactUrl` unchanged (guards against a future absolute-URL assumption).
+- Test: `apps/web/tests/artifacts.test.ts` (a flat file, not a directory — check before adding) — ADD one case proving a same-origin `/artifacts/...` prefix flows through the fetch-harness plan/report path unchanged (guards against a future absolute-URL assumption).
 
 - [ ] **Step 1:** `grep -rn "R2\|r2" apps/web/src` — update comments/docs to name the ArtifactStore read path; ZERO logic edits (if a logic edit seems needed, stop: the urlPrefix contract was supposed to be byte-compatible — investigate and record in the retro).
 - [ ] **Step 2:** Add the same-origin-prefix test; run; pass. Gates + commit (`docs(web): artifact read path now served by nyx artifact store`).
