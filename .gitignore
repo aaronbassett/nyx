@@ -32,8 +32,10 @@ target/distrib/
 # ---------------------------------------------------------------------------
 *.backup
 
-# Per-user / per-machine plugin state (don't commit; users have their own)
-.claude/
+# Claude Code project config is tracked (owner policy 2026-07-23), but
+# per-user local settings and the harness-managed live git worktrees are not.
+.claude/**/*.local.json
+.claude/worktrees/
 .midnight-expert/
 
 # Brainstorming visual-companion scratch (mockups; not part of the project)
