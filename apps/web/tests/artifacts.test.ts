@@ -1,13 +1,14 @@
 /**
  * T070 — web-side artifact-fetch harness tests (US2 compile pipeline, scenario 3).
  *
- * Drives the fetch matrix over the R2 prefix layout (contract §5) and the R3
- * header rules against an injected MOCK `fetch` — no real R2 and no real
- * cross-origin-isolated browser fetch (both owner-gated). Proves: a fresh prefix
- * serves the complete set with zero 404s (SC-005/SC-007) using `mode: "cors"`
- * (R3); a 404 never passes silently; an oversized-uncached artifact raises the
- * EC-10 telemetry flag distinctly from a 404; and manifest paths resolve under
- * `urlPrefix` with a correct single-slash join.
+ * Drives the fetch matrix over the artifact prefix layout (contract §5) against an
+ * injected MOCK `fetch` — no real artifact store and no real cross-origin-isolated
+ * browser fetch (both owner-gated). Proves: a fresh prefix serves the complete set
+ * with zero 404s (SC-005/SC-007) using `mode: "cors"`; a 404 never passes silently;
+ * an oversized-uncached artifact raises the EC-10 telemetry flag distinctly from a
+ * 404; manifest paths resolve under `urlPrefix` with a correct single-slash join;
+ * and a same-origin `/artifacts/...` prefix (P2 browser compile) flows through the
+ * plan/report path byte-compatibly.
  */
 import { describe, expect, it, vi } from "vitest";
 import type { Mock } from "vitest";
@@ -265,6 +266,66 @@ describe("fetchArtifacts — a thrown fetch is a hard miss, not a silent pass", 
     expect(report.missing).toEqual([PROVER.path]);
     expect(report.outcomes[0]?.status).toBe(0);
     expect(report.outcomes[0]?.ok).toBe(false);
+  });
+});
+
+describe("fetchArtifacts — a same-origin /artifacts prefix flows through unchanged (P2 browser compile)", () => {
+  /**
+   * Since P2, the server serves the artifact prefix from its own same-origin,
+   * session-less `GET /artifacts/:projectId/:sourceHash/*` route, so `urlPrefix`
+   * is a root-relative path, NOT an absolute cross-origin URL. The harness is
+   * prefix-generic and must treat it byte-compatibly: this guards against a future
+   * absolute-URL assumption (e.g. a `new URL(...)` that would reject or rewrite a
+   * relative prefix).
+   */
+  const SAME_ORIGIN_PREFIX = "/artifacts/9f-uuid/e3b0c4";
+
+  /** The root-relative URL a manifest file resolves to under the same-origin prefix. */
+  function sameOriginUrlFor(file: ArtifactManifestFile): string {
+    return `${SAME_ORIGIN_PREFIX}/${file.path}`;
+  }
+
+  it("plans the exact prefix+path URLs (no scheme injected, no relative-URL rewrite)", () => {
+    const manifest = manifestOf([PROVER, VERIFIER, ZKIR]);
+
+    const plan = planArtifactFetches(SAME_ORIGIN_PREFIX, manifest);
+
+    expect(plan.map((entry) => entry.url)).toEqual([
+      sameOriginUrlFor(PROVER),
+      sameOriginUrlFor(VERIFIER),
+      sameOriginUrlFor(ZKIR),
+    ]);
+    expect(manifestUrl(SAME_ORIGIN_PREFIX)).toBe(`${SAME_ORIGIN_PREFIX}/manifest.json`);
+    // artifactUrl is a pure string join — it must not resolve the relative prefix
+    // against any origin (the same-origin serve path carries no scheme).
+    expect(artifactUrl(SAME_ORIGIN_PREFIX, PROVER.path)).toBe(sameOriginUrlFor(PROVER));
+  });
+
+  it("fetches every file under the same-origin prefix with the same cors/omit init and reports allOk", async () => {
+    const manifest = manifestOf([PROVER, VERIFIER, ZKIR]);
+    const fetchMock = routingFetch({
+      [sameOriginUrlFor(PROVER)]: servedArtifact,
+      [sameOriginUrlFor(VERIFIER)]: servedArtifact,
+      [sameOriginUrlFor(ZKIR)]: servedArtifact,
+    });
+
+    const report = await fetchArtifacts(SAME_ORIGIN_PREFIX, manifest, { fetch: fetchMock });
+
+    expect(report.urlPrefix).toBe(SAME_ORIGIN_PREFIX);
+    expect(report.allOk).toBe(true);
+    expect(report.missing).toEqual([]);
+
+    const calls = recordedCalls(fetchMock);
+    expect(calls.map((call) => call.url)).toEqual([
+      sameOriginUrlFor(PROVER),
+      sameOriginUrlFor(VERIFIER),
+      sameOriginUrlFor(ZKIR),
+    ]);
+    // The read path is unchanged from the cross-origin case: same cors/omit init.
+    for (const call of calls) {
+      expect(call.init.mode).toBe("cors");
+      expect(call.init.credentials).toBe("omit");
+    }
   });
 });
 

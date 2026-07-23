@@ -1,9 +1,10 @@
 /**
  * T070 — artifact-fetch harness public surface (US2 compile pipeline).
  *
- * Re-exports the R2 artifact manifest types (contract §5) and the pure,
- * injectable-`fetch` harness that validates the fetch matrix against the R3
- * header rules the `FetchZkConfigProvider` relies on.
+ * Re-exports the artifact manifest types (contract §5) and the pure,
+ * injectable-`fetch` harness that validates the fetch matrix the
+ * `FetchZkConfigProvider` relies on against the Nyx artifact store's same-origin
+ * serve path.
  */
 export type { ArtifactCircuit, ArtifactManifest, ArtifactManifestFile } from "./manifest";
 export { ARTIFACT_MANIFEST_FILENAME } from "./manifest";

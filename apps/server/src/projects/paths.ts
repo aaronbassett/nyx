@@ -10,9 +10,14 @@
  * A path is UNSAFE when it is:
  *  - absolute (a leading `/`, or a Windows drive/UNC form);
  *  - a traversal — it contains a `..` SEGMENT (segment-wise, so `a..b.ts` is fine, only a whole
- *    `..` component is a traversal), or a backslash (a Windows separator / `..\` vector); or
+ *    `..` component is a traversal), or a backslash (a Windows separator / `..\` vector);
  *  - rooted at `.git` (a `.git` FIRST segment), which a real `git clone` would materialize into
- *    the repo's own control directory.
+ *    the repo's own control directory; or
+ *  - carrying a NUL (`\0`) or any C0 control character (`\x00`–`\x1f`). A NUL truncates the path
+ *    at the syscall boundary (a classic "poison null byte" — `a.txt\0.png` reaches disk as
+ *    `a.txt`), and Node's `fs` throws a `TypeError` on an embedded NUL, which would otherwise
+ *    surface as a 500 instead of a clean 4xx. Rejecting the whole C0 range also refuses control
+ *    characters that could corrupt a zip/git entry name.
  *
  * The check is deliberately conservative and segment-based so ordinary nested source paths
  * (`client/src/lib/config.ts`) always pass while every escape shape is refused, LOUDLY, via a
@@ -30,10 +35,17 @@ export class UnsafePathError extends Error {
 /** Windows drive-absolute (`C:\`, `C:/`) or UNC (`\\host`) — never a legit project-relative path. */
 const WINDOWS_ABSOLUTE = /^[A-Za-z]:[\\/]/;
 
+/** A NUL or any C0 control character (`\x00`–`\x1f`) — a poison-null / fs-`TypeError` vector. */
+// eslint-disable-next-line no-control-regex -- deliberately matching the C0 control range
+const CONTROL_CHARS = /[\u0000-\u001f]/u;
+
 /** True when `path` is safe to materialize into an archive zip or a git tree. */
 export function isSafePath(path: string): boolean {
   if (path.length === 0) {
     return false;
+  }
+  if (CONTROL_CHARS.test(path)) {
+    return false; // NUL / C0 control char — poison-null truncation + fs TypeError → 500
   }
   if (path.startsWith("/") || WINDOWS_ABSOLUTE.test(path) || path.startsWith("\\")) {
     return false; // absolute / drive / UNC

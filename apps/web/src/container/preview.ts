@@ -24,6 +24,11 @@
  */
 import { WebContainer } from "@webcontainer/api";
 
+import { createCompileWorkerClient } from "@/compile/client";
+import type { CompileWorkerClient } from "@/compile/client";
+import { registerCompileHandlers } from "@/compile/handlers";
+import type { WasmSourceFile } from "@nyx/compact-wasm";
+
 import { createArtifactsRepointer } from "./artifacts";
 import { runBootPipeline } from "./boot";
 import type { BootResult } from "./boot";
@@ -55,6 +60,24 @@ export interface CreatePreviewDeps {
   readonly reboot: () => Promise<void>;
   /** Trigger the re-point/reload after the ZK-config base var is rewritten (FR-014). */
   readonly onRepointed?: (urlPrefix: string) => void | Promise<void>;
+  /**
+   * The project this preview compiles for (P2). Required — together with
+   * {@link CreatePreviewDeps.getSources} — to wire the `compile:run` handler; when
+   * either is absent, compile handling is not wired.
+   */
+  readonly projectId?: string;
+  /**
+   * Resolve the current Compact sources for the in-browser compile (P2). When
+   * provided (with {@link CreatePreviewDeps.projectId}), the `compile:run` handler
+   * is registered against a per-session {@link CompileWorkerClient}.
+   */
+  readonly getSources?: () => Promise<WasmSourceFile[]>;
+  /**
+   * The compile worker to run `compile:run` against (P2). Defaults to a freshly
+   * spun-up module worker ({@link createCompileWorkerClient}); tests inject a fake
+   * so no real `Worker` is constructed.
+   */
+  readonly compileWorker?: CompileWorkerClient;
   /** Clock for emitted event timestamps; defaults to {@link Date.now}. */
   readonly now?: () => number;
 }
@@ -93,7 +116,7 @@ export function createPreview(
   );
   const crashPolicy = createCrashPolicy({ reboot: deps.reboot, onCrashed: deps.onCrashed });
 
-  const subscriptions: readonly Unsubscribe[] = [
+  const subscriptions: Unsubscribe[] = [
     bridge.on("file:write", (event) => {
       sync.applyWrite(event.payload);
     }),
@@ -116,6 +139,21 @@ export function createPreview(
       void crashPolicy.crash(error.message);
     }),
   ];
+
+  // Wire the P2 `compile:run` → worker → upload → `compile:results` handler on a
+  // per-session compile worker. Gated on `projectId` + `getSources` so a preview
+  // built without them (e.g. a pure US3 harness) stays exactly as before and no
+  // real `Worker` is constructed. The worker is disposed with the subscriptions.
+  const { projectId, getSources } = deps;
+  if (projectId !== undefined && getSources !== undefined) {
+    const worker = deps.compileWorker ?? createCompileWorkerClient();
+    subscriptions.push(
+      registerCompileHandlers({ bridge, worker, projectId, getSources, now }),
+      () => {
+        worker.dispose();
+      },
+    );
+  }
 
   return {
     async start(): Promise<BootResult> {
@@ -156,6 +194,12 @@ export interface LaunchPreviewOptions {
   readonly reboot: () => Promise<void>;
   /** Trigger the re-point/reload after the ZK-config base var is rewritten (FR-014). */
   readonly onRepointed?: (urlPrefix: string) => void | Promise<void>;
+  /**
+   * Resolve the current Compact sources for the in-browser compile (P2). When
+   * provided, the `compile:run` handler is wired against a real per-session module
+   * worker; `projectId` (above) scopes the artifact upload.
+   */
+  readonly getSources?: () => Promise<WasmSourceFile[]>;
   /** Clock for emitted event timestamps; defaults to {@link Date.now}. */
   readonly now?: () => number;
 }

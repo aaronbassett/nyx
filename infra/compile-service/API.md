@@ -1,3 +1,8 @@
+> **SUPERSEDED (2026-07-23, owner decision — design: docs/superpowers/specs/2026-07-23-demo-ready-local-mode-design.md §4).**
+> The Compile Service is retired. User contracts compile in the user's browser
+> (`@nyx/compact-wasm`); artifacts upload to the Nyx server's ArtifactStore.
+> This contract is kept for historical reference only. Do not build against it.
+
 # Nyx Compile Service — API contract (v1)
 
 **Status:** draft contract, authored by the Nyx side (US2). The service itself is

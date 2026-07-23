@@ -4,7 +4,7 @@
 
 **Goal:** Replace the placeholder Shell with the full product UI — Landing + Workspace (chat sidebar with token meter and top-up, Monaco code pane with Compact highlighting and save/build/deploy, WebContainer preview) — polished to sell the project to non-technical stakeholders, ending in a demo-ready golden-path rehearsal.
 
-**Architecture:** A minimal two-route shell (no router dependency) mounts the ALREADY-BUILT, tested feature modules (`@/chat`, `@/ledger`, `@/wallet` top-up, `@/container` preview) — this plan is mostly composition plus the new editor feature. The editor follows the demo-shaped US14 semantics: read-only + live-updating during a turn, editable when idle, explicit save via `file:changed` (server task adds the missing handler → `ProjectStore.commit`), unsaved-changes guard on prompt send, user-edit diffs into the next agent turn (FR-080).
+**Architecture:** A minimal two-route shell (no router dependency) mounts the ALREADY-BUILT, tested feature modules (`@/chat`, `@/ledger`, `@/wallet` top-up, `@/container` preview) — this plan is mostly composition plus the new editor feature. The editor follows the demo-shaped US14 semantics: read-only + live-updating during a turn, editable when idle, explicit save via `file:changed` (server task adds the missing handler → `ProjectStore.commit`), unsaved-changes guard on prompt send, user-edit diffs into the next agent turn (FR-080). **P1 made the read path real:** settled turns now persist their files (supervisor `commitFiles` is a REQUIRED dep, bounded `persistTurnFiles` on all four verify-loop endings), so `GET /projects/:id/manifest` + `/files/*` return real `project_files`/`project_file_versions` rows for any project that has run a turn — the editor and the FR-080 diff context read real data, not hollow projects.
 
 **Tech Stack:** React 19, Vite 8, Tailwind v4 + shadcn/ui, `@monaco-editor/react@4.7.0` + `monaco-editor@0.55.1` (already deps), `@nyx/protocol` events, vitest + @testing-library/react + jsdom.
 
@@ -280,7 +280,7 @@ export function Landing(props: {
 
 **Interfaces:**
 
-- Consumes: `FileChangedEventSchema` payload `{ path, content }` (`@nyx/protocol` events.ts:318 — already defined, currently UNHANDLED server-side); `ProjectStore.commit(projectId, request)` (single-file user-edit commit — read `apps/server/src/projects/store.ts:100` `CommitRequest` for the exact shape incl. the user-edit source marker used by D59); the per-project turn-active state in the coordinator.
+- Consumes: `FileChangedEventSchema` payload (`@nyx/protocol` events.ts:318-327 — already defined, currently UNHANDLED server-side); `ProjectStore.commit(projectId, request)` (`store.ts:102`; `CommitRequest` at `store.ts:57-60` is `{ author: FileAuthor; files: readonly FileWrite[] }` — the user-edit marker is `author: "user"`, the D59 source distinction); `getVersionHistory` (`store.ts:110`) returning `VersionSnapshot[]` (`store.ts:78-85`: `{ version, author, createdAt, files: HandoffFile[] }` — filter `author === "user"`); the per-project turn-active state in the coordinator (`TurnGate.isTurnActive`, `coordinator.ts:960-971`; handler registration site: `router.on("test:results", …)` at `coordinator.ts:976` — register `file:changed` alongside).
 - Produces:
   - a `file:changed` handler: ownership-checked `ctx.projectId` (iron rule: never trust client ids), REJECTED with an error event while a turn is active for that project (FR-047/D60 — find the existing error-event idiom the router uses and reuse it), otherwise `store.commit(ctx.projectId, { files: [{ path, content }], source: <user-edit marker> })`.
   - `collectUserEditContext(store, projectId, sinceVersion): Promise<string>` — renders a bounded summary (paths + unified-ish diffs, capped at 16KB with an honest truncation marker, mirroring the `capTestResults` discipline) of user-edit versions since the last turn, from `getVersionHistory` (read its row shape — it already distinguishes user-edit sources for D59).
@@ -290,8 +290,22 @@ export function Landing(props: {
 - [ ] **Step 2: Failing handler tests** — (a) idle project: `file:changed` commits exactly one version with the user-edit source and echoes success; (b) active turn: no commit, error event emitted naming the turn lock; (c) cross-project spoof: payload for project B on a connection bound to project A → rejected, nothing committed (bind to `ctx.projectId`, ignore any payload project field).
 - [ ] **Step 3: Failing `collectUserEditContext` tests** — no edits → empty string; two edited files → both paths + diffs present; oversized content → truncated at the cap with marker; only USER-sourced versions included (agent-turn versions excluded).
 - [ ] **Step 4: Failing supervisor test** — with recorded user edits since last turn, the sub-agent context contains the summary + instruction; with none, context unchanged.
-- [ ] **Step 5: FAIL → implement → PASS. Gates.**
+- [ ] **Step 5: FAIL → implement → PASS. Gates.** (Known carry from the P1 retro, note-only: the coordinator's `lastResultsByProject`/`consoleByProject`/`projects` maps share a coordinator-lifetime no-eviction pattern — if this task adds any per-project map, follow the same pattern and the same "evict together in a future connection-cleanup pass" note rather than inventing a new lifecycle.)
 - [ ] **Step 6: Commit** — `git commit -m "feat(server): file:changed commits and user-edit context for agents"`.
+
+---
+
+### Task 7b (OPTIONAL, recommended): coverage-protocol enrichment — `test:results` carries passing names
+
+**Grounding (P1 retro, review finding F1):** the FR-032 per-circuit coverage telemetry is information-free on real GREEN runs — the wire DTO carries FAILING test names only, so green ⇒ `failures: []` ⇒ an honest all-uncovered report (documented at `apps/server/src/turn/coordinator.ts:765-771`; tests assert the honest gap). The real fix was explicitly recorded for P2/P6 re-planning. P2's Task 1 (optional step) lands the additive protocol field `passedNames?: string[]` on `TestResultsPayloadSchema`; this task lands the two consumers. Skip only with a retro note.
+
+**Files:**
+
+- Modify: `apps/web/src/container/testrunner.ts` (emit passing test `fullName`s from the vitest JSON report's `assertionResults` where `status === "passed"` — the parser already walks them), `apps/server/src/agents/coverage.ts` (`testNamesFromResults` folds `passedNames` alongside failure names; `capTestResults` must cap the enlarged payload under the same FR-033 32KB wire frame — passing names are the FIRST thing truncated, failures keep priority), and the P2 protocol field if P2 skipped it.
+- Test: extend `apps/web/tests/container`/testrunner + `apps/server/tests/` coverage suites: a green run now yields covered circuits when test names mention them; the cap truncates passing names before failure detail; a legacy payload WITHOUT `passedNames` still parses (backward compat).
+
+- [ ] **Step 1:** FAIL → implement → PASS across web + server + protocol suites. Gates.
+- [ ] **Step 2:** Commit — `git commit -m "feat: carry passing test names for circuit coverage telemetry"`.
 
 ---
 

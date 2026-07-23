@@ -94,6 +94,7 @@ describe("runTurn — EC-11 / scenario 9: frontend-only skip", () => {
     const outcome = await orchestrator.runTurn({
       projectId: PROJECT_ID,
       files: [FRONTEND_FILE],
+      turnId: "turn-1",
       changedPaths: ["src/App.tsx"],
     });
 
@@ -113,6 +114,7 @@ describe("runTurn — scenario 1: a failed check feeds the verify loop", () => {
     const outcome = await orchestrator.runTurn({
       projectId: PROJECT_ID,
       files: [...SOURCE_FILES],
+      turnId: "turn-1",
       changedPaths: [...COMPACT_CHANGE],
     });
 
@@ -136,6 +138,7 @@ describe("runTurn — scenario 2 / FR-014: verify-before-announce on green", () 
     const outcome = await orchestrator.runTurn({
       projectId: PROJECT_ID,
       files: [...SOURCE_FILES],
+      turnId: "turn-1",
       changedPaths: [...COMPACT_CHANGE],
     });
 
@@ -159,6 +162,7 @@ describe("runTurn — scenario 2 / FR-014: verify-before-announce on green", () 
     const outcome = await orchestrator.runTurn({
       projectId: PROJECT_ID,
       files: [...SOURCE_FILES],
+      turnId: "turn-1",
       changedPaths: [...COMPACT_CHANGE],
     });
 
@@ -182,6 +186,7 @@ describe("runTurn — scenario 8 / D36: a stale prefix maps to reopen guidance",
     const outcome = await orchestrator.runTurn({
       projectId: PROJECT_ID,
       files: [...SOURCE_FILES],
+      turnId: "turn-1",
       changedPaths: [...COMPACT_CHANGE],
     });
 
@@ -203,6 +208,7 @@ describe("runTurn — SC-006: content-hash reuse announces once, no second build
     const outcome = await orchestrator.runTurn({
       projectId: PROJECT_ID,
       files: [...SOURCE_FILES],
+      turnId: "turn-1",
       changedPaths: [...COMPACT_CHANGE],
     });
 
@@ -229,6 +235,7 @@ describe("runTurn — FR-016: progress surfaced + hung job → explicit timeout"
     const outcome = await orchestrator.runTurn({
       projectId: PROJECT_ID,
       files: [...SOURCE_FILES],
+      turnId: "turn-1",
       changedPaths: [...COMPACT_CHANGE],
     });
 
@@ -251,6 +258,7 @@ describe("runTurn — FR-016: progress surfaced + hung job → explicit timeout"
     const outcome = await orchestrator.runTurn({
       projectId: PROJECT_ID,
       files: [...SOURCE_FILES],
+      turnId: "turn-1",
       changedPaths: [...COMPACT_CHANGE],
     });
 
@@ -284,6 +292,7 @@ describe("runTurn — a full-stage compile failure is data, not an announce", ()
     const outcome = await orchestrator.runTurn({
       projectId: PROJECT_ID,
       files: [...SOURCE_FILES],
+      turnId: "turn-1",
       changedPaths: [...COMPACT_CHANGE],
     });
 
@@ -307,6 +316,7 @@ describe("runTurn — SC-008: check latency is captured against the injected clo
     const outcome = await orchestrator.runTurn({
       projectId: PROJECT_ID,
       files: [...SOURCE_FILES],
+      turnId: "turn-1",
       changedPaths: [...COMPACT_CHANGE],
     });
 

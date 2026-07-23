@@ -1,20 +1,23 @@
 /**
- * Implementation sub-agent tests (US1 — T140, D3/FR-002) — deterministic, no real
- * model, no real MCP.
+ * Implementation sub-agent tests (US1 — T140, D3) — deterministic, no real model, no
+ * real MCP.
  *
  * These pin {@link createImplementationAgent} against a {@link MockLanguageModelV4}
- * plus fake mnm/tome retrieval + a fake toolchain (compiler MCP), proving:
+ * plus fake mnm/tome retrieval, proving:
  *  - the agent GROUNDS in mnm + MNE/tome retrieval before it writes Compact/React
  *    (D3/constitution I) — the retrieve tools wrap `mnm.call`/`tome.call`;
- *  - FR-002 — before surfacing Compact the agent COMPILES via the compiler MCP
- *    (`toolchain.call(check, …)`) on the files it produced (compile-before-surface);
  *  - the typed {@link Output} file set (contract + witness + React + tests) is mapped
  *    onto {@link SubAgentWork.files} with tokens summed from the model usage;
  *  - fed-forward compile diagnostics / test failures on a retry cycle are folded into
- *    the model prompt so the retry consults retrieval + the diagnostics (scenario 3);
- *  - a compiler-MCP throw (McpTimeoutError) PROPAGATES (the supervisor's infra-retry
+ *    the model prompt so the retry consults retrieval + the diagnostics (scenario 3) —
+ *    the diagnostics now come from the SUPERVISOR's per-cycle browser CHECK (P2), not an
+ *    in-agent compile step;
+ *  - a retrieval-MCP throw (McpTimeoutError) PROPAGATES (the supervisor's infra-retry
  *    owns it) rather than being swallowed;
  *  - the same mock inputs yield identical work (determinism, constitution IV).
+ *
+ * P2: the compiler MCP is retired — user contracts compile in the browser toolchain —
+ * so there is NO compile-before-surface tool here anymore.
  */
 import { MockLanguageModelV4 } from "ai/test";
 import { describe, expect, it, vi } from "vitest";
@@ -25,7 +28,6 @@ import {
   MANUAL_RETRIEVAL_TOOL,
   MNM_RETRIEVAL_TOOL,
   TOME_RETRIEVAL_TOOL,
-  TOOLCHAIN_CHECK_TOOL,
 } from "../../src/agents/implementation.js";
 import type { McpCallable } from "../../src/agents/implementation.js";
 import type { SubAgentCycleContext, SubAgents, SubAgentWork } from "../../src/agents/supervisor.js";
@@ -107,24 +109,6 @@ function fakeMcp(impl?: (tool: string, args?: Record<string, unknown>) => Promis
   };
 }
 
-/** A fake toolchain that reports a clean check by default. */
-function fakeToolchain(impl?: (tool: string, args?: Record<string, unknown>) => Promise<unknown>): {
-  call: Mock<McpCallable["call"]>;
-} {
-  return {
-    call: vi.fn<McpCallable["call"]>(
-      impl ??
-        (() =>
-          Promise.resolve({
-            ok: true,
-            diagnostics: [],
-            compilerVersion: "0.24.0",
-            durationMs: 12,
-          })),
-    ),
-  };
-}
-
 /** The contract + witness + React + test file set the model returns. */
 const IMPL_OUTPUT = {
   narration: "Implemented the Counter contract, witness, React UI, and a behavioural test.",
@@ -170,20 +154,17 @@ describe("createImplementationAgent", () => {
       model: mockModel([]),
       mnm: fakeMcp(),
       tome: fakeMcp(),
-      toolchain: fakeToolchain(),
     });
     expect(implementation).toBeTypeOf("function");
   });
 
-  it("grounds in mnm + tome retrieval, then compiles the produced Compact (FR-002)", async () => {
+  it("grounds in mnm + tome retrieval, then surfaces the produced file set (D3)", async () => {
     const mnm = fakeMcp();
     const tome = fakeMcp();
-    const toolchain = fakeToolchain();
     const implementation = createImplementationAgent({
       model: groundedRun(),
       mnm,
       tome,
-      toolchain,
     });
 
     const work = await implementation(makeCtx());
@@ -191,12 +172,8 @@ describe("createImplementationAgent", () => {
     // Grounding: both retrieval sources were consulted with the model's queries (D3).
     expect(mnm.call).toHaveBeenCalledWith(MNM_RETRIEVAL_TOOL, { query: "counter ledger" });
     expect(tome.call).toHaveBeenCalledWith(TOME_RETRIEVAL_TOOL, { query: "increment circuit" });
-    // FR-002: compile-before-surface ran on the produced files with the check tool.
-    expect(toolchain.call).toHaveBeenCalledWith(
-      TOOLCHAIN_CHECK_TOOL,
-      expect.objectContaining({ files: IMPL_OUTPUT.files }),
-    );
-    // The typed file set is surfaced verbatim.
+    // The typed file set is surfaced verbatim (the browser toolchain compiles it — no
+    // in-agent compile step).
     expect(work.files).toEqual(IMPL_OUTPUT.files);
     expect(work.narration).toBe(IMPL_OUTPUT.narration);
   });
@@ -206,7 +183,6 @@ describe("createImplementationAgent", () => {
       model: groundedRun(),
       mnm: fakeMcp(),
       tome: fakeMcp(),
-      toolchain: fakeToolchain(),
     });
 
     const work = await implementation(makeCtx());
@@ -214,27 +190,6 @@ describe("createImplementationAgent", () => {
     // (5+2) + (5+2) + (10+8) = 32 base units.
     expect(work.tokensConsumed).toBe(32n);
     expect(typeof work.tokensConsumed).toBe("bigint");
-  });
-
-  it("skips the compile step when the change set carries no Compact file", async () => {
-    const toolchain = fakeToolchain();
-    const model = mockModel([
-      toolCallStep(MANUAL_RETRIEVAL_TOOL, { query: "ui only" }),
-      finalStep({
-        narration: "Frontend-only tweak.",
-        files: [{ path: "src/App.tsx", content: "export function App() {\n  return null;\n}\n" }],
-      }),
-    ]);
-    const implementation = createImplementationAgent({
-      model,
-      mnm: fakeMcp(),
-      tome: fakeMcp(),
-      toolchain,
-    });
-
-    await implementation(makeCtx({ coldStart: false }));
-
-    expect(toolchain.call).not.toHaveBeenCalled();
   });
 
   it("folds fed-forward compile diagnostics + test failures into the model prompt and re-grounds (scenario 3)", async () => {
@@ -251,7 +206,6 @@ describe("createImplementationAgent", () => {
       model,
       mnm,
       tome: fakeMcp(),
-      toolchain: fakeToolchain(),
     });
 
     await implementation(
@@ -270,27 +224,12 @@ describe("createImplementationAgent", () => {
     expect(text).toContain("counter increments");
   });
 
-  it("propagates a compiler-MCP timeout from compile-before-surface (FR-002)", async () => {
-    const toolchain = fakeToolchain(() =>
-      Promise.reject(new McpTimeoutError("http://toolchain.test", "call", 30000)),
-    );
-    const implementation = createImplementationAgent({
-      model: groundedRun(),
-      mnm: fakeMcp(),
-      tome: fakeMcp(),
-      toolchain,
-    });
-
-    await expect(implementation(makeCtx())).rejects.toBeInstanceOf(McpTimeoutError);
-  });
-
   it("propagates an mnm retrieval timeout instead of swallowing it", async () => {
     const mnm = fakeMcp(() => Promise.reject(new McpTimeoutError("http://mnm.test", "call", 5000)));
     const implementation = createImplementationAgent({
       model: groundedRun(),
       mnm,
       tome: fakeMcp(),
-      toolchain: fakeToolchain(),
     });
 
     await expect(implementation(makeCtx())).rejects.toBeInstanceOf(McpTimeoutError);
@@ -302,7 +241,6 @@ describe("createImplementationAgent", () => {
         model: groundedRun(),
         mnm: fakeMcp(),
         tome: fakeMcp(),
-        toolchain: fakeToolchain(),
       })(makeCtx());
 
     const first: SubAgentWork = await build();
@@ -311,10 +249,10 @@ describe("createImplementationAgent", () => {
   });
 });
 
-describe("createImplementationAgent — steering seam (US1, D3/FR-002/FR-080)", () => {
+describe("createImplementationAgent — steering seam (US1, D3/FR-080)", () => {
   const STEERING = "PLATFORM STEERING MARKER — ship OZ-simulator + Vitest tests for the contract.";
 
-  /** A one-step model that emits a frontend-only file set (no Compact → no compile call). */
+  /** A one-step model that emits an empty file set. */
   function outputOnlyModel(): MockLanguageModelV4 {
     return mockModel([finalStep({ narration: "done", files: [] })]);
   }
@@ -325,7 +263,6 @@ describe("createImplementationAgent — steering seam (US1, D3/FR-002/FR-080)", 
       model,
       mnm: fakeMcp(),
       tome: fakeMcp(),
-      toolchain: fakeToolchain(),
       steering: STEERING,
     });
 
@@ -344,7 +281,6 @@ describe("createImplementationAgent — steering seam (US1, D3/FR-002/FR-080)", 
       model,
       mnm: fakeMcp(),
       tome: fakeMcp(),
-      toolchain: fakeToolchain(),
     });
 
     await implementation(makeCtx());

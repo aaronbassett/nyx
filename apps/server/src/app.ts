@@ -8,6 +8,8 @@
 import Fastify from "fastify";
 import type { FastifyInstance, FastifyRequest, FastifyServerOptions } from "fastify";
 import fastifyWebsocket from "@fastify/websocket";
+import { createInMemoryArtifactStore, registerArtifactRoutes } from "./artifacts/index.js";
+import type { ArtifactStore } from "./artifacts/index.js";
 import { createRequireSession, PgSessionAuthStore, registerAuthRoutes } from "./auth/index.js";
 import type { AuthDb, SessionAuthStore } from "./auth/index.js";
 import type { Config } from "./config/index.js";
@@ -16,6 +18,7 @@ import type { DeployHandler } from "./deploy/handler.js";
 import type { DeployRegistry } from "./deploy/registry.js";
 import { registerDeployRoutes } from "./deploy/routes.js";
 import { registerHealthRoutes } from "./http/health.js";
+import { registerSrsRoutes } from "./http/srs.js";
 import type { DepositStore, LedgerStore } from "./ledger/index.js";
 import { registerLedgerRoutes } from "./ledger/routes.js";
 import type { McpClients } from "./mcp/index.js";
@@ -55,6 +58,13 @@ export interface ServerDeps {
   readonly projectStore?: ProjectStore;
   /** Optional soft-delete cascade (US7); defaults to the no-op seams for now (D49). */
   readonly projectCascade?: DeletionCascade;
+  /**
+   * Optional artifact store (P2 browser-compile). When a project store + live session gate
+   * exist, the artifact upload (PUT/commit) + public serve (GET) routes register against it.
+   * Defaults to an in-memory store so existing fixtures stay green; `index.ts` should inject a
+   * durable {@link createLocalArtifactStore} (with size caps + a rootDir) for real deployments.
+   */
+  readonly artifactStore?: ArtifactStore;
   /**
    * Optional clone/handoff service (US13). When omitted, a default is constructed from the
    * resolved project store + config rate-limit tunables (ONE shared repo cache + limiter for
@@ -194,6 +204,12 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
 
   registerHealthRoutes(app, { db: deps.db, mcp: deps.mcp });
 
+  // SRS pre-fetch cache serve (P2 demo): session-less read-only `GET /srs/*` over the local
+  // cache dir, registered only when configured (the demo stack pre-fetches; other envs omit it).
+  if (deps.config.artifacts.srsCacheDir !== undefined) {
+    registerSrsRoutes(app, { cacheDir: deps.config.artifacts.srsCacheDir });
+  }
+
   const authStore = resolveAuthStore(deps);
   if (authStore !== undefined) {
     registerAuthRoutes(app, { store: authStore, config: deps.config });
@@ -226,6 +242,23 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       // routes and the token-gated git-HTTP scope, so they share a rate limiter + repo cache.
       const cloneService = resolveCloneService(deps, projectStore);
       registerProjectRoutes(app, { store: projectStore, requireSession, cascade, cloneService });
+
+      // P2 browser-compile artifact routes: session+ownership-gated PUT/commit uploads and the
+      // public (session-less) content-addressed GET. Co-registered with the project routes
+      // because the write routes resolve ownership through the project store; the GET carries no
+      // session gate (unguessable content-hash prefixes are the access control). An in-memory
+      // store is the default so existing fixtures need no change (see ServerDeps.artifactStore).
+      // L4: thread the config artifact caps into that default so a buildServer caller that does
+      // NOT inject a store still gets FINITE per-file / bundle / staging caps, never `Infinity`.
+      const artifacts =
+        deps.artifactStore ??
+        createInMemoryArtifactStore({
+          maxFileBytes: deps.config.artifacts.maxFileBytes,
+          maxBundleBytes: deps.config.artifacts.maxBundleBytes,
+          maxStagedBytesPerProject: deps.config.artifacts.maxStagedBytesPerProject,
+          maxStagedPrefixesPerProject: deps.config.artifacts.maxStagedPrefixesPerProject,
+        });
+      registerArtifactRoutes(app, { store: projectStore, artifacts, requireSession });
 
       // Token-gated (NOT session-gated) smart-HTTP git surface. Registered as a SEPARATE
       // encapsulated scope (like the prover proxy) because `handleGitHttp` enforces the token +

@@ -114,13 +114,35 @@ export const EnvSchema = z.object({
   // Connection / infra (validated here, consumed by the db + proxy layers).
   DATABASE_URL: z.string().min(1, "must be a non-empty Postgres connection string"),
   PORT: positiveInt.default(8080),
-  MCP_TOOLCHAIN_URL: z.string().url("must be a valid URL (toolchain compile MCP, .flycast)"),
+  // Absolute public origin the browser-compile artifact URLs are built under (P2). OPTIONAL:
+  // when unset it derives from PORT (`http://localhost:<PORT>`), so no NEW required env var is
+  // introduced (that would break every server test fixture). Only the origin is load-bearing —
+  // the in-process artifact `fetch` adapter parses the path and ignores the host.
+  PUBLIC_ORIGIN: z
+    .string()
+    .url("must be a valid absolute origin (P2 browser-compile artifact URLs)")
+    .optional(),
   MCP_TOME_URL: z.string().url("must be a valid URL (Tome skill-routing MCP)"),
   MCP_MNM_URL: z.string().url("must be a valid URL (mnm docs MCP)"),
   PROVER_URL: z.string().url("must be a valid URL (interim D37 proof server)"),
-  COMPILE_SERVICE_URL: z
-    .string()
-    .url("must be a valid URL (HTTP Compile Service base URL, US2 glue layer)"),
+
+  // Durable artifact store (P2 browser-compile). The server now stores compile artifacts
+  // itself (the Compile Service + R2-write path is retired), so these size caps + on-disk
+  // root replace the R2 config. All OPTIONAL with sane defaults — no NEW required env var
+  // (adding one would break every server test fixture, the US1 lesson).
+  ARTIFACT_STORE_ROOT: z.string().min(1).default("./data/artifacts"),
+  ARTIFACT_MAX_FILE_BYTES: positiveInt.default(16_777_216), // 16 MB/file
+  ARTIFACT_MAX_BUNDLE_BYTES: positiveInt.default(134_217_728), // 128 MB/prefix
+  // Per-project STAGED (uncommitted) exhaustion caps (M1): bound how much a project may hold
+  // uncommitted across ALL prefixes, so unbounded distinct `sourceHash` prefixes can't exhaust
+  // the shared staging volume. Defaults ≈ 4× the bundle cap + 8 concurrent uncommitted prefixes.
+  ARTIFACT_MAX_STAGED_BYTES_PER_PROJECT: positiveInt.default(536_870_912), // 512 MB staged/project
+  ARTIFACT_MAX_STAGED_PREFIXES_PER_PROJECT: positiveInt.default(8), // concurrent uncommitted prefixes
+  // Bounded per-cycle CHECK + green FULL browser-compile waits (D42 no-hang backstops).
+  COMPILE_CHECK_TIMEOUT_MS: positiveInt.default(30_000),
+  COMPILE_FULL_TIMEOUT_MS: positiveInt.default(300_000),
+  // Optional local SRS pre-fetch cache served read-only at `GET /srs/*` (demo prove speed).
+  SRS_CACHE_DIR: z.string().min(1).optional(),
 
   // Network profile selection + optional per-field endpoint overrides. The
   // profile bundles PUBLIC endpoints (node/indexer/proof) + the connector's
@@ -139,19 +161,9 @@ export const EnvSchema = z.object({
   MCP_HEALTH_TIMEOUT_MS: positiveInt.default(5_000),
   MCP_MAX_CONCURRENCY: positiveInt.default(4),
 
-  // R2 read placeholders (public, non-secret; optional until R2 is wired).
-  R2_PUBLIC_BASE_URL: z.string().url("must be a valid URL").optional(),
-  R2_BUCKET: z.string().min(1).optional(),
-
   // Server-only secrets — presence validated; NEVER routed to a client surface.
   // (DATABASE_URL, validated above, is also secret and lives under `secrets`.)
   DEPLOY_KEY: z.string().min(1, "must be present (server-only deploy key, D52)"),
-  COMPILE_SERVICE_TOKEN: z
-    .string()
-    .min(1, "must be present (server-only Compile Service bearer token, constitution III)"),
-  R2_ACCESS_KEY_ID: z.string().min(1, "must be present (server-only R2 write credential)"),
-  R2_SECRET_ACCESS_KEY: z.string().min(1, "must be present (server-only R2 write credential)"),
-  R2_ACCOUNT_ID: z.string().min(1, "must be present (server-only R2 account id)"),
 
   // Per-provider LLM API keys (D19 model routing). OPTIONAL server-only secrets:
   // a deployment supplies a key only for the providers its MODEL_ROUTING table
@@ -203,7 +215,6 @@ export type Env = z.infer<typeof EnvSchema>;
 
 /** MCP endpoints + client tunables consumed by the mcp layer (T019). */
 export interface McpConfig {
-  readonly toolchainUrl: string;
   readonly tomeUrl: string;
   readonly mnmUrl: string;
   /** Strict per-request timeout (connect + call); no call may hang (D31). */
@@ -222,20 +233,21 @@ export interface ProverConfig {
 }
 
 /**
- * HTTP Compile Service config (US2 glue layer, `infra/compile-service/API.md`).
- * The service is the ONLY holder of R2 write credentials; Nyx drives it over
- * bearer auth and only READS R2 (constitution III). The `url` is a server-internal
- * endpoint — never client-bound (kept out of {@link PublicConfig}) — while the
- * bearer token is a server-only secret under {@link ServerSecrets}.
+ * Durable artifact store config (P2 browser-compile). The server now stores compile
+ * artifacts itself — the retired Compile Service + R2-write path is gone — so these are
+ * the on-disk root + size caps `index.ts` hands {@link createLocalArtifactStore}, plus the
+ * optional local SRS pre-fetch cache served read-only at `GET /srs/*`. All are local
+ * endpoints/paths, not credentials, so this flows into {@link PublicConfig}.
  */
-export interface CompileServiceConfig {
-  readonly url: string;
-}
-
-/** R2 read-side placeholders (public, non-secret). */
-export interface R2ReadConfig {
-  readonly publicBaseUrl: string | undefined;
-  readonly bucket: string | undefined;
+export interface ArtifactStoreConfig {
+  readonly rootDir: string;
+  readonly maxFileBytes: number;
+  readonly maxBundleBytes: number;
+  /** Per-project cap on total UNCOMMITTED staged bytes (M1 disk-exhaustion guard). */
+  readonly maxStagedBytesPerProject: number;
+  /** Per-project cap on the count of concurrently-staged (uncommitted) prefixes (M1). */
+  readonly maxStagedPrefixesPerProject: number;
+  readonly srsCacheDir: string | undefined;
 }
 
 /**
@@ -259,6 +271,10 @@ export interface Tunables {
   readonly depositRefTtlMs: number;
   readonly reconcileCadenceMs: number;
   readonly sessionLifetimeMs: number;
+  /** Bounded per-cycle browser CHECK wait (D42 no-hang backstop), in ms. */
+  readonly compileCheckTimeoutMs: number;
+  /** Bounded green FULL browser-compile wait (D42 no-hang backstop), in ms. */
+  readonly compileFullTimeoutMs: number;
   /** Clone/handoff git-HTTP rate-limit bucket capacity (burst) (EC-55). */
   readonly cloneRateCapacity: number;
   /** Clone/handoff attempts replenished per {@link Tunables.cloneRateIntervalMs} (EC-55). */
@@ -275,11 +291,6 @@ export interface Tunables {
 export interface ServerSecrets {
   readonly databaseUrl: string;
   readonly deployKey: string;
-  /** Bearer token for the HTTP Compile Service; server-only, like {@link ServerSecrets.deployKey}. */
-  readonly compileServiceToken: string;
-  readonly r2AccessKeyId: string;
-  readonly r2SecretAccessKey: string;
-  readonly r2AccountId: string;
   /**
    * Per-provider LLM API keys for the D19 model-routing loader — all OPTIONAL:
    * a key is present only for providers a deployment's `MODEL_ROUTING` actually
@@ -299,23 +310,28 @@ export interface ServerSecrets {
 /** The fully validated, frozen server configuration. */
 export interface Config {
   readonly port: number;
+  /**
+   * Absolute public origin (scheme + host + optional port) the P2 browser-compile artifact
+   * URLs are built under, e.g. `http://localhost:8080`. Public, non-secret (an endpoint, not a
+   * credential) — flows into {@link PublicConfig}. Derived from {@link Config.port} when the
+   * `PUBLIC_ORIGIN` env var is unset.
+   */
+  readonly publicOrigin: string;
   readonly network: NetworkConfig;
   readonly mcp: McpConfig;
   readonly prover: ProverConfig;
-  readonly compileService: CompileServiceConfig;
-  readonly r2: R2ReadConfig;
+  /** Durable artifact store root + size caps + optional SRS cache (P2 browser-compile). */
+  readonly artifacts: ArtifactStoreConfig;
   readonly tunables: Tunables;
   readonly modelRouting: ModelRoutingTable;
   readonly secrets: ServerSecrets;
 }
 
 /**
- * Config view safe to expose beyond the server boundary. `secrets` is dropped
- * (constitution III); `compileService` is dropped too — its URL is a
- * server-internal endpoint consumed only by the orchestrator (like the bearer
- * token, it never becomes a client/`VITE_` surface).
+ * Config view safe to expose beyond the server boundary. `secrets` is dropped entirely
+ * (constitution III), so deploy keys can never be serialized to a client surface.
  */
-export type PublicConfig = Omit<Config, "secrets" | "compileService">;
+export type PublicConfig = Omit<Config, "secrets">;
 
 // ── Model-routing credential projection ──────────────────────────────────────
 

@@ -112,7 +112,8 @@ export class ProverUnavailableError extends Error {
  * Build a {@link ProverClient} that transparently relays a request to the interim
  * prover. The body + content-type go out opaquely; the response status, body, and
  * content-type come back opaquely. A `fetch` throw becomes a named
- * {@link ProverUnavailableError} (mirrors `HttpCompileClient`'s unreachable mapping).
+ * {@link ProverUnavailableError} (the named-unreachable-error mapping used across the
+ * server's external-service clients).
  */
 export function createProverClient(deps: ProverClientDeps): ProverClient {
   const fetchImpl = deps.fetch ?? globalThis.fetch;

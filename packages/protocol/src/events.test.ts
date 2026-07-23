@@ -270,6 +270,86 @@ describe("ClientToServerEventSchema", () => {
   });
 });
 
+describe("compile:run / compile:results (P2 browser compile)", () => {
+  const turnId = "turn-1";
+
+  it("accepts a server->client compile:run frame", () => {
+    const parsed = parseServerToClientEvent({
+      type: "compile:run",
+      payload: { turnId, kind: "check" },
+      ts: 1,
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it("rejects compile:run with an unknown kind", () => {
+    const parsed = parseServerToClientEvent({
+      type: "compile:run",
+      payload: { turnId, kind: "half" },
+      ts: 1,
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("accepts a failing check compile:results with diagnostics", () => {
+    const parsed = parseClientToServerEvent({
+      type: "compile:results",
+      payload: {
+        turnId,
+        kind: "check",
+        ok: false,
+        diagnostics: [
+          {
+            severity: "error",
+            source: "compactc",
+            message: "undeclared identifier",
+            file: "contract.compact",
+            span: { start: { line: 3, column: 7 } },
+          },
+        ],
+        compilerVersion: "0.31.1",
+        durationMs: 812,
+      },
+      ts: 1,
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it("accepts a green full compile:results carrying sourceHash + circuits", () => {
+    const parsed = parseClientToServerEvent({
+      type: "compile:results",
+      payload: {
+        turnId,
+        kind: "full",
+        ok: true,
+        diagnostics: [],
+        compilerVersion: "0.31.1",
+        durationMs: 4021,
+        sourceHash: "a".repeat(64),
+        circuits: [{ name: "deposit", proof: true }],
+      },
+      ts: 1,
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it("rejects a green full compile:results WITHOUT sourceHash", () => {
+    const parsed = parseClientToServerEvent({
+      type: "compile:results",
+      payload: {
+        turnId,
+        kind: "full",
+        ok: true,
+        diagnostics: [],
+        compilerVersion: "0.31.1",
+        durationMs: 4021,
+      },
+      ts: 1,
+    });
+    expect(parsed.success).toBe(false);
+  });
+});
+
 describe("parse helpers", () => {
   const promptSubmit: unknown = {
     type: "prompt:submit",

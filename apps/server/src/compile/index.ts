@@ -1,11 +1,13 @@
 /**
- * Compile pipeline public surface (US2 — T066).
+ * Compile pipeline public surface (US2 — T066; P2 browser-compile).
  *
- * The Nyx-side Compile Service client + artifact orchestrator: consumers of the
- * owner-built Compile Service (`infra/compile-service/API.md`). US2 adds NO REST
- * routes — the pipeline is invoked by the turn/agent layer (US1) via these
- * injectable-deps modules, exercised directly in tests. Nyx never compiles or
- * writes R2; the service is owner-gated (constitution III).
+ * The compile client + artifact orchestrator the turn/agent layer (US1) drives. P2 retired
+ * the HTTP Compile Service + R2-write path: the concrete client is now
+ * {@link createBrowserCompileClient}, which delegates the compile to the user's browser
+ * toolchain and whose green artifacts land in the server's own ArtifactStore. What remains
+ * here is transport-agnostic — the {@link CompileClient} contract, the {@link runCompileJob}
+ * submit→poll loop, and the {@link ArtifactOrchestrator} that reads+verifies a committed
+ * prefix before announcing. Invoked in-process (no REST routes), exercised directly in tests.
  */
 export {
   CompileServiceError,
@@ -14,18 +16,12 @@ export {
   CompileServiceProtocolError,
   CompileJobTimeoutError,
 } from "./errors.js";
-export {
-  HttpCompileClient,
-  runCompileJob,
-  DEFAULT_POLL_INTERVAL_MS,
-  DEFAULT_MAX_WAIT_MS,
-} from "./client.js";
-export type {
-  CompileClient,
-  CompileServiceClientDeps,
-  CompileProgressUpdate,
-  RunCompileJobOptions,
-} from "./client.js";
+export { runCompileJob, DEFAULT_POLL_INTERVAL_MS, DEFAULT_MAX_WAIT_MS } from "./client.js";
+export type { CompileClient, CompileProgressUpdate, RunCompileJobOptions } from "./client.js";
+export { createCompileResultsInbox } from "./inbox.js";
+export type { CompileResultsInbox } from "./inbox.js";
+export { createBrowserCompileClient } from "./browser-client.js";
+export type { BrowserCompileClientDeps, BrowserCompileSession } from "./browser-client.js";
 export {
   ArtifactOrchestrator,
   hasCompactChange,

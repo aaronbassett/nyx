@@ -6,7 +6,7 @@
 
 **Architecture:** A `tsx` CLI in `infra/demo/` built as a sequence of idempotent phases over injectable seams (exec, fs, fetch, clock, log). One demo compose file layers Postgres and the nyx-server container onto the three pinned devnet images. Machine state (generated keys, vault address, funding evidence) lives in gitignored `infra/demo/.state/`. Everything deterministic is unit-tested with fakes; everything touching live services is `DEVNET_URL`-gated.
 
-**Tech Stack:** TypeScript/Node ≥22, tsx, vitest, docker compose, pnpm\@10 workspaces, Socket Firewall (`sfw`), the pinned Midnight devnet images (node `0.22.5`, indexer-standalone `4.2.1`, proof-server `8.1.0` — never bump from memory).
+**Tech Stack:** TypeScript/Node ≥22, tsx, vitest, docker compose, pnpm **10.34.5** workspaces (the `packageManager` pin — `minimumReleaseAge` needs ≥10.16.0 and 10.0.0 silently ignored the `onlyBuiltDependencies` allowlist; P0 retro), Socket Firewall pinned **`sfw@2.0.6`** (`npm i -g sfw@2.0.6`, same as CI — P0 retro), the pinned Midnight devnet images (node `0.22.5`, indexer-standalone `4.2.1`, proof-server `8.1.0` — never bump from memory).
 
 ## Global Constraints
 
@@ -14,7 +14,9 @@
 - Devnet image pins are load-bearing: `midnightntwrk/midnight-node:0.22.5` (< 1.0.0), `midnightntwrk/indexer-standalone:4.2.1` (< 4.3.0), `midnightntwrk/proof-server:8.1.0`. Copy verbatim from `infra/devnet/docker-compose.yml`; do not bump.
 - Devnet ports 9944 / 6300 / 8088 are pinned and never remapped; Nyx's OWN services (Postgres, server, web) get non-conflicting ports.
 - Genesis dev seed `0000000000000000000000000000000000000000000000000000000000000001` is PUBLIC — local devnet only; the CLI must refuse to run funding phases when `NYX_NETWORK !== "local-devnet"`.
-- Constitution I: every key-derivation, funding, DUST-registration, node/indexer probe shape is verified against the live devnet / installed SDK types before coding — never from memory. Steps below encode probe-then-code.
+- **Genesis seed partitioning (SPIKE-2 §Funding / P1 retro):** seeds `0x…01`–`0x…04` are genesis-mint wallets (each 250,000,000,000,000 unshielded NIGHT, pre-dust-registered) but they are SHARED GLOBAL STATE on the devnet — concurrent consumers must partition (the spikes used `…01`/`…03`). The demo CLI funds its own GENERATED wallets (server deploy wallet ≠ user dev wallet, two fresh seeds) from ONE genesis seed and never hands a genesis seed to the server or the web app; per-wallet submissions are serialized (UTXO races observed on concurrent submits from one seed).
+- **The funding/DUST recipe is EXECUTED PRIOR ART, not an open question:** SPIKE-2 §"Funding/DUST recipe" (script `05-fresh-wallet-dust.mjs`) is the verbatim reference — wallet env construction over `{walletNetworkId:'undeployed', networkId:'undeployed', indexer, indexerWS (`/api/v4/graphql/ws`), node, nodeWS, proofServer, faucet:undefined}` + `setNetworkId('undeployed')` (LOWERCASE — the tx-encoding id; `"Undeployed"` is only Lace's display string) + `MidnightWalletProvider.build(logger, env, seedHex)`; transfer via `wallet.transferTransaction([...unshielded outputs...])` → `signRecipe` → `finalizeRecipe` → `submitTransaction`; DUST registration via `wallet.registerNightUtxosForDustGeneration(...)` — accepted with ZERO dust held, ~12 s accrual before the first fee-paying tx; balances via `state.unshielded.balances[unshieldedToken().raw]` and `state.dust.balance(new Date())`.
+- Constitution I: every key-derivation, funding, DUST-registration, node/indexer probe shape is verified against the live devnet / installed SDK types before coding — never from memory. Steps below encode probe-then-code (with the SPIKE-2 recipe as the first-cited evidence).
 - Secrets (deploy key, LLM keys) never enter git: `.state/`, `.env.demo`, `.env.demo.local`, `apps/web/.env.local` are gitignored; only `.env.demo.example` is committed.
 - Warnings are errors; conventional commits (lowercase subject, ≤72 chars); never `--no-verify`.
 - ESM everywhere (`"type": "module"`); repo TS strict mode; `interface` over `type` where the repo does so (repo-wide lint rule).
@@ -132,7 +134,9 @@ data
 FROM node:22-slim AS deps
 WORKDIR /app
 # Socket Firewall guards every registry fetch inside the build (design §7).
-RUN npm install -g sfw@latest pnpm@10.0.0
+# Pins per P0 retro: sfw 2.0.6 (the guard must not be an unpinned head install)
+# and pnpm 10.34.5 (the packageManager pin; minimumReleaseAge needs >=10.16.0).
+RUN npm install -g sfw@2.0.6 pnpm@10.34.5
 COPY pnpm-lock.yaml pnpm-workspace.yaml package.json ./
 COPY apps/server/package.json apps/server/
 COPY packages/protocol/package.json packages/protocol/
@@ -152,7 +156,7 @@ WORKDIR /app/apps/server
 CMD ["../../node_modules/.bin/tsx", "src/index.ts"]
 ```
 
-⚠️ The `npm install -g sfw` bootstrap is the ONE permitted npm use (there is no pnpm before it exists in the image); everything package-related after it goes through `sfw pnpm`. If P0's retro established a different sfw install channel, use that. Adjust the `COPY .../package.json` list to the actual current workspace members (`ls apps packages infra`) before building. If `@nyx/compact-wasm` exists by now (P2), add its `package.json` COPY too — `@nyx/server` may not depend on it, in which case leave it out; check `apps/server/package.json` dependencies.
+⚠️ The `npm install -g` bootstrap is the ONE permitted npm use (there is no pnpm before it exists in the image); everything package-related after it goes through `sfw pnpm`. P0's retro confirms the channel (`npm i -g sfw`, pinned 2.0.6). Adjust the `COPY .../package.json` list to the actual current workspace members (`ls apps packages infra`) before building. **P2 adds `"@nyx/compact-wasm": "workspace:*"` to `apps/server` dependencies (the browser client's `version()` reads `COMPACT_WASM_META`) — include `COPY packages/compact-wasm/package.json packages/compact-wasm/` in the deps stage; its committed `vendor/` rides in with the runtime stage's `COPY packages ./packages`.**
 
 - [ ] **Step 4: Build the image and smoke it.** From the repo root:
 
@@ -569,7 +573,7 @@ export async function waitForHttpOk(
 ): Promise<void>;
 ```
 
-- [ ] **Step 1: PROBE FIRST (constitution I / design §3).** Bring the plain devnet up (`sfw pnpm devnet:up` in one terminal or `docker compose -f infra/devnet/docker-compose.yml up -d`) and capture real shapes:
+- [ ] **Step 1: PROBE FIRST (constitution I / design §3).** Bring the plain devnet up — preflight first with `sfw pnpm --filter @nyx/infra devnet:preflight` (**the P1-retro-verified invocation**; a root-level `pnpm exec tsx infra/devnet/preflight-cli.ts` fails — `tsx` is an infra-workspace dep), then `docker compose -f infra/devnet/docker-compose.yml up -d` — and capture real shapes:
 
 Run: `curl -sf http://localhost:9944/health && echo OK`
 Run: `docker inspect --format '{{.State.Health.Status}}' nyx-devnet-node`
@@ -602,8 +606,8 @@ Record the exact response JSON in a comment block at the top of `health.ts`. If 
 - Consumes: `readState`/`writeState` (Task 5), `PhaseCtx`, the **P4 retro's verified recipe** for key derivation, NIGHT transfer, and DUST registration (P4's `DeployExecutor` + `BalanceQuery` work already verified wallet/SDK shapes against the devnet — REUSE those exact packages/calls; do not re-derive from memory).
 - Produces: `createFundingPhase(deps): Phase` where `deps` injects `{ derive(seed): Promise<{address: string}>, transferNight(from, to, amount): Promise<{txRef: string}>, registerDust(seed): Promise<void>, queryNight(address): Promise<bigint>, queryDust(address): Promise<bigint> }` — a `FundingOps` seam with a real adapter `createDevnetFundingOps(networkProfile)` and a fake for tests. Satisfied when state has `fundedAt` AND live balances are still positive.
 
-- [ ] **Step 1: VERIFY THE RECIPE (constitution I — the design flags this as the riskiest step).** Read the P4 retro + `apps/server/src/deploy/executor.ts` as merged to learn the verified wallet-sdk derivation/submission surfaces. Then dispatch `/midnight-verify:verify` with the concrete claim set: "(a) deriving the genesis dev account from seed 0x00…01 with <the wallet-sdk package P4 used>, (b) building + submitting an unshielded NIGHT transfer on the local devnet, (c) DUST-registering an account so it can pay fees — exact calls, against the running devnet". Bring the demo devnet up for this. Capture the verified call sequence + package versions in `docs/superpowers/plans/retros/P5_FUNDING_EVIDENCE.md`.
-- [ ] **Step 2: Failing deterministic test** — `createFundingPhase` over a fake `FundingOps`: generates two fresh 32-byte hex seeds when state lacks them (crypto.randomBytes via injected `randomSeed` for determinism), derives addresses, transfers a configured NIGHT amount from the genesis account to BOTH, DUST-registers BOTH, writes `fundedAt` + seeds + addresses to state; `isSatisfied` false when `fundedAt` missing; refuses to run (throws with hint) when `networkId !== "Undeployed"` (genesis-seed safety per Global Constraints).
+- [ ] **Step 1: ASSEMBLE THE RECIPE (constitution I — de-risked: it has ALREADY been executed).** The full keygen→transfer→DUST-register→fee-paying-tx sequence was run against this devnet by SPIKE-2 (`05-fresh-wallet-dust.mjs`; §G tx ids; §"Funding/DUST recipe" step-by-step — reproduced in this plan's Global Constraints). Read that recipe FIRST, then the P3/P4 retros + `apps/server/src/deploy/` as merged (they reuse the same wallet-sdk surfaces and may have refined pins — e.g. the wallet-sdk 1.0.0-vs-1.1.0 report discrepancy, resolved from the installed package). Dispatch `/midnight-verify:verify` only for anything the recipe + retros leave ambiguous. Write `docs/superpowers/plans/retros/P5_FUNDING_EVIDENCE.md` citing SPIKE2_REPORT.md §Funding verbatim (section references + tx ids) plus whatever was re-verified — do not re-derive from scratch what is already executed evidence.
+- [ ] **Step 2: Failing deterministic test** — `createFundingPhase` over a fake `FundingOps`: generates two fresh 32-byte hex seeds when state lacks them (crypto.randomBytes via injected `randomSeed` for determinism), derives addresses, transfers a configured NIGHT amount from the genesis account to BOTH, DUST-registers BOTH, writes `fundedAt` + seeds + addresses to state; `isSatisfied` false when `fundedAt` missing; refuses to run (throws with hint) when the resolved network profile is not `local-devnet` (genesis-seed safety per Global Constraints — note the check is on the PROFILE id; the SDK-side `setNetworkId('undeployed')` is lowercase and `"Undeployed"` is only Lace's display string, never compare against it here).
 - [ ] **Step 3: Run — FAIL. Step 4: Implement `fund.ts`** (phase + `FundingOps` seam + real adapter delegating to the verified calls from Step 1). **Step 5: deterministic test PASS.**
 - [ ] **Step 6: `DEVNET_URL`-gated integration test** `demo-fund.devnet.test.ts`: skipped unless `process.env.DEVNET_URL` set (same pattern as the server's `DATABASE_URL`-gated pg tests — read one, e.g. `apps/server/tests/*pg*.test.ts`, and mirror the skip idiom). With the devnet live: run the real phase against a temp state dir; assert `queryNight(userAddress) > 0n` and `queryDust(userAddress) > 0n` afterwards. Run it locally with the devnet up: `DEVNET_URL=http://localhost:9944 sfw pnpm --filter @nyx/infra test -- demo-fund.devnet`. Expected: PASS — this is the plan's proof the funding recipe works.
 - [ ] **Step 7: Gates. Commit** — `git commit -m "feat(demo): verified keygen and night/dust funding phase"`.
@@ -639,11 +643,11 @@ Record the exact response JSON in a comment block at the top of `health.ts`. If 
 
 **Interfaces:**
 
-- Consumes: `apps/server` migrate CLI (`tsx src/db/migrate-cli.ts up`, reads `DATABASE_URL`); the SRS parameter set established by P2 (see its retro — the compactc-wasm PoC caches from `https://srs.midnight.network` into `~/.cache/midnight/zk-params`; P2 fixed the actual file list the browser prover needs, and the server serves the cache from its `SRS_CACHE_DIR` config — the srs phase MUST download into the same directory `.env.demo` sets for `SRS_CACHE_DIR`); `.env.demo.local` for MCP launch commands (Tome + mnm ONLY — compact-mcp is retired).
+- Consumes: the `apps/server` migrate script (`migrate:up` exists at `apps/server/package.json:9` = `tsx src/db/migrate-cli.ts up`, reads `DATABASE_URL` — invoke via `sfw pnpm --filter @nyx/server migrate:up`, the same filter-invocation lesson as the P1 preflight fix); the SRS parameter set established by P2 (see its retro — the SRS host is `srs.midnight.network`, cached under `~/.cache/midnight/zk-params` by the toolchain; spike-measured circuit sizes pin the k range: counter `increment` k=5, NyxtVault `deposit` k=13 (`bls_midnight_2p13`, ~1.5 MB), `burn` k=14 — P2's retro fixes the exact file list the browser prover needs, and the server serves the cache from its `SRS_CACHE_DIR` config — the srs phase MUST download into the same directory `.env.demo` sets for `SRS_CACHE_DIR`); `.env.demo.local` for MCP launch commands (Tome + mnm ONLY — compact-mcp is retired).
 - Produces:
 
 ```typescript
-export function createMigratePhase(): Phase; // exec: sfw pnpm --filter @nyx/server exec tsx src/db/migrate-cli.ts up  (env: DATABASE_URL=postgres://nyx:nyx-local-demo@localhost:5433/nyx)
+export function createMigratePhase(): Phase; // exec: sfw pnpm --filter @nyx/server migrate:up  (env: DATABASE_URL=postgres://nyx:nyx-local-demo@localhost:5433/nyx)
 export function createSrsPhase(deps: {
   paramFiles: readonly string[];
   baseUrl: string;

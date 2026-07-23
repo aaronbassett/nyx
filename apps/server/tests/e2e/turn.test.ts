@@ -36,6 +36,7 @@ import type {
   SubAgentWork,
   SubAgents,
 } from "../../src/agents/supervisor.js";
+import { createCompileResultsInbox } from "../../src/compile/index.js";
 import type { ArtifactManifest, CompileClient } from "../../src/compile/index.js";
 import type { Balance, LedgerEntryRecord, LedgerStore, Turn } from "../../src/ledger/ledger.js";
 import type { ChatStore, ChatWrite } from "../../src/projects/chat.js";
@@ -80,7 +81,6 @@ const stubModelRouter: ModelRouter = {
 };
 
 const stubMcp: TurnCoordinatorMcp = {
-  toolchain: { call: () => Promise.reject(new Error("toolchain.call unexpected")) },
   tome: { call: () => Promise.reject(new Error("tome.call unexpected")) },
   mnm: { call: () => Promise.reject(new Error("mnm.call unexpected")) },
 };
@@ -202,7 +202,7 @@ function makeSubAgents(): SubAgents {
 }
 
 /** A fake {@link CompileClient} that records each check into the trace and always succeeds. */
-function makeCompileClient(trace: TraceEntry[]): CompileClient {
+function makeFakeCompileClient(trace: TraceEntry[]): CompileClient {
   return {
     check: () => {
       trace.push({ kind: "check", ok: true });
@@ -259,9 +259,11 @@ function makeHarness(options: { intent: IntentResult; verdicts: Verdict[] }): Ha
   const verdicts = [...options.verdicts];
   const ledger = makeLedger();
 
+  const compileClient = makeFakeCompileClient(trace);
   const deps: TurnCoordinatorDeps = {
     modelRouter: stubModelRouter,
-    compileClient: makeCompileClient(trace),
+    makeCompileClient: () => ({ forTurn: () => compileClient }),
+    compileInbox: createCompileResultsInbox({ delay: neverDelay }),
     ledger: ledger.ledger,
     chat: makeChat(),
     projectStore: {

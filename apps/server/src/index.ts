@@ -11,7 +11,9 @@
 import { randomUUID } from "node:crypto";
 import { buildServer } from "./app.js";
 import { createModelRouter } from "./agents/routing.js";
-import { HttpCompileClient } from "./compile/index.js";
+import { createLocalArtifactStore, storeFetchAdapter } from "./artifacts/index.js";
+import { createBrowserCompileClient, createCompileResultsInbox } from "./compile/index.js";
+import type { BrowserCompileSession } from "./compile/index.js";
 import { ConfigValidationError, loadConfig } from "./config/index.js";
 import type { Config } from "./config/index.js";
 import { providerApiKeys } from "./config/schema.js";
@@ -52,6 +54,18 @@ import { createTurnCoordinator } from "./turn/coordinator.js";
  * memory). `assertCanDeploy` still fails closed on an EMPTY wallet via the per-deploy floor.
  */
 const DEPLOY_WALLET_LOW_THRESHOLD_TDUST = 0n;
+
+/** Reclaim an abandoned staged (uncommitted) artifact prefix once it is older than this (M1). */
+const STAGING_MAX_AGE_MS = 60 * 60_000; // 1 h
+/** Cadence of the unref'd boot sweep that reclaims abandoned staged artifact prefixes (M1). */
+const STAGING_SWEEP_INTERVAL_MS = 15 * 60_000; // 15 min
+
+/** Unref'd delay so a bounded compile-inbox wait never pins the process (mirrors the coordinator). */
+function unrefDelay(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms).unref();
+  });
+}
 
 /** Structured, bigint-safe stderr sink for the deploy-wallet balance alerts (FR-059). */
 function logWalletAlert(alert: WalletAlert): void {
@@ -124,10 +138,33 @@ async function main(): Promise<void> {
     routing: config.modelRouting,
     apiKeys: providerApiKeys(config.secrets),
   });
-  const compileClient = new HttpCompileClient({
-    token: config.secrets.compileServiceToken,
-    baseUrl: config.compileService.url,
+  // P2 browser-compile wiring: the per-cycle CHECK + the green FULL compile now run in the
+  // USER'S browser (the retired server-side Compile Service + R2-write path is gone). The
+  // browser uploads its green artifacts to the server's OWN durable {@link ArtifactStore}
+  // (content-hash-addressed, size-capped from config); `storeFetchAdapter` gives the
+  // orchestrator an IN-PROCESS `fetch` over that same store so verify-before-announce reads the
+  // committed prefix without HTTP-ing the server's own artifact route.
+  const artifactStore = createLocalArtifactStore({
+    rootDir: config.artifacts.rootDir,
+    maxFileBytes: config.artifacts.maxFileBytes,
+    maxBundleBytes: config.artifacts.maxBundleBytes,
+    // M1 — per-project staged (uncommitted) exhaustion caps for the shared disk volume.
+    maxStagedBytesPerProject: config.artifacts.maxStagedBytesPerProject,
+    maxStagedPrefixesPerProject: config.artifacts.maxStagedPrefixesPerProject,
   });
+  // ONE shared rendezvous inbox backs both the per-turn client (which awaits `compile:results`)
+  // and the WS handler (which delivers to it, ownership-gated). `config.publicOrigin` builds the
+  // artifact URLs the orchestrator resolves through `fetchArtifact` before announcing
+  // `artifacts:ready`; the bounded CHECK/FULL waits are config tunables (D42 no-hang backstops).
+  const compileInbox = createCompileResultsInbox({ delay: unrefDelay });
+  const makeCompileClient = (session: BrowserCompileSession) =>
+    createBrowserCompileClient({
+      inbox: compileInbox,
+      session,
+      publicOrigin: config.publicOrigin,
+      checkTimeoutMs: config.tunables.compileCheckTimeoutMs,
+      fullTimeoutMs: config.tunables.compileFullTimeoutMs,
+    });
   const ledgerStore = createLedgerStore(db, { flatReserve: config.tunables.flatReserveNyxt });
   const depositStore = createDepositStore(db, ledgerStore, {
     minimumDeposit: config.tunables.minimumDepositNyxt,
@@ -153,7 +190,8 @@ async function main(): Promise<void> {
   // The supervisor turn loop (D34): its `handlers` drive one turn per `prompt:submit`.
   const coordinator = createTurnCoordinator({
     modelRouter,
-    compileClient,
+    makeCompileClient,
+    compileInbox,
     ledger: ledgerStore,
     chat,
     // Turn-end file persistence (US7): a settled turn commits its files as one agent
@@ -161,6 +199,10 @@ async function main(): Promise<void> {
     projectStore,
     mcp,
     flatReserve: config.tunables.flatReserveNyxt,
+    // Verify-before-announce reads the browser-uploaded artifacts from the server's OWN store
+    // over an in-process `fetch` — with browser compile the urlPrefix points at the server's own
+    // artifact route, so a real `fetch` would HTTP itself; the store adapter reads it directly.
+    fetchArtifact: storeFetchAdapter(artifactStore),
   });
 
   // The US8 deploy loop. All seam construction, no network: the executor, the wallet balance
@@ -227,6 +269,11 @@ async function main(): Promise<void> {
     mcp,
     wsHandler,
     projectStore,
+    // The durable, size-capped artifact store the browser publishes green compiles to (P2) —
+    // the SAME instance the coordinator reads through `storeFetchAdapter`, so an upload the WS
+    // route commits is exactly what verify-before-announce sees. buildServer's in-memory default
+    // is only for tests.
+    artifactStore,
     cloneService,
     ledgerStore,
     depositStore,
@@ -266,6 +313,22 @@ async function main(): Promise<void> {
   reconcileScheduler.start();
   app.addHook("onClose", () => {
     reconcileScheduler.stop();
+  });
+
+  // M1 — reclaim abandoned staged (uncommitted) artifact prefixes on an UNREF'd interval so a
+  // client that PUTs green artifacts then never commits cannot pin the shared disk forever. The
+  // timer never keeps the process alive and is cleared on close; a sweep fault is logged, not fatal.
+  const stagingSweepTimer = setInterval(() => {
+    void artifactStore.sweepStaged(STAGING_MAX_AGE_MS).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      process.stderr.write(
+        `${JSON.stringify({ severity: "warn", source: "artifact-sweep", event: "sweep-error", message })}\n`,
+      );
+    });
+  }, STAGING_SWEEP_INTERVAL_MS);
+  stagingSweepTimer.unref();
+  app.addHook("onClose", () => {
+    clearInterval(stagingSweepTimer);
   });
 
   await app.listen({ port: config.port, host: "0.0.0.0" });

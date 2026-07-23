@@ -168,6 +168,46 @@ export type VerifyRunPayload = z.infer<typeof VerifyRunPayloadSchema>;
 export const VerifyRunEventSchema = eventSchema("verify:run", VerifyRunPayloadSchema);
 export type VerifyRunEvent = z.infer<typeof VerifyRunEventSchema>;
 
+/** Compile kinds (P2): a fast per-cycle `check` vs the green-only `full` compile (D35). */
+export const CompileKindSchema = z.enum(["check", "full"]);
+export type CompileKind = z.infer<typeof CompileKindSchema>;
+
+/** One structured diagnostic relayed verbatim from the browser toolchain (P2). */
+export const CompileDiagnosticSchema = z.object({
+  severity: z.enum(["error", "warning", "note"]),
+  source: z.enum(["compactp", "compactc"]),
+  message: z.string(),
+  file: z.string().optional(),
+  span: z
+    .object({
+      start: z.object({ line: z.number(), column: z.number() }),
+      end: z.object({ line: z.number(), column: z.number() }).optional(),
+    })
+    .optional(),
+  code: z.string().optional(),
+});
+export type CompileDiagnostic = z.infer<typeof CompileDiagnosticSchema>;
+
+/** One compiled circuit named in a green full result (P2). */
+export const CompileCircuitWireSchema = z.object({
+  name: z.string().min(1),
+  proof: z.boolean(),
+});
+export type CompileCircuitWire = z.infer<typeof CompileCircuitWireSchema>;
+
+/**
+ * `compile:run` — the server delegates this turn's compile to the CLIENT'S wasm
+ * toolchain (design §4: user code builds on the user's machine). The client
+ * replies with `compile:results` carrying the same `turnId` + `kind`.
+ */
+export const CompileRunPayloadSchema = z.object({
+  turnId: TurnIdSchema,
+  kind: CompileKindSchema,
+});
+export type CompileRunPayload = z.infer<typeof CompileRunPayloadSchema>;
+export const CompileRunEventSchema = eventSchema("compile:run", CompileRunPayloadSchema);
+export type CompileRunEvent = z.infer<typeof CompileRunEventSchema>;
+
 /** Deploy pipeline phases surfaced to the client (D62, FR-054). */
 export const DeployStatusPhaseSchema = z.enum([
   "validating",
@@ -241,6 +281,7 @@ export const ServerToClientEventSchema = z.discriminatedUnion("type", [
   SessionTakeoverEventSchema,
   TurnMessageEventSchema,
   VerifyRunEventSchema,
+  CompileRunEventSchema,
   DeployStatusEventSchema,
   LedgerUpdateEventSchema,
 ]);
@@ -276,10 +317,52 @@ export const TestResultsPayloadSchema = z.object({
   turnId: TurnIdSchema,
   pass: z.boolean(),
   failures: z.array(TestFailureSchema),
+  /**
+   * Full names of the PASSING tests (P1 retro F1, additive/optional). Green
+   * runs carry no `failures`, so per-circuit coverage telemetry (FR-032) is
+   * information-free without the passing names. Existing emitters/parsers that
+   * omit this field stay valid; P6 wires the emit + fold + cap sites.
+   */
+  passedNames: z.array(z.string()).optional(),
 });
 export type TestResultsPayload = z.infer<typeof TestResultsPayloadSchema>;
 export const TestResultsEventSchema = eventSchema("test:results", TestResultsPayloadSchema);
 export type TestResultsEvent = z.infer<typeof TestResultsEventSchema>;
+
+/**
+ * `compile:results` — the client's compile verdict. A failure is DATA
+ * (`ok:false` + diagnostics), never an error frame. A green `full` result MUST
+ * carry the `sourceHash` the client uploaded artifacts under.
+ */
+export const CompileResultsPayloadSchema = z
+  .object({
+    turnId: TurnIdSchema,
+    kind: CompileKindSchema,
+    ok: z.boolean(),
+    diagnostics: z.array(CompileDiagnosticSchema),
+    compilerVersion: z.string().min(1),
+    durationMs: z.number().nonnegative(),
+    sourceHash: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/u, "must be a lowercase sha-256 hex source hash")
+      .optional(),
+    circuits: z.array(CompileCircuitWireSchema).optional(),
+  })
+  .superRefine((payload, ctx) => {
+    if (payload.kind === "full" && payload.ok && payload.sourceHash === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["sourceHash"],
+        message: "a green full compile must carry the uploaded sourceHash",
+      });
+    }
+  });
+export type CompileResultsPayload = z.infer<typeof CompileResultsPayloadSchema>;
+export const CompileResultsEventSchema = eventSchema(
+  "compile:results",
+  CompileResultsPayloadSchema,
+);
+export type CompileResultsEvent = z.infer<typeof CompileResultsEventSchema>;
 
 /**
  * `console:log` / `console:error` — runtime feedback streamed within the
@@ -330,6 +413,7 @@ export type FileChangedEvent = z.infer<typeof FileChangedEventSchema>;
 export const ClientToServerEventSchema = z.discriminatedUnion("type", [
   PromptSubmitEventSchema,
   TestResultsEventSchema,
+  CompileResultsEventSchema,
   ConsoleLogEventSchema,
   ConsoleErrorEventSchema,
   DevStatusEventSchema,

@@ -2,7 +2,8 @@
  * `artifacts:ready` re-pointer for the Nyx WebContainer preview host (US3, T087).
  *
  * When the server announces freshly-compiled ZK artifacts (`artifacts:ready`,
- * FR-014, D35), the generated app must read its ZK config from the NEW R2 prefix.
+ * FR-014, D35), the generated app must read its ZK config from the NEW artifact
+ * prefix (served same-origin by the Nyx artifact store since P2 browser compile).
  * The app's `FetchZkConfigProvider` resolves its base URL from an env var at
  * startup, so re-pointing == rewriting that key in the container's `.env.local`
  * (the D10 config chokepoint) then asking the coordinator to re-point/reload.
