@@ -68,6 +68,9 @@ importers:
       '@modelcontextprotocol/sdk':
         specifier: ^1.29.0
         version: 1.29.0(zod@3.25.76)
+      '@nyx/compact-wasm':
+        specifier: workspace:*
+        version: link:../../packages/compact-wasm
       '@nyx/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol

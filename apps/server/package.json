@@ -19,6 +19,7 @@
     "@midnight-ntwrk/ledger-v8": "8.1.0",
     "@midnight-ntwrk/wallet-sdk-address-format": "3.1.2",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@nyx/compact-wasm": "workspace:*",
     "@nyx/protocol": "workspace:*",
     "@nyx/scaffold": "workspace:*",
     "@openrouter/ai-sdk-provider": "^3.0.0",

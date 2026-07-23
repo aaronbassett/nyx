@@ -26,6 +26,10 @@ export type {
   CompileProgressUpdate,
   RunCompileJobOptions,
 } from "./client.js";
+export { createCompileResultsInbox } from "./inbox.js";
+export type { CompileResultsInbox } from "./inbox.js";
+export { createBrowserCompileClient } from "./browser-client.js";
+export type { BrowserCompileClientDeps, BrowserCompileSession } from "./browser-client.js";
 export {
   ArtifactOrchestrator,
   hasCompactChange,
