@@ -392,6 +392,84 @@ describe.each(cases)("ArtifactStore ($name)", (testCase) => {
   });
 });
 
+describe("createLocalArtifactStore — sweep vs. concurrent commit (reclaim data-loss race)", () => {
+  it("a commit landing in the check→rm window leaves the committed prefix INTACT; an old uncommitted prefix is still swept", async () => {
+    // The historical `sweepStaged` did `isCommitted(dir)` → `readPrefixStaged` → `rm(dir)` with no
+    // lock and no re-check, so a `commit` (whose last PUT predates the cutoff — `stagedAt` is
+    // PUT-time, not commit-time) that landed AFTER the check but BEFORE the `rm` had its entire
+    // prefix — including the freshly-written manifest.json — deleted. This drives that exact
+    // interleave deterministically (no real sleeps): the sweep pauses at an injected barrier just
+    // before reclaim, the test lands the commit, then releases the sweep. Post-fix the sweep takes
+    // the same per-prefix lock as commit and re-checks `isCommitted` under it, so the now-committed
+    // prefix survives.
+    const racedHash = "a".repeat(64); // committed DURING the sweep window — must survive
+    const abandonedHash = "b".repeat(64); // never committed — must still be reclaimed
+    const bytes = enc.encode("payload");
+    const ct = "application/octet-stream";
+
+    let t = 1_000;
+
+    // A one-shot barrier the raced prefix's reclaim parks on; the abandoned prefix passes through.
+    let reachedResolve!: () => void;
+    const reached = new Promise<void>((r) => {
+      reachedResolve = r;
+    });
+    let release!: () => void;
+    const releaseGate = new Promise<void>((r) => {
+      release = r;
+    });
+    let gated = false;
+
+    const store = createLocalArtifactStore({
+      rootDir: await freshRoot(),
+      maxFileBytes: 1_000_000,
+      maxBundleBytes: 10_000_000,
+      clock: () => t,
+      onSweepBeforeReclaim: async (dir) => {
+        if (!dir.endsWith(racedHash) || gated) {
+          return; // the abandoned prefix (and any re-entry) is not gated
+        }
+        gated = true;
+        reachedResolve();
+        await releaseGate;
+      },
+    });
+
+    // Both prefixes staged at t=1000; last PUT predates the cutoff below (this is the bug's premise
+    // — an about-to-be-committed prefix looks "old" because staging time, not commit time, is aged).
+    await store.putFile(PROJECT, racedHash, "f.bin", bytes, ct);
+    await store.putFile(PROJECT, abandonedHash, "f.bin", bytes, ct);
+
+    // Advance the clock so both are past the cutoff (5000 - 2000 = 3000; both staged at 1000).
+    t = 5_000;
+
+    // Start the sweep; it parks at the barrier just before reclaiming the raced prefix.
+    const sweepP = store.sweepStaged(2_000);
+    await reached;
+
+    // The commit lands squarely inside the check→rm window.
+    await store.commit(
+      PROJECT,
+      racedHash,
+      manifestFor([{ path: "f.bin", bytes, contentType: ct }]),
+    );
+
+    // Release the parked sweep and let it finish.
+    release();
+    const removed = await sweepP;
+
+    // The committed prefix survived intact — manifest present and file readable.
+    expect(await store.getManifest(PROJECT, racedHash)).not.toBeNull();
+    const file = await store.getFile(PROJECT, racedHash, "f.bin");
+    expect(file ? new Uint8Array(file.bytes) : null).toEqual(bytes);
+
+    // The genuinely-abandoned old prefix was still reclaimed.
+    expect(await store.getFile(PROJECT, abandonedHash, "f.bin")).toBeNull();
+    expect(await store.getManifest(PROJECT, abandonedHash)).toBeNull();
+    expect(removed).toBe(1);
+  });
+});
+
 describe("createLocalArtifactStore — per-prefix write serialization (L2 TOCTOU)", () => {
   it("two concurrent PUTs to ONE prefix whose sum exceeds the bundle cap → exactly one rejects", async () => {
     // The disk `putFile` reads the prefix's staged total, checks the bundle cap, THEN writes.

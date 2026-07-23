@@ -359,8 +359,15 @@ export function createLocalArtifactStore(deps: {
   maxStagedPrefixesPerProject?: number;
   /** Injectable clock for the M1 staging sweep + sidecar timestamps; defaults to `Date.now`. */
   clock?: () => number;
+  /**
+   * TEST-ONLY concurrency seam: awaited inside {@link ArtifactStore.sweepStaged} for each
+   * reclaim candidate — AFTER the age check, BEFORE the per-prefix reclaim lock — so a test can
+   * deterministically land a `commit` inside the historical check→`rm` window and prove the
+   * committed prefix survives. Undefined (a no-op) in production.
+   */
+  onSweepBeforeReclaim?: (dir: string) => void | Promise<void>;
 }): ArtifactStore {
-  const { rootDir, maxFileBytes, maxBundleBytes } = deps;
+  const { rootDir, maxFileBytes, maxBundleBytes, onSweepBeforeReclaim } = deps;
   const maxStagedBytesPerProject =
     deps.maxStagedBytesPerProject ?? defaultStagedBytes(maxBundleBytes);
   const maxStagedPrefixesPerProject =
@@ -559,26 +566,33 @@ export function createLocalArtifactStore(deps: {
       const dir = prefixDir(projectId, sourceHash);
       const manifestPath = join(dir, "manifest.json");
 
-      // Content-addressed prefixes are immutable: a re-commit is a no-op (idempotent).
-      if (await pathExists(manifestPath)) {
-        return;
-      }
-
-      const metaDir = join(dir, "meta");
-      for (const entry of manifest.files) {
-        assertSafeFilePath(entry.path);
-        const meta = await readMeta(safeJoin(metaDir, `${entry.path}.json`));
-        if (meta === null) {
-          throw new ArtifactManifestIncompleteError(entry.path);
+      // Take the SAME per-prefix lock the sweep's reclaim uses so the manifest-last write is
+      // mutually exclusive with a concurrent `sweepStaged` — the sweep's locked `isCommitted`
+      // re-check then always observes this commit if it landed first, and can never `rm` a prefix
+      // this commit is (or has just finished) writing. Without this, the lock on the sweep side
+      // alone would only SHRINK the check→delete race window, not close it.
+      return withPrefixLock(dir, async () => {
+        // Content-addressed prefixes are immutable: a re-commit is a no-op (idempotent).
+        if (await pathExists(manifestPath)) {
+          return;
         }
-        if (meta.sha256 !== entry.sha256) {
-          throw new ArtifactHashMismatchError(entry.path);
-        }
-      }
 
-      await mkdir(dir, { recursive: true });
-      // Manifest written LAST — its presence is the completeness marker.
-      await writeFile(manifestPath, JSON.stringify(manifest));
+        const metaDir = join(dir, "meta");
+        for (const entry of manifest.files) {
+          assertSafeFilePath(entry.path);
+          const meta = await readMeta(safeJoin(metaDir, `${entry.path}.json`));
+          if (meta === null) {
+            throw new ArtifactManifestIncompleteError(entry.path);
+          }
+          if (meta.sha256 !== entry.sha256) {
+            throw new ArtifactHashMismatchError(entry.path);
+          }
+        }
+
+        await mkdir(dir, { recursive: true });
+        // Manifest written LAST — its presence is the completeness marker.
+        await writeFile(manifestPath, JSON.stringify(manifest));
+      });
     },
 
     async getManifest(projectId, sourceHash) {
@@ -655,8 +669,23 @@ export function createLocalArtifactStore(deps: {
           }
           const { latestStagedAt } = await readPrefixStaged(join(dir, "meta"));
           if (latestStagedAt <= cutoff) {
-            await rm(dir, { recursive: true, force: true });
-            removed += 1;
+            await onSweepBeforeReclaim?.(dir);
+            // Reclaim under the SAME per-prefix lock `commit` takes, and re-check `isCommitted`
+            // INSIDE it: a commit may have landed between the age check above and now. `stagedAt`
+            // is PUT-time (not commit-time), so an about-to-be-committed prefix can look "old" —
+            // deleting it here would drop the freshly-written manifest.json (and its files). The
+            // locked re-check makes a now-committed prefix durable; only a still-uncommitted one is
+            // reclaimed (the delete + re-check are atomic against commit's manifest write).
+            const reclaimed = await withPrefixLock(dir, async () => {
+              if (await isCommitted(dir)) {
+                return false; // a commit won the race — the prefix is durable, never swept
+              }
+              await rm(dir, { recursive: true, force: true });
+              return true;
+            });
+            if (reclaimed) {
+              removed += 1;
+            }
           }
         }
       }
