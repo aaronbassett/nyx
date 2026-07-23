@@ -7,7 +7,7 @@ Prompt-to-DApp platform for Midnight Network. Spec: `specs/001-nyx-platform/spec
 TypeScript/Node ≥22 · Vercel AI SDK (supervisor swarm, per-agent model routing config D19) · React 19 + Vite + shadcn + Tailwind v4 · @webcontainer/api · Monaco + Monarch Compact grammar · Postgres · Cloudflare R2 (R3 header config is load-bearing) · Fly.io (scale-to-zero) · Midnight SDK `@midnight-ntwrk/*` (public npm; versions via `npm view`, NEVER memory) · Compact (via owner's toolchain MCP; check mode per iteration, full on green, D35) · pnpm monorepo (`apps/server`, `apps/web`, `packages/{protocol,scaffold,nyxt-vault}`, `infra/`)
 
 ## Commands
-`sfw pnpm install` (always the sfw wrapper) · `pnpm lint` / `pnpm typecheck` / `pnpm test` (deterministic only) · `pnpm dev` · `compact check` (compiler version)
+`sfw pnpm install` (always the sfw wrapper) · `pnpm lint` / `pnpm typecheck` / `pnpm test` (deterministic only) · `pnpm dev` · `compact check` (compiler version) · pre-push runs full gates + sfw check (see CONTRIBUTING.md)
 
 ## Iron rules
 1. Never hand-write Compact/SDK shapes from memory — Tome/MNE/mnm retrieval + compiler MCP + midnight-verify (constitution I)

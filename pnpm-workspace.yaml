@@ -3,5 +3,17 @@ packages:
   - "packages/*"
   - "infra"
 
+# Supply-chain hardening (P0): a newly-published dependency version must be at
+# least this old before pnpm will install it — freshly-published (potentially
+# poisoned) releases are quarantined until malware is typically caught & pulled.
+# Applies to ALL dependencies, including transitive ones. Requires pnpm >=10.16.0
+# (packageManager pins 10.34.5). Units are MINUTES per pnpm docs (verified
+# 2026-07-23, https://pnpm.io/settings). 10080 minutes = 7 days.
+minimumReleaseAge: 10080
+
+# Dependency lifecycle scripts (preinstall/install/postinstall) are blocked by
+# default in pnpm 10. This allowlist is the ONLY set of packages permitted to
+# run build scripts. Every entry needs a justification comment; additions
+# require a code-reviewed PR.
 onlyBuiltDependencies:
-  - esbuild
+  - esbuild # native binary bootstrap; vitest/vite are unusable without it

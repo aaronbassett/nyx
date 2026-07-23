@@ -30,11 +30,16 @@ export default tseslint.config(
     },
   },
   {
-    // Root config files (this file, commitlint.config.mjs) aren't part of any
-    // tsconfig, so the type-aware project service can't resolve them. Lint them
-    // without type information instead of erroring.
-    files: ["**/*.config.mjs"],
+    // Plain-JS files that aren't part of any tsconfig — root config files (this
+    // file, commitlint.config.mjs) and standalone Node scripts (scripts/*.mjs) —
+    // can't be resolved by the type-aware project service. Lint them without type
+    // information, and declare the Node globals they rely on so `no-undef` passes.
+    files: ["**/*.config.mjs", "scripts/**/*.mjs"],
     ...tseslint.configs.disableTypeChecked,
+    languageOptions: {
+      ...tseslint.configs.disableTypeChecked.languageOptions,
+      globals: { console: "readonly", process: "readonly" },
+    },
   },
   prettier,
 );

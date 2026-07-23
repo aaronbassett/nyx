@@ -1,0 +1,6 @@
+set -e
+node scripts/check-sfw.mjs
+sfw pnpm lint
+sfw pnpm format:check
+sfw pnpm typecheck
+sfw pnpm test
