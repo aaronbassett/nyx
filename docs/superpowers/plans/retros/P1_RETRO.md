@@ -1,0 +1,35 @@
+# P1 Retro — Spikes + Foundation Gaps
+
+Plan: `docs/superpowers/plans/2026-07-23-p1-spikes-foundation.md` · Branch: `demo/p1-spikes-foundation` · Base: `cac981a` (post-P0 main)
+
+All eight tasks completed; no deferrals. Both spikes ran concurrently on Fable 5 against the shared devnet while foundation tasks 4–6 landed sequentially on Opus. Commits: `f694e56` (commitFiles) → `21afd69` (green builds) → `231e40e` (coverage) → spike reports → this retro.
+
+## Deviations from the plan
+
+1. **Task 1 preflight command path.** The plan's `sfw pnpm exec tsx infra/devnet/preflight-cli.ts` fails at root (`tsx` is an infra-workspace dep); the working invocation is `sfw pnpm --filter @nyx/infra devnet:preflight`. Devnet came up healthy (node 0.22.5 `c65b8b80…`, indexer 4.2.1 `3aeae79a…`, proof-server 8.1.0 `801bbc03…`).
+2. **Task 4:** none of substance — `SourceFile` was structurally compatible with `FileWrite`, all four verify-loop endings call `persistTurnFiles`, settle-wins proven by a commit-throwing-store test.
+3. **Task 5:** the brief's import-cycle fallback (`GreenBuild` local type) was unnecessary — `DeployArtifacts` imports type-only from `deploy/pipeline.js` with no runtime cycle. pg-gated scenarios follow the existing `DATABASE_URL` skip pattern (no live Postgres in this environment; migration 0005 is auto-discovered by the schema suite).
+4. **Task 6:** `lastResultsByProject` deliberately mirrors the sibling `consoleByProject` map's coordinator-lifetime (never-evicted) pattern rather than inventing a new lifecycle; noted for a future connection-cleanup pass that should evict all three maps together.
+5. **Spike coordination overhead (process, not plan):** two nested-subagent results mis-routed to the orchestrator instead of the spike that spawned them, and spike1 idled twice on background builds (once benign, once on a silently-failed stage-04). The orchestrator relayed results/failures via SendMessage; the spikes then completed. Future briefs should tell spikes to await child results directly.
+
+## Discoveries
+
+**SPIKE-1 (full report: `SPIKE1_REPORT.md`) — YES.** Pin the wasm compiler at `compactc-v0.31.1` (`0da5b0452eb0c1053d42418bf34b12cc29c7d63e`): rebuilt at that pin, its generated JS, ZKIR, and keys are **byte-identical to the native toolchain** — no `checkRuntimeVersion` bypass needed at all. The as-cloned HEAD pin's circuit artifacts are also byte-identical (and deployed/finalized on devnet via sdk-tester, CONFIRMED), but its generated JS targets the 0.18 runtime API and hard-fails on the devnet's 0.16 stack — version-check stripping does not suffice. Lockstep rule: compiler pin + compact-runtime + onchain-runtime + midnight-js + ledger/node/proof-server move as one row. Build recipe (emscripten/clang-19 deltas, stage-03 >10 min) documented in the report.
+
+**SPIKE-2 (full report: `SPIKE2_REPORT.md`) — YES, high confidence.** A NyxtVault `deposit` proven **in-process by the zkir-v2 wasm** was accepted and finalized by the devnet node (block 218), with a proof-server negative control (only the wallet's DUST fee leg hit :6300). Full client-side key lifecycle also proven: wasm keygen → byte-identical verifier keys → deploy → wasm prove → finalized (block 258). The injection point is the supported `Transaction.prove(provingProvider, costModel)` seam — `@midnight-ntwrk/zkir-v2` exports `provingProvider(...)` in exactly that shape. Proof-server fallback proven as a one-line `proofProvider` swap over the same client-supplied key material. Fresh-wallet funding/DUST recipe fully executed and documented (transfer NIGHT → `registerNightUtxosForDustGeneration` with zero dust held → ~12 s accrual → fee-paying tx).
+
+**Cross-cutting devnet facts (verified by execution):** tx-encoding network id is **lowercase `undeployed`** (capitalized → node rejection 1010/Custom 166; Lace only _displays_ "Undeployed" — the existing wallet-gate compare is unaffected, the SDK/tx path must use lowercase); indexer GraphQL WS lives at `/api/v4/graphql/ws`; genesis seeds `0x…01`–`0x…04` each hold 250e12 unshielded NIGHT and are pre-dust-registered; concurrent consumers must partition seeds (spikes used …01/…03); per-wallet submissions must be serialized (UTXO races observed).
+
+**Coordinator internals:** `capTestResults` was already wired (coordinator.ts:571/:879/:889 + supervisor.ts:701) — the Phase 7 "US1 must wire" flag is fully satisfied; only coverage telemetry needed adding.
+
+## Deferred items
+
+None. (NyxtVault `deposit`/`burn` were not exercised on-chain by SPIKE-1 — deploy+witness confirmed; SPIKE-2 exercised `deposit` end-to-end twice, so the gap closed across the pair.)
+
+## Impact on remaining plans
+
+- **P2 (browser compile):** consume SPIKE-1's pin decision — rebuild the wasm at `compactc-v0.31.1`, commit the built `compactc.{js,wasm,data}`, delete any version-check-stripping shim from the plan. Keygen strategy: server/compile-time keygen with toolchain zkir 2.1.0 is the proven path; browser keygen requires rebuilding the patched zkir wasm at a ledger-8 tag + byte-comparing keys first (SPIKE-1 risk 1). 0.31.1 emits no `contract-manifest.json` — compute our own hashes. `--skip-zk` output needs a separate `zkir compile-many` step for keys/`.bzkir`.
+- **P3 (dev wallet/money):** consume SPIKE-2's recipe wholesale — `MidnightWalletProvider.build`-style wallet over `{indexer, indexerWS, node, nodeWS, proofServer}` with `setNetworkId('undeployed')`; proving budget ~23–26 s at k=13 (progress UX, web worker, key prefetch); the wallet fee leg still needs a prover (proof server or `wallet-sdk-prover-client` WasmProver); DUST registration in fresh-wallet onboarding; serialize per-wallet submissions.
+- **P4 (deploy engine):** the executor's version matrix is now proven ground truth (midnight-js-*@4.1.1 + ledger-v8@8.1.0 + compact-runtime@0.16.0 + testkit-js@4.1.1 patterns); lowercase `undeployed` in tx assembly; verifier keys ship inside `ContractDeploy` from the client-supplied zkConfig.
+- **P5 (demo orchestrator):** encode the funding/DUST recipe from SPIKE-2 §Funding; genesis seed partitioning (server vs user wallets on different seeds); the devnet preflight invocation is `pnpm --filter @nyx/infra devnet:preflight`.
+- **Foundation now real:** settled turns write `project_file_versions` (US13 exports and P6's editor read real files); deploys see real green builds (P4's gate un-stubbed); coverage telemetry logs per green compile.
