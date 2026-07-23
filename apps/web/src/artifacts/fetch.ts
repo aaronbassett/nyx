@@ -1,34 +1,45 @@
 /**
  * T070 — web-side artifact-fetch harness (US2 compile pipeline, scenario 3).
  *
- * After a green full compile, the Compile Service publishes proving artifacts to
- * a content-hashed R2 prefix and Nyx emits `artifacts:ready { urlPrefix }`. The
- * browser preview's `FetchZkConfigProvider` then reads those artifacts from R2
- * under a cross-origin-isolated (`COEP: require-corp`) context. This module is
- * the pure, injectable-`fetch` core of that read path: it turns a `urlPrefix`
- * plus the parsed `manifest.json` (contract §5) into a fetch plan, runs it, and
- * returns a structured, deterministic report over the fetch matrix.
+ * After a green full compile the browser toolchain publishes proving artifacts to
+ * the Nyx server's content-addressed artifact store and Nyx emits
+ * `artifacts:ready { urlPrefix }`. As of P2 (browser compile) that `urlPrefix` is
+ * SAME-ORIGIN — the server serves the prefix from its own public, session-less
+ * `GET /artifacts/:projectId/:sourceHash/*` route (retiring the old
+ * Compile-Service + public-R2 read path). The browser preview's
+ * `FetchZkConfigProvider` reads those artifacts under a cross-origin-isolated
+ * (`COEP: require-corp`) context. This module is the pure, injectable-`fetch` core
+ * of that read path: it turns a `urlPrefix` plus the parsed `manifest.json`
+ * (contract §5) into a fetch plan, runs it, and returns a structured,
+ * deterministic report over the fetch matrix.
  *
- * Two facts from R3 shape it:
- *  - a `mode: "cors"` fetch is EXEMPT from COEP, which is why these cross-origin
- *    reads succeed under `require-corp` — every artifact fetch uses `cors`;
- *  - each object is served with `Cache-Control: public, max-age=31536000,
- *    immutable`. EC-10 is the exception: a file over the ~512 MB edge-cache limit
- *    is served from R2 UNCACHED (no `immutable`), which the report flags for
- *    telemetry rather than treating as a failure.
+ * The harness is prefix-GENERIC: it makes no assumption that `urlPrefix` is
+ * absolute or cross-origin, so a same-origin `/artifacts/...` prefix flows through
+ * plan → fetch → report unchanged. Two serving facts still shape it:
+ *  - every artifact fetch uses `mode: "cors"`. Same-origin reads do not need it,
+ *    but a cors-mode fetch is also EXEMPT from COEP, so the same code path keeps
+ *    working unchanged should a prefix ever be served cross-origin under
+ *    `require-corp`;
+ *  - an object MAY be served with an `immutable` cache directive. EC-10 telemetry:
+ *    a file over the ~512 MB edge-cache limit is served UNCACHED (no `immutable`),
+ *    which the report flags for telemetry rather than treating as a failure. This
+ *    stays a telemetry signal, never a gate — the same-origin store need not set
+ *    `immutable` for the read to succeed.
  *
  * `fetch` is INJECTABLE (default `globalThis.fetch`) so tests drive the whole
- * matrix against a mock — no real R2, no real cross-origin-isolated browser fetch
- * (both stay owner-gated). Nothing here reads the DOM or the clock; identical
- * inputs yield an identical plan.
+ * matrix against a mock — no real artifact store, no real cross-origin-isolated
+ * browser fetch (both stay owner-gated). Nothing here reads the DOM or the clock;
+ * identical inputs yield an identical plan.
  */
 import { ARTIFACT_MANIFEST_FILENAME, type ArtifactManifest } from "./manifest";
 
 /**
- * The fixed `RequestInit` for every artifact read. `mode: "cors"` is load-bearing
- * (R3: a cors-mode fetch is exempt from COEP, so the read works under
- * `require-corp`); `credentials: "omit"` keeps the session cookie off the public
- * R2 read domain (constitution III — creds never cross that boundary).
+ * The fixed `RequestInit` for every artifact read. `mode: "cors"` keeps the read
+ * COEP-safe (a cors-mode fetch is exempt from `require-corp`) whether the prefix
+ * is served same-origin by the Nyx artifact store or cross-origin;
+ * `credentials: "omit"` keeps the session cookie off the artifact read path —
+ * that public `GET /artifacts/...` route is session-less by design (constitution
+ * III — creds never cross that boundary).
  */
 const ARTIFACT_FETCH_INIT: RequestInit = {
   mode: "cors",

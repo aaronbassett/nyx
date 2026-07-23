@@ -5,7 +5,7 @@
  * are published straight from the browser to the server's content-addressed
  * artifact prefix: one raw PUT per file, then a SINGLE manifest-last POST to
  * `/commit`. The commit's arrival is the completeness marker for the whole set
- * (verify-before-announce, mirroring the R2 `manifest.json` completeness marker in
+ * (verify-before-announce, mirroring the `manifest.json` completeness marker in
  * `artifacts/manifest.ts`) — so it is sent ONLY after every file PUT has
  * succeeded, and a non-2xx on any request throws before it is reached.
  *
