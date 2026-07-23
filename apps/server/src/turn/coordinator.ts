@@ -57,7 +57,12 @@
 import { encodeTurnSettledEvent } from "@nyx/protocol";
 import type { ServerToClientEvent, TestResultsPayload, TurnId } from "@nyx/protocol";
 import { buildImplementationInstructions, buildScaffoldingInstructions } from "@nyx/scaffold";
-import { capTestResults } from "../agents/coverage.js";
+import {
+  capTestResults,
+  computeCircuitCoverage,
+  testNamesFromResults,
+} from "../agents/coverage.js";
+import type { CircuitCoverageReport } from "../agents/coverage.js";
 import { createIntentClassifier } from "../agents/classifier.js";
 import { createImplementationAgent } from "../agents/implementation.js";
 import { createPlanningAgent } from "../agents/planning.js";
@@ -216,6 +221,14 @@ export interface TurnCoordinatorDeps {
    * line; tests inject a spy to assert the loud log fired.
    */
   readonly logError?: (message: string, detail: Record<string, unknown>) => void;
+  /**
+   * Telemetry sink for the FR-032 per-circuit coverage report, emitted ONCE per green full
+   * compile (D41: telemetry ONLY — no branch of turn control flow reads it, so a hollow or
+   * zeroed report NEVER blocks, fails, or alters the turn). Defaults to a single structured
+   * `info` line via the coordinator's {@link defaultLogCoverage} pattern; tests inject a sink
+   * to capture the report.
+   */
+  readonly logCoverage?: (report: CircuitCoverageReport) => void;
 }
 
 /**
@@ -284,6 +297,25 @@ function defaultLogError(message: string, detail: Record<string, unknown>): void
   const line = JSON.stringify(rendered, (_key, value: unknown) =>
     typeof value === "bigint" ? value.toString() : value,
   );
+  process.stderr.write(`${line}\n`);
+}
+
+/**
+ * The default coverage telemetry sink (FR-032): a single structured `info` JSON line to
+ * `process.stderr` (mirrors {@link defaultLogError}'s convention at info level). Telemetry
+ * only — the {@link CircuitCoverageReport} holds only numbers/strings/booleans, so the line
+ * can never throw and the emit never gates or alters the turn (D41).
+ */
+function defaultLogCoverage(report: CircuitCoverageReport): void {
+  const line = JSON.stringify({
+    level: "info",
+    source: "turn-coordinator",
+    message: "circuit coverage",
+    coveredCount: report.coveredCount,
+    totalCount: report.totalCount,
+    ratio: report.ratio,
+    perCircuit: report.perCircuit,
+  });
   process.stderr.write(`${line}\n`);
 }
 
@@ -470,6 +502,7 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
   const delay: (ms: number) => Promise<void> = deps.delay ?? defaultDelay;
   const buildSupervisor = deps.buildSupervisor ?? createSupervisor;
   const logError = deps.logError ?? defaultLogError;
+  const logCoverage = deps.logCoverage ?? defaultLogCoverage;
 
   /**
    * Run one outbound emit, swallowing a dead-socket throw (Defense 3). `ws.send` on a
@@ -539,6 +572,16 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
     deps.maxTestResultsBytes === undefined
       ? capTestResults(payload)
       : capTestResults(payload, { maxBytes: deps.maxTestResultsBytes });
+
+  // The last CAPPED `test:results` per PROJECT — the sole input, alongside the green full
+  // compile's circuits, to the FR-032 coverage telemetry. Keyed by `ctx.projectId` (the
+  // delivering connection's authorized project) so a foreign tenant's verdict can only ever
+  // stash under its OWN key, never pollute the owner's (cross-tenant scoping, Defense 4). Its
+  // lifecycle MIRRORS the per-project `projects`/`consoleByProject` maps (one entry per
+  // project, coordinator-lifetime): the entry is REPLACED every turn before the green compile
+  // reads it, so a stale cross-turn value can never reach coverage. It is telemetry-only (D41),
+  // so a miss just yields an empty-testNames report — never a gate.
+  const lastResultsByProject = new Map<string, TestResultsPayload>();
 
   // One {@link Supervisor} per PROJECT (BUG-1 fix), keyed by `projectId` — NOT one per
   // connection. The supervisor's per-project single-active-turn lock (D24/FR-009) only
@@ -630,6 +673,19 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
                 error,
               });
             }
+            // FR-032 coverage TELEMETRY (D41): emit once per green full compile, derived from
+            // the green build's circuits + the project's last capped `test:results`. Read-only
+            // evidence — NO branch of turn control flow consults the report, so this can never
+            // gate, fail, or alter the turn (an absent stash just yields an empty-testNames,
+            // all-uncovered report). `testNamesFromResults` folds the payload's FAILING names;
+            // a richer runner would supply the full passed+failed set (see coverage.ts).
+            const lastResults = lastResultsByProject.get(input.projectId);
+            logCoverage(
+              computeCircuitCoverage({
+                circuits: outcome.circuits.map((circuit) => circuit.name),
+                testNames: lastResults === undefined ? [] : testNamesFromResults(lastResults),
+              }),
+            );
           }
           return outcome;
         },
@@ -818,11 +874,19 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
     router
       .on("prompt:submit", (event, ctx) => runPromptTurn(ctx, event.payload))
       .on("test:results", (event, ctx) => {
+        // Cap the wire payload ONCE (server-side FR-033 enforcement) and reuse it for both the
+        // rendezvous delivery and the coverage stash so the two never diverge.
+        const capped = capResults(event.payload);
+        // Stash the capped verdict as this project's latest results — the FR-032 coverage
+        // input the green full compile reads. Keyed by the delivering connection's OWN
+        // `ctx.projectId`, so a foreign verdict stashes under the foreign key, never the
+        // owner's (Defense 4 scoping); the inbox delivery below still gates ownership.
+        lastResultsByProject.set(ctx.projectId, capped);
         // Defense 4 (cross-tenant verdict injection): hand the inbox the delivering
         // connection's project so it resolves ONLY a wait OWNED by that project. A foreign
         // socket's verdict for another tenant's in-flight turnId is IGNORED (no false PASS, no
         // budget griefing); an unknown turnId is a no-op. Mirrors Defense 2's project check.
-        inbox.deliver(capResults(event.payload), ctx.projectId);
+        inbox.deliver(capped, ctx.projectId);
       })
       .on("console:log", (event, ctx) => {
         recordConsole(ctx.projectId, "log", event.payload.message);

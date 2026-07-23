@@ -34,6 +34,7 @@ import {
 } from "@nyx/protocol";
 import { createTurnCoordinator } from "../../src/turn/coordinator.js";
 import type { TurnCoordinatorDeps, TurnCoordinatorMcp } from "../../src/turn/coordinator.js";
+import type { CircuitCoverageReport } from "../../src/agents/coverage.js";
 import type { ModelRole } from "../../src/config/schema.js";
 import type { ModelRouter } from "../../src/agents/routing.js";
 import type {
@@ -1213,5 +1214,81 @@ describe("turnGate: in-flight tracking + idle callbacks (EC-40 / FR-058, US8)", 
     // No turn was opened for EITHER project — the gate stays idle for both.
     expect(coordinator.turnGate.isTurnActive(PROJECT)).toBe(false);
     expect(coordinator.turnGate.isTurnActive("victim-project")).toBe(false);
+  });
+});
+
+describe("coverage telemetry (FR-032 / D41): a report is emitted per green full compile", () => {
+  /**
+   * Drive a REAL green turn end-to-end and capture the coverage report. The client's
+   * `test:results` is delivered THROUGH the coordinator's handler (not the inbox
+   * directly) so the capped payload is stashed per project — the stash the `ready`
+   * full compile reads to derive test names. `fetchArtifact` lets verify-before-announce
+   * resolve so the full compile reaches `ready` (the fake compile client's succeeded job
+   * reports circuit `increment`).
+   */
+  function coverageDeps(sink: CircuitCoverageReport[]): TurnCoordinatorDeps {
+    return baseDeps({
+      fetchArtifact,
+      classifyIntent: () => Promise.resolve({ kind: "dapp" }),
+      subAgents: makeSubAgents(),
+      logCoverage: (report) => {
+        sink.push(report);
+      },
+    });
+  }
+
+  it("marks a circuit referenced by a test name as covered", async () => {
+    const coverageReports: CircuitCoverageReport[] = [];
+    const { ctx } = makeCtx();
+    const coordinator = createTurnCoordinator(coverageDeps(coverageReports));
+    const fake = makeFakeRouter();
+    coordinator.handlers(fake.router);
+
+    // The turn parks at awaitTestResults (verify:run emitted, inbox armed for turn-1).
+    const done = fake.invoke(promptEvent("build a counter"), ctx);
+    await tick();
+
+    // Deliver a GREEN verdict THROUGH the handler (stashes the capped payload per project)
+    // whose failure name references the `increment` circuit the full compile reports. A
+    // green (pass:true) verdict is the sole full-compile trigger even with named failures.
+    await fake.invoke(
+      testResultsEvent("turn-1", true, [{ name: "increment adds one", message: "boom" }]),
+      ctx,
+    );
+    await done;
+
+    // Exactly one report — the full compile fires at most once per green turn (D35).
+    expect(coverageReports).toHaveLength(1);
+    expect(coverageReports[0]?.perCircuit[0]).toMatchObject({
+      circuit: "increment",
+      covered: true,
+    });
+    expect(coverageReports[0]?.coveredCount).toBe(1);
+    expect(coverageReports[0]?.totalCount).toBe(1);
+  });
+
+  it("still emits a report (telemetry only, never a gate) when no test references the circuit", async () => {
+    // D41: coverage NEVER gates the turn. A green turn whose test names reference no circuit
+    // still settles green AND still emits a zeroed coverage report — evidence, not a verdict.
+    const coverageReports: CircuitCoverageReport[] = [];
+    const { ctx } = makeCtx();
+    const coordinator = createTurnCoordinator(coverageDeps(coverageReports));
+    const fake = makeFakeRouter();
+    coordinator.handlers(fake.router);
+
+    const done = fake.invoke(promptEvent("build a counter"), ctx);
+    await tick();
+    await fake.invoke(
+      testResultsEvent("turn-1", true, [{ name: "unrelated behaviour holds", message: "" }]),
+      ctx,
+    );
+    await done;
+
+    expect(coverageReports).toHaveLength(1);
+    expect(coverageReports[0]?.perCircuit[0]).toMatchObject({
+      circuit: "increment",
+      covered: false,
+    });
+    expect(coverageReports[0]?.coveredCount).toBe(0);
   });
 });
