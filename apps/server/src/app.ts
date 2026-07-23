@@ -8,6 +8,8 @@
 import Fastify from "fastify";
 import type { FastifyInstance, FastifyRequest, FastifyServerOptions } from "fastify";
 import fastifyWebsocket from "@fastify/websocket";
+import { createInMemoryArtifactStore, registerArtifactRoutes } from "./artifacts/index.js";
+import type { ArtifactStore } from "./artifacts/index.js";
 import { createRequireSession, PgSessionAuthStore, registerAuthRoutes } from "./auth/index.js";
 import type { AuthDb, SessionAuthStore } from "./auth/index.js";
 import type { Config } from "./config/index.js";
@@ -55,6 +57,13 @@ export interface ServerDeps {
   readonly projectStore?: ProjectStore;
   /** Optional soft-delete cascade (US7); defaults to the no-op seams for now (D49). */
   readonly projectCascade?: DeletionCascade;
+  /**
+   * Optional artifact store (P2 browser-compile). When a project store + live session gate
+   * exist, the artifact upload (PUT/commit) + public serve (GET) routes register against it.
+   * Defaults to an in-memory store so existing fixtures stay green; `index.ts` should inject a
+   * durable {@link createLocalArtifactStore} (with size caps + a rootDir) for real deployments.
+   */
+  readonly artifactStore?: ArtifactStore;
   /**
    * Optional clone/handoff service (US13). When omitted, a default is constructed from the
    * resolved project store + config rate-limit tunables (ONE shared repo cache + limiter for
@@ -226,6 +235,14 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       // routes and the token-gated git-HTTP scope, so they share a rate limiter + repo cache.
       const cloneService = resolveCloneService(deps, projectStore);
       registerProjectRoutes(app, { store: projectStore, requireSession, cascade, cloneService });
+
+      // P2 browser-compile artifact routes: session+ownership-gated PUT/commit uploads and the
+      // public (session-less) content-addressed GET. Co-registered with the project routes
+      // because the write routes resolve ownership through the project store; the GET carries no
+      // session gate (unguessable content-hash prefixes are the access control). An in-memory
+      // store is the default so existing fixtures need no change (see ServerDeps.artifactStore).
+      const artifacts = deps.artifactStore ?? createInMemoryArtifactStore();
+      registerArtifactRoutes(app, { store: projectStore, artifacts, requireSession });
 
       // Token-gated (NOT session-gated) smart-HTTP git surface. Registered as a SEPARATE
       // encapsulated scope (like the prover proxy) because `handleGitHttp` enforces the token +

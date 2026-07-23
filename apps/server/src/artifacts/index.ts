@@ -14,3 +14,6 @@ export {
 } from "./errors.js";
 export { createInMemoryArtifactStore, createLocalArtifactStore } from "./store.js";
 export type { ArtifactStore, StoredArtifactFile } from "./store.js";
+export { storeFetchAdapter } from "./fetch-adapter.js";
+export { registerArtifactRoutes } from "./routes.js";
+export type { ArtifactRouteDeps } from "./routes.js";
