@@ -32,6 +32,13 @@ import {
   registerProjectRoutes,
 } from "./projects/index.js";
 import type { CloneService, DeletionCascade, ProjectStore } from "./projects/index.js";
+import {
+  createDevnetForwarder,
+  createDevnetWsRelay,
+  httpToWs,
+  INDEXER_WS_SUBPATH,
+  registerDevnetRoutes,
+} from "./devnet/index.js";
 import { registerProverRoutes } from "./prover/index.js";
 import type { ProverClient } from "./prover/index.js";
 import { registerWs } from "./ws/index.js";
@@ -295,6 +302,22 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     if (deps.proverClient !== undefined) {
       registerProverRoutes(app, { proverClient: deps.proverClient, requireSession });
     }
+
+    // Same-origin devnet forwarding (P3): the isolated (COOP/COEP) browser reaches the local
+    // devnet node/indexer THROUGH the server. HTTP byte forwarders + session-gated WebSocket
+    // relays on `/devnet/node/*` + `/devnet/indexer/*`. Endpoints come from the server-side
+    // NetworkProfile (`config.network.*`), never client-routed (constitution I/III). The WS
+    // targets add the indexer's GraphQL-subscriptions sub-path (SPIKE-1 risk 7 / SPIKE-2).
+    const { network } = deps.config;
+    registerDevnetRoutes(app, {
+      nodeForwarder: createDevnetForwarder({ baseUrl: network.nodeUrl }),
+      indexerForwarder: createDevnetForwarder({ baseUrl: network.indexerUrl }),
+      nodeWsRelay: createDevnetWsRelay({ targetUrl: httpToWs(network.nodeUrl) }),
+      indexerWsRelay: createDevnetWsRelay({
+        targetUrl: `${httpToWs(network.indexerUrl)}${INDEXER_WS_SUBPATH}`,
+      }),
+      requireSession,
+    });
   }
 
   if (deps.wsHandler === undefined) {
