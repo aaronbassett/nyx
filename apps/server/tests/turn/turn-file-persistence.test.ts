@@ -485,4 +485,102 @@ describe("Turn-end file persistence — commitFiles → ProjectStore.commit", ()
     expect(detail).toContain("file persistence failed");
     expect(detail).toContain("project store unreachable");
   });
+
+  it("I2: a NEVER-RESOLVING commitFiles is BOUNDED — turn:settled still emitted + loud persist failure", async () => {
+    // A HUNG store must never postpone the money terminal (input locked, reserve held). The
+    // commit is raced against the injected `delay` timeout; on timeout the turn logs loudly
+    // and STILL settles. `delay: () => Promise.resolve()` makes the bound fire immediately
+    // (the D42 no-hang pattern — mirrors the coordinator inbox's timeout drive).
+    const commitFiles = vi.fn<
+      (projectId: string, files: readonly FileWrite[]) => Promise<CommitResult>
+    >(() => new Promise<CommitResult>(() => undefined)); // never resolves
+    const { ctx, sent } = makeSupervisorCtx("proj-1");
+    const supervisor = createSupervisor(
+      supervisorDeps("proj-1", commitFiles, { delay: () => Promise.resolve() }),
+    );
+
+    const result = await supervisor.handlePrompt(ctx, { projectId: "proj-1", text: "build" });
+
+    // The commit hung, but the bounded persist let the turn reach green and settle.
+    expect(result.kind).toBe("green");
+    expect(commitFiles).toHaveBeenCalledTimes(1);
+    expect(sent.some((event) => event.type === "turn:settled")).toBe(true);
+
+    // The timeout was surfaced LOUDLY onto the activity feed (a bounded no-hang, never silent).
+    const persistActivity = sent.filter(
+      (event) => event.type === "turn:activity" && event.payload.phase === "persist",
+    );
+    expect(persistActivity).toHaveLength(1);
+    const detail =
+      persistActivity[0]?.type === "turn:activity" ? persistActivity[0].payload.detail : "";
+    expect(detail).toContain("file persistence failed");
+    expect(detail).toContain("did not complete within");
+  });
+
+  it("M4: an INFRA-FAILED ending commits its work-in-progress files exactly once", async () => {
+    const commitFiles = vi.fn<
+      (projectId: string, files: readonly FileWrite[]) => Promise<CommitResult>
+    >(() => Promise.resolve({ version: 1 }));
+    const { ctx, sent } = makeSupervisorCtx("proj-1");
+    const supervisor = createSupervisor(
+      supervisorDeps("proj-1", commitFiles, {
+        // The per-cycle CHECK always throws → withInfraRetry exhausts → InfraFailureError →
+        // the loop's infra ending (the persist call site at the `catch` boundary).
+        checkCompile: () => Promise.reject(new Error("compile service down")),
+      }),
+    );
+
+    const result = await supervisor.handlePrompt(ctx, { projectId: "proj-1", text: "build" });
+
+    expect(result.kind).toBe("infra-failed");
+    // The cycle's sub-agents wrote before the check faulted, so the WIP is persisted ONCE.
+    expect(commitFiles).toHaveBeenCalledTimes(1);
+    const [committedProjectId, committedFiles] = commitFiles.mock.calls[0] ?? [];
+    expect(committedProjectId).toBe("proj-1");
+    expect((committedFiles ?? []).map((file) => file.path).sort()).toEqual([
+      "contract.compact",
+      "src/App.tsx",
+    ]);
+    // The infra ending still settled at actual (D34).
+    expect(sent.some((event) => event.type === "turn:settled")).toBe(true);
+  });
+
+  it("M4: a CHECK-FAIL-EXHAUSTED ending commits its work-in-progress files exactly once", async () => {
+    const commitFiles = vi.fn<
+      (projectId: string, files: readonly FileWrite[]) => Promise<CommitResult>
+    >(() => Promise.resolve({ version: 1 }));
+    const { ctx, sent } = makeSupervisorCtx("proj-1");
+    const supervisor = createSupervisor(
+      supervisorDeps("proj-1", commitFiles, {
+        // Every cycle's CHECK returns a failure (DATA, not a throw) → the 3-cycle budget
+        // exhausts via the compile-check path (the persist call site inside the `!check.ok`
+        // exhausted branch), distinct from the test-fail exhausted path already covered.
+        checkCompile: () =>
+          Promise.resolve<CheckOutcome>({
+            ok: false,
+            diagnostics: [
+              {
+                severity: "error",
+                source: "compactc",
+                message: "type error",
+                code: "E001",
+                raw: false,
+              },
+            ],
+          }),
+      }),
+    );
+
+    const result = await supervisor.handlePrompt(ctx, { projectId: "proj-1", text: "build" });
+
+    expect(result.kind).toBe("exhausted");
+    expect(commitFiles).toHaveBeenCalledTimes(1);
+    const [committedProjectId, committedFiles] = commitFiles.mock.calls[0] ?? [];
+    expect(committedProjectId).toBe("proj-1");
+    expect((committedFiles ?? []).map((file) => file.path).sort()).toEqual([
+      "contract.compact",
+      "src/App.tsx",
+    ]);
+    expect(sent.some((event) => event.type === "turn:settled")).toBe(true);
+  });
 });

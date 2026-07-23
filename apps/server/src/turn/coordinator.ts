@@ -102,6 +102,14 @@ export const TEST_RESULTS_TIMEOUT_FAILURE_NAME = "verify:timeout";
 export const MAX_CONSOLE_CAPTURE = 500;
 
 /**
+ * Default bounded wait for the latest-green-build record (I2 no-hang). A record that has not
+ * completed within this window is treated exactly like a record failure — logged loudly,
+ * then the turn proceeds — so a hung {@link ProjectStore.recordGreenBuild} store can never
+ * postpone the supervisor's money terminal (which awaits this seam via the full compile).
+ */
+export const DEFAULT_GREEN_BUILD_RECORD_TIMEOUT_MS = 10_000;
+
+/**
  * Sentinel turn id for the catch-all terminal unlock (BUG-2 backstop). An unexpected
  * `handlePrompt` throw carries no `TurnResult`, so the real turn id is unknown; the client
  * unlocks input on ANY `turn:settled`, so a non-empty placeholder (`TurnIdSchema` requires
@@ -206,6 +214,13 @@ export interface TurnCoordinatorDeps {
   readonly pollIntervalMs?: number;
   /** Bounded max wait for the full compile job (FR-016) — forwarded to the orchestrator. */
   readonly maxWaitMs?: number;
+  /**
+   * Bounded wait for the latest-green-build record before the full compile returns (I2
+   * no-hang); default {@link DEFAULT_GREEN_BUILD_RECORD_TIMEOUT_MS}. A timeout is treated
+   * exactly like a record failure — logged loudly, turn continues — so a hung store never
+   * postpones the money terminal. Uses the injected {@link TurnCoordinatorDeps.delay} seam.
+   */
+  readonly recordGreenBuildTimeoutMs?: number;
   /** `fetch` for reading R2 artifacts (verify-before-announce); forwarded to the orchestrator. */
   readonly fetchArtifact?: typeof fetch;
   /** Override the intent classifier (tests inject a pure verdict; default = routed model). */
@@ -501,8 +516,32 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
   const now: () => number = deps.now ?? Date.now;
   const delay: (ms: number) => Promise<void> = deps.delay ?? defaultDelay;
   const buildSupervisor = deps.buildSupervisor ?? createSupervisor;
-  const logError = deps.logError ?? defaultLogError;
+  const rawLogError = deps.logError ?? defaultLogError;
   const logCoverage = deps.logCoverage ?? defaultLogCoverage;
+  const recordGreenBuildTimeoutMs =
+    deps.recordGreenBuildTimeoutMs ?? DEFAULT_GREEN_BUILD_RECORD_TIMEOUT_MS;
+
+  /**
+   * A THROW-PROOF wrapper over the (possibly injected) error sink (I1). A logging sink must
+   * NEVER be able to block the money terminal, and — inside the `runFullCompile` post-`ready`
+   * guard — must never re-throw and trigger the supervisor's `withInfraRetry` to re-run the
+   * full compile (a duplicate `artifacts:ready`, D35 breach). A throwing injected sink falls
+   * back to the throw-proof {@link defaultLogError}; if even that throws, logging is abandoned
+   * — the error is never propagated. Every other emit/idle-callback logger routes through here.
+   */
+  const logError = (message: string, detail: Record<string, unknown>): void => {
+    try {
+      rawLogError(message, detail);
+    } catch {
+      if (rawLogError !== defaultLogError) {
+        try {
+          defaultLogError(message, detail);
+        } catch {
+          // Give up on logging — never propagate; the money terminal must not be blocked.
+        }
+      }
+    }
+  };
 
   /**
    * Run one outbound emit, swallowing a dead-socket throw (Defense 3). `ws.send` on a
@@ -609,6 +648,41 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
     });
 
   /**
+   * Persist the latest green build within a BOUNDED wait (I2 no-hang). Races
+   * {@link ProjectStore.recordGreenBuild} against the injected {@link delay} timeout so a hung
+   * store can never postpone the supervisor's money terminal (the full compile awaits this).
+   * NEVER throws: a rejection OR a timeout is logged loudly and swallowed (the artifacts are
+   * already announced; a deploy simply won't see this build), and the caller proceeds to the
+   * coverage telemetry. The record promise carries its own rejection handler, so a rejection
+   * that lands AFTER the timeout wins is never an unhandled rejection.
+   */
+  const recordGreenBuildWithinBound = async (
+    projectId: string,
+    build: { urlPrefix: string; compilerVersion: string },
+  ): Promise<void> => {
+    const TIMEOUT = Symbol("record-green-timeout");
+    const recorded: Promise<string | undefined> = deps.projectStore
+      .recordGreenBuild(projectId, build)
+      .then(
+        () => undefined,
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      );
+    const timedOut: Promise<typeof TIMEOUT> = delay(recordGreenBuildTimeoutMs).then(() => TIMEOUT);
+    const outcome = await Promise.race([recorded, timedOut]);
+    if (outcome === undefined) {
+      return; // recorded cleanly
+    }
+    const reason =
+      outcome === TIMEOUT
+        ? `did not complete within ${String(recordGreenBuildTimeoutMs)}ms`
+        : outcome;
+    logError("green-build record failed; turn continues (deploy won't see this build)", {
+      projectId,
+      reason,
+    });
+  };
+
+  /**
    * Build the project's {@link ProjectTurnState}: ONE supervisor + one dynamic
    * {@link SupervisorContext} whose `send` and ctx-bound seams all read `state.liveCtx` at
    * EMIT time (deferred closures), so a mid-turn D40 takeover reroutes frames to the new
@@ -647,45 +721,71 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
         subAgents,
         // Turn-end file persistence: commit the turn's accumulated files as ONE
         // agent-authored batch at the last committed version (US7 SC-026) so a settled
-        // turn is never hollow (the US13 exports + US14 editor read these rows).
-        commitFiles: (projectId, files) =>
+        // turn is never hollow (the US13 exports + US14 editor read these rows). M6: the
+        // commit binds the closure's OWNERSHIP-CHECKED outer `projectId` (from Defense 1/2)
+        // and IGNORES the supervisor-supplied argument, so a cross-project commit is
+        // structurally unrepresentable here even if a supervisor passed a foreign id.
+        commitFiles: (_supervisorProjectId, files) =>
           deps.projectStore.commit(projectId, { author: "agent", files }),
         // The per-cycle CHECK is the fast path: adapt the input and hand back the service's
         // `{ ok, diagnostics, … }` verbatim (a structural superset of `CheckOutcome`).
         checkCompile: (input) => deps.compileClient.check(toCheckRequest(input)),
         // The green-only FULL compile: a fresh orchestrator per turn, so `artifacts:ready`
         // is at-most-once by construction; it announces to the CURRENT live connection. On a
-        // `ready` outcome, persist it as the project's latest green build (FR-054) so the US8
-        // deploy handler's greenness gate reads it at deploy time. A record failure must NEVER
-        // fail the turn — the artifacts are already announced; a deploy simply won't see the
-        // build. Loud-log and continue (mirrors the commitFiles backstop).
+        // `ready` outcome we (a) persist it as the project's latest green build (FR-054) so
+        // the US8 deploy handler's greenness gate reads it at deploy time, and (b) emit the
+        // FR-032 coverage telemetry.
+        //
+        // ⚠️ I1 — the ENTIRE post-`ready` side-effect block is wrapped in ONE throw-proof
+        // guard. `runFullCompile` is retried by the supervisor's `withInfraRetry`, so if ANY
+        // side effect here threw/rejected AFTER the compile already succeeded, the compile
+        // would be re-run up to 3 more times — duplicate `artifacts:ready` frames (a D35
+        // at-most-once breach) and a green turn misclassified infra-failed. So nothing in
+        // this block may escape: the record is bounded + self-logged (I2), and a throwing
+        // `logCoverage`/`computeCircuitCoverage` lands in the guard's throw-proof `logError`
+        // (which itself can never throw, even with an injected sink). The turn always ends
+        // green with the single `artifacts:ready` the orchestrator already emitted.
         runFullCompile: async (input) => {
           const outcome = await orchestratorFor(() => state.liveCtx).runTurn(input);
           if (outcome.kind === "ready") {
             try {
-              await deps.projectStore.recordGreenBuild(input.projectId, {
+              // (I2) Bound the record so a hung store can't postpone the money terminal. M6:
+              // bind the OWNERSHIP-CHECKED outer `projectId`, never the supervisor-supplied
+              // `input.projectId`, so a cross-project record is structurally unrepresentable.
+              await recordGreenBuildWithinBound(projectId, {
                 urlPrefix: outcome.urlPrefix,
                 compilerVersion: outcome.compilerVersion,
               });
+
+              // FR-032 coverage TELEMETRY (D41): emit once per green full compile, derived
+              // from the green build's circuits + the project's last capped `test:results`.
+              // Read-only evidence — NO branch of turn control flow consults the report, so
+              // this can never gate, fail, or alter the turn.
+              //
+              // ⚠️ Known protocol gap (recorded in the P1 retro): the `test:results` wire DTO
+              // carries FAILING test names ONLY (`failures[]`), so `testNamesFromResults` folds
+              // only those. On a realistic GREEN run (`pass: true, failures: []`) there are NO
+              // names, so EVERY circuit reports as uncovered — the report is honest but
+              // uninformative. The telemetry becomes meaningful only once the protocol carries
+              // PASSING test names too; until then the all-uncovered green report is expected.
+              // M6: the stash is read under the outer `projectId`, not `input.projectId`.
+              const lastResults = lastResultsByProject.get(projectId);
+              logCoverage(
+                computeCircuitCoverage({
+                  circuits: outcome.circuits.map((circuit) => circuit.name),
+                  testNames: lastResults === undefined ? [] : testNamesFromResults(lastResults),
+                }),
+              );
             } catch (error) {
-              logError("green-build record failed; turn continues (deploy won't see this build)", {
-                projectId: input.projectId,
+              // I1 backstop: any throw from the post-`ready` block (e.g. an injected throwing
+              // `logCoverage`) is logged via the throw-proof sink and SWALLOWED — never
+              // re-thrown, so `withInfraRetry` cannot re-run the compile. The single
+              // `artifacts:ready` already went out; the turn still ends green.
+              logError("green-build post-processing failed; turn continues (already announced)", {
+                projectId,
                 error,
               });
             }
-            // FR-032 coverage TELEMETRY (D41): emit once per green full compile, derived from
-            // the green build's circuits + the project's last capped `test:results`. Read-only
-            // evidence — NO branch of turn control flow consults the report, so this can never
-            // gate, fail, or alter the turn (an absent stash just yields an empty-testNames,
-            // all-uncovered report). `testNamesFromResults` folds the payload's FAILING names;
-            // a richer runner would supply the full passed+failed set (see coverage.ts).
-            const lastResults = lastResultsByProject.get(input.projectId);
-            logCoverage(
-              computeCircuitCoverage({
-                circuits: outcome.circuits.map((circuit) => circuit.name),
-                testNames: lastResults === undefined ? [] : testNamesFromResults(lastResults),
-              }),
-            );
           }
           return outcome;
         },
