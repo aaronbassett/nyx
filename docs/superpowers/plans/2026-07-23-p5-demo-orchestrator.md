@@ -55,6 +55,12 @@ Use the right agent type for each dispatch — do not run everything as a generi
 - CI workflow changes (if any): `gha:gha-creator` + `gha:review`.
 - Pre-PR review loop: `devs:code-reviewer` — always this type for review dispatches.
 
+**Model routing — which model runs what:**
+
+- Implementation dispatches (`devs:typescript-dev`, `gha:*`) and `midnight-verify:*` verification dispatches run on **Opus**: pass `model: "opus"` in the Agent call.
+- Review dispatches (`devs:code-reviewer`) run on **Opus** by default. Escalate a review to **Fable 5** when the diff touches secrets handling (key generation, `.state/` persistence, env-file generation — nothing secret may reach git or logs), or when a finding is still disputed after one fix loop.
+- **Fable 5 is reserved** for the orchestrating session itself, the Task 0 re-planning subagent, and the secrets-handling review above. Never run routine implementation on Fable.
+
 ## No-Deferral Policy
 
 Fully implement every task in this plan before moving on. Deferral is permitted only when 100% required — an external hard blocker outside the codebase. "This is hard/slow/complex" or "this could be a follow-up" are not justifications. Every deferral must appear in the retro with: what was deferred, the blocking condition, what unblocks it, and the impact on remaining plans.

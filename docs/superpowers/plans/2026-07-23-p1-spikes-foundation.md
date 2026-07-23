@@ -54,6 +54,13 @@ Use the right agent type for each dispatch — do not run everything as a generi
 - Foundation TypeScript tasks (commit wiring, green-build store, coverage telemetry): `devs:typescript-dev`.
 - Pre-PR review loop: `devs:code-reviewer` — always this type for review dispatches.
 
+**Model routing — which model runs what:**
+
+- **SPIKE-1 and SPIKE-2 run on Fable 5** — they are novel, evidence-driven exploration with no established recipe; do not downgrade them.
+- Foundation implementation dispatches (`devs:typescript-dev`) run on **Opus**: pass `model: "opus"` in the Agent call. `midnight-verify:*` / `compact-core:compact-dev` dispatches inside the spikes inherit the spike's model.
+- Review dispatches (`devs:code-reviewer`) run on **Opus** by default. Escalate to **Fable 5** for the review of the turn-loop→commit wiring (it touches the supervisor/settle path — money-adjacent) and for any finding still disputed after one fix loop.
+- **Fable 5 is reserved** for the orchestrating session itself, the two spikes, and (in later plans) Task 0 re-planning. Never run routine implementation on Fable; never downgrade the reserved dispatches to Opus.
+
 ## No-Deferral Policy
 
 Fully implement every task in this plan before moving on. Deferral is permitted only when 100% required — an external hard blocker outside the codebase. "This is hard/slow/complex" or "this could be a follow-up" are not justifications. Every deferral must appear in the retro with: what was deferred, the blocking condition, what unblocks it, and the impact on remaining plans. **Exception baked into this plan:** a spike that honestly concludes "NO, with evidence" has SUCCEEDED — the fallback decision is the deliverable, not a deferral.
