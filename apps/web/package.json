@@ -11,12 +11,14 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@monaco-editor/react": "^4.7.0",
     "@nyx/protocol": "workspace:*",
     "@radix-ui/react-slot": "1.3.0",
     "@webcontainer/api": "^1.6.4",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",
     "lucide-react": "1.24.0",
+    "monaco-editor": "^0.55.1",
     "react": "19.2.7",
     "react-dom": "19.2.7",
     "tailwind-merge": "3.6.0"
