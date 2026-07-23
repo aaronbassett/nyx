@@ -21,6 +21,8 @@ import { describe, expect, it, vi } from "vitest";
 import { ZK_CONFIG_BASE_ENV_KEY } from "@/container/artifacts";
 import { CONTRACT_ADDRESS_ENV_KEY } from "@/container/env";
 import { ENV_LOCAL_PATH } from "@/container/env-file";
+import type { CompileWorkerClient } from "@/compile/client";
+import type { CheckOutput, FullOutput } from "@/compile/messages";
 import { createPreview } from "@/container/preview";
 import type {
   PreviewBridge,
@@ -30,7 +32,12 @@ import type {
   WebContainerHandle,
   WebContainerProcessHandle,
 } from "@/container/types";
-import type { ContractAddress, ServerToClientEvent } from "@nyx/protocol";
+import type {
+  CompileResultsPayload,
+  ContractAddress,
+  ServerToClientEvent,
+  TurnId,
+} from "@nyx/protocol";
 
 /** A single recorded `.env.local` / VFS write. */
 interface WriteCall {
@@ -166,6 +173,35 @@ const takeoverEvent = (): ServerToClientEvent => ({
   ts: TS,
 });
 
+const compileRunEvent = (turnId: string, kind: "check" | "full"): ServerToClientEvent => ({
+  type: "compile:run",
+  payload: { turnId: turnId as TurnId, kind },
+  ts: TS,
+});
+
+/** A fake {@link CompileWorkerClient} so no real module `Worker` is spun up. */
+class FakeCompileWorker implements CompileWorkerClient {
+  disposed = false;
+  private readonly result: CheckOutput = {
+    ok: true,
+    diagnostics: [],
+    compilerVersion: "0.31.1",
+    durationMs: 1,
+  };
+
+  check(): Promise<CheckOutput> {
+    return Promise.resolve(this.result);
+  }
+
+  compileFull(): Promise<FullOutput> {
+    return Promise.resolve(this.result);
+  }
+
+  dispose(): void {
+    this.disposed = true;
+  }
+}
+
 interface Harness {
   readonly fake: FakeHandle;
   readonly mock: MockBridge;
@@ -249,6 +285,54 @@ describe("createPreview", () => {
     await flush();
 
     expect(onTakeover).toHaveBeenCalledTimes(1);
+  });
+
+  it("wires compile:run against the per-session worker when projectId + getSources are given", async () => {
+    const fake = createFakeHandle();
+    const mock = createMockBridge();
+    const worker = new FakeCompileWorker();
+    const controller = createPreview(fake.handle, mock.bridge, {
+      tree: {},
+      onTakeover: vi.fn<() => void>(),
+      onCrashed: vi.fn<(detail?: string) => void>(),
+      restartDevServer: vi.fn<() => Promise<void>>(() => Promise.resolve()),
+      reboot: vi.fn<() => Promise<void>>(() => Promise.resolve()),
+      projectId: "proj-1",
+      getSources: () => Promise.resolve([{ path: "main.compact", content: "circuit foo() {}" }]),
+      compileWorker: worker,
+      now: () => TS,
+    });
+
+    mock.emit(compileRunEvent("turn-1", "check"));
+    await flush();
+
+    const verdict = mock.sent.find(
+      (event): event is { type: "compile:results"; payload: CompileResultsPayload } =>
+        (event as { type?: string }).type === "compile:results",
+    );
+    expect(verdict?.payload).toMatchObject({ turnId: "turn-1", kind: "check", ok: true });
+
+    // dispose() tears the compile subscription down AND disposes the worker.
+    controller.dispose();
+    expect(worker.disposed).toBe(true);
+    mock.emit(compileRunEvent("turn-2", "check"));
+    await flush();
+    const verdicts = mock.sent.filter(
+      (event) => (event as { type?: string }).type === "compile:results",
+    );
+    expect(verdicts).toHaveLength(1);
+  });
+
+  it("does not wire compile:run (nor construct a worker) without projectId/getSources", async () => {
+    const { mock } = createHarness();
+
+    // No compile handler is registered, so a compile:run frame is simply ignored.
+    mock.emit(compileRunEvent("turn-x", "check"));
+    await flush();
+
+    expect(mock.sent.some((event) => (event as { type?: string }).type === "compile:results")).toBe(
+      false,
+    );
   });
 
   it("stops handling events after dispose()", async () => {
