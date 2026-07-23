@@ -34,6 +34,7 @@ import { loadConfig } from "../../src/config/index.js";
 import { createMcpClients } from "../../src/mcp/index.js";
 import type { McpSession } from "../../src/mcp/index.js";
 import type { Queryable } from "../../src/db/index.js";
+import type { DeployArtifacts } from "../../src/deploy/pipeline.js";
 import { SESSION_COOKIE_NAME } from "../../src/protocol/index.js";
 import { computeContentHash, defaultCloneTokenGenerator } from "../../src/projects/index.js";
 import type {
@@ -166,6 +167,7 @@ export class InMemoryProjectStore implements ProjectStore {
   private files = new Map<string, Map<string, FileRecord>>();
   private versions = new Map<string, VersionRecord[]>();
   private chat = new Map<string, ChatRecord[]>();
+  private greenBuilds = new Map<string, DeployArtifacts>();
 
   private seq = 0;
   private faultAfterWrites: number | undefined;
@@ -422,6 +424,17 @@ export class InMemoryProjectStore implements ProjectStore {
     );
   }
 
+  recordGreenBuild(projectId: string, build: DeployArtifacts): Promise<void> {
+    // Latest wins (upsert): mirrors the Pg ON CONFLICT (project_id) DO UPDATE.
+    this.greenBuilds.set(projectId, { ...build });
+    return Promise.resolve();
+  }
+
+  getLatestGreenBuild(projectId: string): Promise<DeployArtifacts | null> {
+    const build = this.greenBuilds.get(projectId);
+    return Promise.resolve(build === undefined ? null : { ...build });
+  }
+
   mintCloneToken(projectId: string): Promise<string> {
     const record = this.projects.get(projectId);
     if (record === undefined) {
@@ -475,6 +488,7 @@ export class InMemoryProjectStore implements ProjectStore {
         this.files.delete(id);
         this.versions.delete(id);
         this.chat.delete(id);
+        this.greenBuilds.delete(id); // FK ON DELETE CASCADE (migration 0005).
         purged += 1;
       }
     }

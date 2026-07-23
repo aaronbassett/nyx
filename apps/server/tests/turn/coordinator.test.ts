@@ -34,6 +34,8 @@ import {
 } from "@nyx/protocol";
 import { createTurnCoordinator } from "../../src/turn/coordinator.js";
 import type { TurnCoordinatorDeps, TurnCoordinatorMcp } from "../../src/turn/coordinator.js";
+import { computeCircuitCoverage, testNamesFromResults } from "../../src/agents/coverage.js";
+import type { CircuitCoverageReport } from "../../src/agents/coverage.js";
 import type { ModelRole } from "../../src/config/schema.js";
 import type { ModelRouter } from "../../src/agents/routing.js";
 import type {
@@ -355,6 +357,10 @@ function baseDeps(overrides: Partial<TurnCoordinatorDeps> = {}): TurnCoordinator
     compileClient: makeCompileClient().client,
     ledger: makeLedger().ledger,
     chat: makeChat(),
+    projectStore: {
+      commit: () => Promise.resolve({ version: 1 }),
+      recordGreenBuild: () => Promise.resolve(),
+    },
     mcp: stubMcp,
     flatReserve: FLAT_RESERVE,
     now: () => TS,
@@ -695,6 +701,10 @@ describe("default swarm steering injection (@nyx/scaffold, US1 D3/FR-003/FR-080)
       compileClient: makeCompileClient().client,
       ledger: makeLedger().ledger,
       chat: makeChat(),
+      projectStore: {
+        commit: () => Promise.resolve({ version: 1 }),
+        recordGreenBuild: () => Promise.resolve(),
+      },
       mcp: routedMcp,
       flatReserve: FLAT_RESERVE,
       now: () => TS,
@@ -1205,5 +1215,171 @@ describe("turnGate: in-flight tracking + idle callbacks (EC-40 / FR-058, US8)", 
     // No turn was opened for EITHER project — the gate stays idle for both.
     expect(coordinator.turnGate.isTurnActive(PROJECT)).toBe(false);
     expect(coordinator.turnGate.isTurnActive("victim-project")).toBe(false);
+  });
+});
+
+describe("coverage telemetry (FR-032 / D41) + green post-processing failure envelopes", () => {
+  /**
+   * Drive a REAL green turn end-to-end. The client's `test:results` is delivered THROUGH the
+   * coordinator's handler (not the inbox directly) so the capped payload is stashed per
+   * project — the stash the `ready` full compile reads to derive test names. `fetchArtifact`
+   * lets verify-before-announce resolve so the full compile reaches `ready` (the fake compile
+   * client's succeeded job reports circuit `increment`).
+   */
+  function greenCoverageDeps(overrides: Partial<TurnCoordinatorDeps> = {}): TurnCoordinatorDeps {
+    return baseDeps({
+      fetchArtifact,
+      classifyIntent: () => Promise.resolve({ kind: "dapp" }),
+      subAgents: makeSubAgents(),
+      ...overrides,
+    });
+  }
+
+  /** True when the green done-presentation ("preview is live") reached the socket. */
+  const wentGreen = (sent: ServerToClientEvent[]): boolean =>
+    sent.some(
+      (event) => event.type === "turn:message" && event.payload.delta.includes("preview is live"),
+    );
+
+  it("F1: a REALISTIC green run (pass:true, failures:[]) emits an all-uncovered report", async () => {
+    // The ONLY verdict a green vitest run can emit is pass WITH NO failures. Because the wire
+    // DTO carries FAILING names only, a green run supplies no names → EVERY circuit reports
+    // uncovered. Honest but uninformative (a known protocol gap, recorded in the P1 retro):
+    // the telemetry becomes meaningful only once the protocol carries passing test names.
+    const coverageReports: CircuitCoverageReport[] = [];
+    const { ctx } = makeCtx();
+    const coordinator = createTurnCoordinator(
+      greenCoverageDeps({
+        logCoverage: (report) => {
+          coverageReports.push(report);
+        },
+      }),
+    );
+    const fake = makeFakeRouter();
+    coordinator.handlers(fake.router);
+
+    const done = fake.invoke(promptEvent("build a counter"), ctx);
+    await tick();
+    await fake.invoke(testResultsEvent("turn-1", true, []), ctx);
+    await done;
+
+    // Exactly one report — the full compile fires at most once per green turn (D35).
+    expect(coverageReports).toHaveLength(1);
+    expect(coverageReports[0]?.perCircuit).toEqual([
+      { circuit: "increment", covered: false, testCount: 0 },
+    ]);
+    expect(coverageReports[0]?.coveredCount).toBe(0);
+    expect(coverageReports[0]?.totalCount).toBe(1);
+  });
+
+  it("computeCircuitCoverage marks a circuit covered when a folded test name references it (unit)", () => {
+    // Documents the matching contract at the unit level (agents/coverage.test.ts covers it in
+    // depth). testNamesFromResults folds FAILING names — the only names the wire DTO carries —
+    // so this shape is what's available when a cycle FAILED, never on a green run.
+    const names = testNamesFromResults({
+      turnId: TurnIdSchema.parse("turn-1"),
+      pass: false,
+      failures: [{ name: "increment adds one", message: "boom" }],
+    });
+    const report = computeCircuitCoverage({ circuits: ["increment"], testNames: names });
+    expect(report.perCircuit[0]).toMatchObject({ circuit: "increment", covered: true });
+    expect(report.coveredCount).toBe(1);
+  });
+
+  it("I1: a throwing logCoverage sink never re-runs the compile — turn stays green, ONE artifacts:ready", async () => {
+    // Without the single throw-proof post-`ready` guard, a throwing logCoverage would reject
+    // runFullCompile → the supervisor's withInfraRetry re-runs it up to 3 more times →
+    // DUPLICATE artifacts:ready frames (a D35 at-most-once breach) + the green turn
+    // misclassified infra-failed. The guard swallows the throw, so exactly one compile runs.
+    const compile = makeCompileClient();
+    const { ctx, sent } = makeCtx();
+    const coordinator = createTurnCoordinator(
+      greenCoverageDeps({
+        compileClient: compile.client,
+        logCoverage: () => {
+          throw new Error("telemetry sink boom");
+        },
+      }),
+    );
+    const fake = makeFakeRouter();
+    coordinator.handlers(fake.router);
+
+    const done = fake.invoke(promptEvent("build a counter"), ctx);
+    await tick();
+    await fake.invoke(testResultsEvent("turn-1", true, []), ctx);
+    await done;
+
+    // Exactly ONE full compile ran (one submit) and exactly ONE artifacts:ready went out —
+    // the throwing sink did NOT trigger a retry storm.
+    expect(compile.compileCalls).toHaveLength(1);
+    expect(sent.filter((event) => event.type === "artifacts:ready")).toHaveLength(1);
+    // The turn ended GREEN (done-presentation + a single settle), never infra-failed.
+    expect(wentGreen(sent)).toBe(true);
+    expect(sent.filter((event) => event.type === "turn:settled")).toHaveLength(1);
+  });
+
+  it("M5: a REJECTING recordGreenBuild leaves the outcome ready and the turn green", async () => {
+    const compile = makeCompileClient();
+    const { ctx, sent } = makeCtx();
+    const coordinator = createTurnCoordinator(
+      greenCoverageDeps({
+        compileClient: compile.client,
+        projectStore: {
+          commit: () => Promise.resolve({ version: 1 }),
+          recordGreenBuild: () => Promise.reject(new Error("green-build store down")),
+        },
+      }),
+    );
+    const fake = makeFakeRouter();
+    coordinator.handlers(fake.router);
+
+    const done = fake.invoke(promptEvent("build a counter"), ctx);
+    await tick();
+    await fake.invoke(testResultsEvent("turn-1", true, []), ctx);
+    await done;
+
+    // The record REJECTED but the turn still went GREEN with one announce + one settle.
+    expect(compile.compileCalls).toHaveLength(1);
+    expect(sent.filter((event) => event.type === "artifacts:ready")).toHaveLength(1);
+    expect(wentGreen(sent)).toBe(true);
+    expect(sent.filter((event) => event.type === "turn:settled")).toHaveLength(1);
+  });
+
+  it("I2: a NEVER-RESOLVING recordGreenBuild is bounded and cannot postpone the money terminal", async () => {
+    // A HUNG store must never hold the money terminal (input locked, reserve held). The record
+    // is raced against the injected delay timeout; on timeout the outcome stays `ready` and the
+    // turn reaches green. `delay` resolves ONLY for the record-bound ms so the inbox's own
+    // (default 180_000ms) timeout still never fires and the green verdict is delivered below.
+    const RECORD_TIMEOUT_MS = 5;
+    const delay = (ms: number): Promise<void> =>
+      ms === RECORD_TIMEOUT_MS ? Promise.resolve() : new Promise<void>(() => undefined);
+    const compile = makeCompileClient();
+    const { ctx, sent } = makeCtx();
+    const coordinator = createTurnCoordinator(
+      greenCoverageDeps({
+        compileClient: compile.client,
+        delay,
+        recordGreenBuildTimeoutMs: RECORD_TIMEOUT_MS,
+        projectStore: {
+          commit: () => Promise.resolve({ version: 1 }),
+          // Never resolves — the bound must let the turn continue anyway.
+          recordGreenBuild: () => new Promise<void>(() => undefined),
+        },
+      }),
+    );
+    const fake = makeFakeRouter();
+    coordinator.handlers(fake.router);
+
+    const done = fake.invoke(promptEvent("build a counter"), ctx);
+    await tick();
+    await fake.invoke(testResultsEvent("turn-1", true, []), ctx);
+    await done;
+
+    // The record hung, but its bounded timeout let the full compile return `ready` → green:
+    // one announce, one settle, the done-presentation.
+    expect(compile.compileCalls).toHaveLength(1);
+    expect(sent.filter((event) => event.type === "artifacts:ready")).toHaveLength(1);
+    expect(wentGreen(sent)).toBe(true);
+    expect(sent.filter((event) => event.type === "turn:settled")).toHaveLength(1);
   });
 });

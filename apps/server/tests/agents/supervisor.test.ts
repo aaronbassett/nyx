@@ -346,6 +346,7 @@ function makeDeps(overrides: Partial<SupervisorDeps>): SupervisorDeps {
     classifyIntent: () => Promise.resolve<IntentResult>({ kind: "dapp" }),
     subAgents: makeSubAgents().subAgents,
     awaitTestResults: makeTestResults([{ pass: true }]),
+    commitFiles: () => Promise.resolve({ version: 1 }),
     retryDelay: () => Promise.resolve(),
     ...overrides,
   };

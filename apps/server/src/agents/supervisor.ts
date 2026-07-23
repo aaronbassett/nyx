@@ -72,6 +72,7 @@ import type {
 } from "@nyx/protocol";
 import type { CompileOutcome, CompileTurnInput, Diagnostic, SourceFile } from "../compile/index.js";
 import type { ChatStore } from "../projects/chat.js";
+import type { CommitResult, FileWrite } from "../projects/store.js";
 import type { Balance, LedgerStore } from "../ledger/ledger.js";
 import { InsufficientAvailableError } from "../ledger/ledger.js";
 import { capTestResults } from "./coverage.js";
@@ -242,6 +243,13 @@ export interface SupervisorDeps {
   readonly runFullCompile: FullCompiler;
   /** Chat persistence + rehydration (D23); also the cold-start signal (FR-003). */
   readonly chat: ChatStore;
+  /**
+   * Persist a turn's accumulated files as ONE agent-authored commit (SC-026) at every
+   * turn ending that reached the verify loop. REQUIRED — the US13 exports and the US14
+   * editor read the resulting `project_file_versions` rows; a settled turn must never be
+   * hollow. Production wires it to {@link ProjectStore.commit} with `author: "agent"`.
+   */
+  readonly commitFiles: (projectId: string, files: readonly FileWrite[]) => Promise<CommitResult>;
   /** The flat pre-turn reserve in NYXT base units (D34/D47). */
   readonly flatReserve: bigint;
   /** Intent classification (D25). */
@@ -258,6 +266,20 @@ export interface SupervisorDeps {
   readonly maxInfraRetries?: number;
   /** Backoff seam between infra retries; defaults to an immediate (deterministic) resolve. */
   readonly retryDelay?: (attempt: number) => Promise<void>;
+  /**
+   * The bounded-timeout delay seam for turn-end file persistence (mirrors the coordinator's
+   * D42 `delay`+`timeoutMs` no-hang pattern). Defaults to an unref'd `setTimeout` so a live
+   * bound never pins the process; tests inject an immediate/fake-time resolve to drive the
+   * timeout deterministically.
+   */
+  readonly delay?: (ms: number) => Promise<void>;
+  /**
+   * Bounded wait for {@link commitFiles} before the turn proceeds to its money terminal
+   * (I2 no-hang); default {@link DEFAULT_PERSIST_TIMEOUT_MS}. A HUNG store must never
+   * postpone `turn:settled` (input locked, reserve held) — a timeout is treated exactly
+   * like a commit failure: logged loudly onto the activity feed, then settle continues.
+   */
+  readonly persistTimeoutMs?: number;
 }
 
 /**
@@ -336,6 +358,14 @@ export interface Supervisor {
 /** Default infra RETRIES before a loud named failure (scenario 5). */
 export const DEFAULT_MAX_INFRA_RETRIES = 3;
 
+/**
+ * Default bounded wait for turn-end file persistence (I2 no-hang). A commit that has not
+ * completed within this window is treated exactly like a failed commit — logged loudly,
+ * then the turn proceeds to settle — so a hung {@link SupervisorDeps.commitFiles} store can
+ * never postpone the money terminal (input locked, reserve held) indefinitely.
+ */
+export const DEFAULT_PERSIST_TIMEOUT_MS = 10_000;
+
 /** The service name attributed to a thrown compile fault. */
 const COMPILE_SERVICE_NAME = "Compile Service";
 
@@ -350,6 +380,19 @@ const INPUT_LOCKED_MESSAGE =
   "Input is locked while the current turn finishes. I'll unlock it as soon as this turn settles.";
 
 // ── Internal helpers ───────────────────────────────────────────────────────────
+
+/**
+ * The default persist-timeout delay — an UNREF'd timer so a live bounded wait never pins
+ * the process. Mirrors the coordinator's `defaultDelay` (the D42 no-hang pattern).
+ */
+function defaultDelay(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms).unref();
+  });
+}
+
+/** Sentinel signalling the persist bound timed out before {@link SupervisorDeps.commitFiles} resolved. */
+const PERSIST_TIMEOUT = Symbol("persist-timeout");
 
 /**
  * A thrown infra fault that survived every retry (scenario 5). Carries the named
@@ -507,12 +550,16 @@ class TurnSupervisor implements Supervisor {
   private readonly active = new Map<string, string | null>();
   private readonly maxInfraRetries: number;
   private readonly retryDelay: (attempt: number) => Promise<void>;
+  private readonly delay: (ms: number) => Promise<void>;
+  private readonly persistTimeoutMs: number;
   private readonly makeBudget: (options?: VerifyBudgetOptions) => VerifyBudget;
   private readonly makeTrigger: (deps: GreenCompileTriggerDeps) => GreenCompileTrigger;
 
   constructor(private readonly deps: SupervisorDeps) {
     this.maxInfraRetries = deps.maxInfraRetries ?? DEFAULT_MAX_INFRA_RETRIES;
     this.retryDelay = deps.retryDelay ?? (() => Promise.resolve());
+    this.delay = deps.delay ?? defaultDelay;
+    this.persistTimeoutMs = deps.persistTimeoutMs ?? DEFAULT_PERSIST_TIMEOUT_MS;
     this.makeBudget = deps.verifyBudget ?? createVerifyBudget;
     this.makeTrigger = deps.greenTrigger ?? createGreenCompileTrigger;
   }
@@ -629,6 +676,9 @@ class TurnSupervisor implements Supervisor {
     let cycles = 0;
     let compileDiagnostics: readonly Diagnostic[] = [];
     let testFailures: readonly TestFailure[] = [];
+    // The turn's accumulated files across ALL cycles (a later cycle overrides an earlier
+    // one per path), persisted as ONE agent commit at every ending that reaches the loop.
+    const turnFiles = new Map<string, FileWrite>();
 
     try {
       for (;;) {
@@ -647,6 +697,7 @@ class TurnSupervisor implements Supervisor {
         const work = await this.runCycleAgents(ctx, cycleCtx, coldStart);
         totalTokens += work.tokens;
         for (const file of work.files) {
+          turnFiles.set(file.path, { path: file.path, content: file.content });
           await this.emitFileWrite(ctx, file);
         }
 
@@ -672,6 +723,7 @@ class TurnSupervisor implements Supervisor {
           });
           const decision = budget.recordTestResult(false, check.diagnostics);
           if (decision.kind === "exhausted") {
+            await this.persistTurnFiles(ctx, turnId, projectId, turnFiles);
             return await this.exhaustedEnding(ctx, {
               params,
               consumed: totalTokens,
@@ -693,9 +745,11 @@ class TurnSupervisor implements Supervisor {
           // (D35/FR-029) — never a mere check-pass, never before the tests run. Then the
           // done-presentation.
           await trigger.triggerOnGreen(decision, compileInput);
+          await this.persistTurnFiles(ctx, turnId, projectId, turnFiles);
           return await this.greenEnding(ctx, { params, consumed: totalTokens, cycles });
         }
         if (decision.kind === "exhausted") {
+          await this.persistTurnFiles(ctx, turnId, projectId, turnFiles);
           return await this.exhaustedEnding(ctx, {
             params,
             consumed: totalTokens,
@@ -715,6 +769,7 @@ class TurnSupervisor implements Supervisor {
       }
     } catch (error) {
       if (error instanceof InfraFailureError) {
+        await this.persistTurnFiles(ctx, turnId, projectId, turnFiles);
         return await this.infraEnding(ctx, {
           params,
           consumed: totalTokens,
@@ -724,6 +779,66 @@ class TurnSupervisor implements Supervisor {
       }
       throw error;
     }
+  }
+
+  /**
+   * Persist the turn's accumulated files as one agent commit (SC-026). Persistence must
+   * NEVER break — nor even DELAY — the money path (I2): a commit that fails OR hangs is
+   * logged onto the activity feed and swallowed, and the turn still settles (the files
+   * still live in the client VFS). The commit is BOUNDED ({@link commitWithinBound}) so a
+   * hung store can never postpone `turn:settled` (input locked, reserve held). An empty
+   * turn (no files produced) writes nothing (no phantom empty version).
+   */
+  private async persistTurnFiles(
+    ctx: SupervisorContext,
+    turnId: string,
+    projectId: string,
+    turnFiles: ReadonlyMap<string, FileWrite>,
+  ): Promise<void> {
+    if (turnFiles.size === 0) {
+      return;
+    }
+    const failure = await this.commitWithinBound(projectId, [...turnFiles.values()]);
+    if (failure === undefined) {
+      return;
+    }
+    // M3: the persist-failure notice is best-effort — a throwing/rejecting `ctx.send`
+    // (dead socket) must NOT block the settle that follows, so its own throw is swallowed.
+    // Settle stays UNCONDITIONAL; the files still live in the client VFS regardless.
+    try {
+      await this.emitActivity(ctx, turnId, {
+        agent: "supervisor",
+        phase: "persist",
+        detail: `file persistence failed (${failure}); files remain in the container only`,
+      });
+    } catch {
+      // The notice could not be delivered — swallow so the money terminal is never blocked.
+    }
+  }
+
+  /**
+   * Commit within a BOUNDED wait (I2 no-hang). Races {@link SupervisorDeps.commitFiles}
+   * against the injected {@link persistTimeoutMs} timeout: a rejection OR a timeout resolves
+   * to a human failure message (this NEVER throws), so the caller always proceeds to settle.
+   * Returns `undefined` on a clean commit. The commit promise carries its own rejection
+   * handler, so a rejection that lands AFTER the timeout wins is never an unhandled rejection.
+   */
+  private async commitWithinBound(
+    projectId: string,
+    files: readonly FileWrite[],
+  ): Promise<string | undefined> {
+    const committed: Promise<string | undefined> = this.deps.commitFiles(projectId, files).then(
+      () => undefined,
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    );
+    const timedOut: Promise<typeof PERSIST_TIMEOUT> = this.delay(this.persistTimeoutMs).then(
+      () => PERSIST_TIMEOUT,
+    );
+    const outcome = await Promise.race([committed, timedOut]);
+    if (outcome === PERSIST_TIMEOUT) {
+      return `did not complete within ${String(this.persistTimeoutMs)}ms`;
+    }
+    return outcome;
   }
 
   /**

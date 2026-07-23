@@ -51,10 +51,10 @@ async function migrationById(id: number): Promise<Migration> {
 }
 
 describe("migration files (static shape)", () => {
-  it("discovers the initial schema, ledger-width, deploy-txref, and reconcile-width migrations as up/down pairs", async () => {
+  it("discovers the initial schema, ledger-width, deploy-txref, reconcile-width, and green-builds migrations as up/down pairs", async () => {
     const migrations = await loadMigrations();
-    expect(migrations).toHaveLength(4);
-    const [first, second, third, fourth] = migrations;
+    expect(migrations).toHaveLength(5);
+    const [first, second, third, fourth, fifth] = migrations;
     expect(first?.id).toBe(1);
     expect(first?.name).toBe("initial_schema");
     expect(second?.id).toBe(2);
@@ -63,6 +63,8 @@ describe("migration files (static shape)", () => {
     expect(third?.name).toBe("deploy_registry_txref_unique");
     expect(fourth?.id).toBe(4);
     expect(fourth?.name).toBe("reconcile_amount_width");
+    expect(fifth?.id).toBe(5);
+    expect(fifth?.name).toBe("green_builds");
     for (const migration of migrations) {
       expect(migration.upSql.length).toBeGreaterThan(0);
       expect(migration.downSql.length).toBeGreaterThan(0);
@@ -155,6 +157,17 @@ describe("migration files (static shape)", () => {
     expect(upSql).toMatch(/\bclone_token\s+text/);
     expect(upSql).toMatch(/\bclone_materialized_at_version\s+bigint/);
     expect(upSql).toContain("CREATE UNIQUE INDEX projects_clone_token_key");
+  });
+
+  it("adds the per-project green-build table with a cascading FK (migration 0005)", async () => {
+    const { upSql, downSql } = await migrationById(5);
+    expect(upSql).toMatch(/CREATE TABLE project_green_builds\b/);
+    expect(upSql).toMatch(
+      /project_id\s+uuid\s+PRIMARY KEY REFERENCES projects \(id\) ON DELETE CASCADE/,
+    );
+    expect(upSql).toMatch(/\burl_prefix\s+text\s+NOT NULL/);
+    expect(upSql).toMatch(/\bcompiler_version\s+text\s+NOT NULL/);
+    expect(downSql).toContain("DROP TABLE project_green_builds;");
   });
 
   it("keys deposit refs and reconcile watermarks for exactly-once semantics", async () => {

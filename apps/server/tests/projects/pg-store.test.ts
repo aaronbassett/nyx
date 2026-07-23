@@ -193,4 +193,25 @@ describe.skipIf(!runLive)("PgProjectStore against live Postgres (US7)", () => {
     const history = await store.getChat(project.id);
     expect(history.map((m) => m.content)).toEqual(["hi", "hello"]);
   });
+
+  // Requires migration 0005 applied to the target database.
+  it("upserts the latest green build per project and returns null when absent (FR-054)", async () => {
+    const project = await store.createProject(OWNER, "green");
+    expect(await store.getLatestGreenBuild(project.id)).toBeNull();
+
+    await store.recordGreenBuild(project.id, { urlPrefix: "g/hashA/", compilerVersion: "0.31.1" });
+    await store.recordGreenBuild(project.id, { urlPrefix: "g/hashB/", compilerVersion: "0.31.1" });
+    expect(await store.getLatestGreenBuild(project.id)).toEqual({
+      urlPrefix: "g/hashB/",
+      compilerVersion: "0.31.1",
+    });
+
+    // Soft-delete does not cascade; hard-delete (FK ON DELETE CASCADE) removes the row.
+    await db.query(`DELETE FROM projects WHERE id = $1`, [project.id]);
+    const { rows } = await db.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM project_green_builds WHERE project_id = $1`,
+      [project.id],
+    );
+    expect(Number(rows[0]?.count ?? "0")).toBe(0);
+  });
 });
