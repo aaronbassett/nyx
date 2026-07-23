@@ -133,6 +133,11 @@ export const EnvSchema = z.object({
   ARTIFACT_STORE_ROOT: z.string().min(1).default("./data/artifacts"),
   ARTIFACT_MAX_FILE_BYTES: positiveInt.default(16_777_216), // 16 MB/file
   ARTIFACT_MAX_BUNDLE_BYTES: positiveInt.default(134_217_728), // 128 MB/prefix
+  // Per-project STAGED (uncommitted) exhaustion caps (M1): bound how much a project may hold
+  // uncommitted across ALL prefixes, so unbounded distinct `sourceHash` prefixes can't exhaust
+  // the shared staging volume. Defaults ≈ 4× the bundle cap + 8 concurrent uncommitted prefixes.
+  ARTIFACT_MAX_STAGED_BYTES_PER_PROJECT: positiveInt.default(536_870_912), // 512 MB staged/project
+  ARTIFACT_MAX_STAGED_PREFIXES_PER_PROJECT: positiveInt.default(8), // concurrent uncommitted prefixes
   // Bounded per-cycle CHECK + green FULL browser-compile waits (D42 no-hang backstops).
   COMPILE_CHECK_TIMEOUT_MS: positiveInt.default(30_000),
   COMPILE_FULL_TIMEOUT_MS: positiveInt.default(300_000),
@@ -238,6 +243,10 @@ export interface ArtifactStoreConfig {
   readonly rootDir: string;
   readonly maxFileBytes: number;
   readonly maxBundleBytes: number;
+  /** Per-project cap on total UNCOMMITTED staged bytes (M1 disk-exhaustion guard). */
+  readonly maxStagedBytesPerProject: number;
+  /** Per-project cap on the count of concurrently-staged (uncommitted) prefixes (M1). */
+  readonly maxStagedPrefixesPerProject: number;
   readonly srsCacheDir: string | undefined;
 }
 

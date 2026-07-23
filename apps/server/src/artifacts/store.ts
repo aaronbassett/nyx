@@ -23,7 +23,7 @@
  */
 import { createHash } from "node:crypto";
 import type { Dirent } from "node:fs";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import { ArtifactManifestSchema } from "../compile/schemas.js";
@@ -34,6 +34,7 @@ import {
   ArtifactFileTooLargeError,
   ArtifactHashMismatchError,
   ArtifactManifestIncompleteError,
+  ArtifactStagingQuotaError,
   InvalidSourceHashError,
   UnsafePathError,
 } from "./errors.js";
@@ -49,7 +50,12 @@ export interface StoredArtifactFile {
  * prefixes. Every method REJECTS (never throws synchronously) with a named error.
  */
 export interface ArtifactStore {
-  /** Stage one file's bytes under `(projectId, sourceHash)`; overwrites re-account bytes. */
+  /**
+   * Stage one file's bytes under `(projectId, sourceHash)`; overwrites re-account bytes. REJECTS
+   * {@link ArtifactStagingQuotaError} when the project's total UNCOMMITTED footprint (staged bytes
+   * across all prefixes, or the count of concurrently-staged prefixes) would exceed its per-project
+   * caps — a staging-volume exhaustion guard on the shared disk (M1).
+   */
   putFile(
     projectId: string,
     sourceHash: string,
@@ -63,6 +69,14 @@ export interface ArtifactStore {
   getManifest(projectId: string, sourceHash: string): Promise<ArtifactManifest | null>;
   /** One staged/committed file's bytes + content type, or `null` if absent. */
   getFile(projectId: string, sourceHash: string, path: string): Promise<StoredArtifactFile | null>;
+  /**
+   * GC hook (M1): remove every UNCOMMITTED prefix whose most-recent staging write is older than
+   * `olderThanMs` (measured against the store's injected clock), and resolve with the count
+   * removed. COMMITTED prefixes and freshly-/actively-staged prefixes ALWAYS survive — only
+   * abandoned half-uploads are reclaimed. Idempotent + never throws for an absent root; wired to
+   * an unref'd boot interval so a client that PUTs then never commits cannot pin disk forever.
+   */
+  sweepStaged(olderThanMs: number): Promise<number>;
 }
 
 /** A lowercase-hex SHA-256 — the `sourceHash` shape (`<projectId>/<sourceHash>/` prefix). */
@@ -80,6 +94,9 @@ const FileMetaSchema = z.object({
   contentType: z.string(),
   sha256: z.string(),
   bytes: z.number(),
+  // Clock value at the time this file was staged — the age input for the M1 sweep. Defaulted so a
+  // sidecar written before this field existed parses as epoch-0 (i.e. eligible for GC), never a throw.
+  stagedAt: z.number().default(0),
 });
 type FileMeta = z.infer<typeof FileMetaSchema>;
 
@@ -122,7 +139,17 @@ interface MemPrefix {
   readonly files: Map<string, MemFile>;
   manifest: ArtifactManifest | null;
   totalBytes: number;
+  /** Clock value of the most-recent staging write — the age GC compares against (M1 sweep). */
+  stagedAt: number;
 }
+
+/** Default per-project staged-bytes cap = 4× the (finite) bundle cap; Infinity when uncapped. */
+function defaultStagedBytes(maxBundleBytes: number): number {
+  return Number.isFinite(maxBundleBytes) ? maxBundleBytes * 4 : Number.POSITIVE_INFINITY;
+}
+
+/** Default max count of concurrently-staged (uncommitted) prefixes per project (M1). */
+const DEFAULT_STAGED_PREFIXES_PER_PROJECT = 8;
 
 /**
  * In-memory {@link ArtifactStore} double (the repo store pattern). Mirrors the disk layout
@@ -132,16 +159,29 @@ interface MemPrefix {
 export function createInMemoryArtifactStore(deps?: {
   maxFileBytes?: number;
   maxBundleBytes?: number;
+  /** Per-project cap on total UNCOMMITTED staged bytes (M1); default 4× {@link maxBundleBytes}. */
+  maxStagedBytesPerProject?: number;
+  /** Per-project cap on the count of concurrently-staged prefixes (M1); default 8. */
+  maxStagedPrefixesPerProject?: number;
+  /** Injectable clock for the M1 staging sweep; defaults to `Date.now`. */
+  clock?: () => number;
 }): ArtifactStore {
   const maxFileBytes = deps?.maxFileBytes ?? Number.POSITIVE_INFINITY;
   const maxBundleBytes = deps?.maxBundleBytes ?? Number.POSITIVE_INFINITY;
+  const maxStagedBytesPerProject =
+    deps?.maxStagedBytesPerProject ?? defaultStagedBytes(maxBundleBytes);
+  const maxStagedPrefixesPerProject =
+    deps?.maxStagedPrefixesPerProject ?? DEFAULT_STAGED_PREFIXES_PER_PROJECT;
+  const clock = deps?.clock ?? Date.now;
   const prefixes = new Map<string, MemPrefix>();
   const keyOf = (projectId: string, sourceHash: string): string => `${projectId}/${sourceHash}`;
+  /** A prefix key belongs to `projectId` iff it is `<projectId>/<hex>` (ids carry no `/`). */
+  const isProjectKey = (key: string, projectId: string): boolean => key.startsWith(`${projectId}/`);
 
   const getOrCreate = (key: string): MemPrefix => {
     let prefix = prefixes.get(key);
     if (prefix === undefined) {
-      prefix = { files: new Map(), manifest: null, totalBytes: 0 };
+      prefix = { files: new Map(), manifest: null, totalBytes: 0, stagedAt: clock() };
       prefixes.set(key, prefix);
     }
     return prefix;
@@ -157,14 +197,41 @@ export function createInMemoryArtifactStore(deps?: {
         if (bytes.length > maxFileBytes) {
           throw new ArtifactFileTooLargeError(path, maxFileBytes);
         }
-        const prefix = getOrCreate(keyOf(projectId, sourceHash));
-        const priorBytes = prefix.files.get(path)?.bytes.length ?? 0;
-        const projectedTotal = prefix.totalBytes - priorBytes + bytes.length;
+        const key = keyOf(projectId, sourceHash);
+        const existing = prefixes.get(key);
+        const priorBytes = existing?.files.get(path)?.bytes.length ?? 0;
+        const projectedTotal = (existing?.totalBytes ?? 0) - priorBytes + bytes.length;
         if (projectedTotal > maxBundleBytes) {
           throw new ArtifactBundleTooLargeError(maxBundleBytes);
         }
+        // M1 — per-project staged (UNCOMMITTED) exhaustion guard. Committed prefixes are durable
+        // and don't count; sum the project's other uncommitted prefixes, then add THIS prefix's
+        // projected total (unless it is already committed). Enforced BEFORE any mutation so a
+        // rejected PUT leaves no phantom prefix behind.
+        const currentUncommitted = (existing?.manifest ?? null) === null;
+        let stagedPrefixCount = currentUncommitted ? 1 : 0;
+        let stagedBytes = currentUncommitted ? projectedTotal : 0;
+        for (const [otherKey, otherPrefix] of prefixes) {
+          if (
+            otherKey === key ||
+            !isProjectKey(otherKey, projectId) ||
+            otherPrefix.manifest !== null
+          ) {
+            continue;
+          }
+          stagedPrefixCount += 1;
+          stagedBytes += otherPrefix.totalBytes;
+        }
+        if (stagedPrefixCount > maxStagedPrefixesPerProject) {
+          throw new ArtifactStagingQuotaError("prefixes", maxStagedPrefixesPerProject);
+        }
+        if (stagedBytes > maxStagedBytesPerProject) {
+          throw new ArtifactStagingQuotaError("bytes", maxStagedBytesPerProject);
+        }
+        const prefix = getOrCreate(key);
         prefix.files.set(path, { bytes: bytes.slice(), contentType, sha256: sha256Hex(bytes) });
         prefix.totalBytes = projectedTotal;
+        prefix.stagedAt = clock();
         return Promise.resolve();
       } catch (error) {
         return reject(error);
@@ -221,6 +288,19 @@ export function createInMemoryArtifactStore(deps?: {
         return reject(error);
       }
     },
+
+    sweepStaged(olderThanMs) {
+      // Remove every UNCOMMITTED prefix last staged before the cutoff; committed + fresh survive.
+      const cutoff = clock() - olderThanMs;
+      let removed = 0;
+      for (const [key, prefix] of prefixes) {
+        if (prefix.manifest === null && prefix.stagedAt <= cutoff) {
+          prefixes.delete(key);
+          removed += 1;
+        }
+      }
+      return Promise.resolve(removed);
+    },
   };
 }
 
@@ -273,11 +353,44 @@ export function createLocalArtifactStore(deps: {
   rootDir: string;
   maxFileBytes: number;
   maxBundleBytes: number;
+  /** Per-project cap on total UNCOMMITTED staged bytes (M1); default 4× {@link maxBundleBytes}. */
+  maxStagedBytesPerProject?: number;
+  /** Per-project cap on the count of concurrently-staged prefixes (M1); default 8. */
+  maxStagedPrefixesPerProject?: number;
+  /** Injectable clock for the M1 staging sweep + sidecar timestamps; defaults to `Date.now`. */
+  clock?: () => number;
 }): ArtifactStore {
   const { rootDir, maxFileBytes, maxBundleBytes } = deps;
+  const maxStagedBytesPerProject =
+    deps.maxStagedBytesPerProject ?? defaultStagedBytes(maxBundleBytes);
+  const maxStagedPrefixesPerProject =
+    deps.maxStagedPrefixesPerProject ?? DEFAULT_STAGED_PREFIXES_PER_PROJECT;
+  const clock = deps.clock ?? Date.now;
 
   const prefixDir = (projectId: string, sourceHash: string): string =>
     join(rootDir, projectId, sourceHash);
+
+  // L2 — a lightweight per-prefix promise-chain mutex. The disk `putFile` does a read-modify-write
+  // (sum staged bytes → check caps → write), so two concurrent PUTs to ONE prefix could both read
+  // stale totals and both pass the bundle cap (a TOCTOU). Serializing per prefix key closes that:
+  // each PUT for a key awaits the prior one, so the second sees the first's bytes. The tail entry
+  // is cleaned when it settles (bounded by CONCURRENTLY-writing prefixes, never by total prefixes).
+  const prefixLocks = new Map<string, Promise<unknown>>();
+  const withPrefixLock = <T>(key: string, fn: () => Promise<T>): Promise<T> => {
+    const prior = prefixLocks.get(key) ?? Promise.resolve();
+    const run = prior.then(fn, fn);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    prefixLocks.set(key, tail);
+    void tail.finally(() => {
+      if (prefixLocks.get(key) === tail) {
+        prefixLocks.delete(key);
+      }
+    });
+    return run;
+  };
 
   const readMeta = async (metaPath: string): Promise<FileMeta | null> => {
     let raw: string;
@@ -320,6 +433,76 @@ export function createLocalArtifactStore(deps: {
     return out;
   };
 
+  /** Aggregate a prefix's staged footprint from its meta sidecars: total bytes + newest `stagedAt`. */
+  const readPrefixStaged = async (
+    metaDir: string,
+  ): Promise<{ totalBytes: number; latestStagedAt: number }> => {
+    let dirents: Dirent[];
+    try {
+      dirents = await readdir(metaDir, { recursive: true, withFileTypes: true });
+    } catch (error) {
+      if (hasErrnoCode(error, "ENOENT")) {
+        return { totalBytes: 0, latestStagedAt: 0 };
+      }
+      throw error;
+    }
+    let totalBytes = 0;
+    let latestStagedAt = 0;
+    for (const dirent of dirents) {
+      if (!dirent.isFile() || !dirent.name.endsWith(".json")) {
+        continue;
+      }
+      const meta = await readMeta(join(dirent.parentPath, dirent.name));
+      if (meta === null) {
+        continue;
+      }
+      totalBytes += meta.bytes;
+      if (meta.stagedAt > latestStagedAt) {
+        latestStagedAt = meta.stagedAt;
+      }
+    }
+    return { totalBytes, latestStagedAt };
+  };
+
+  /** True when a prefix has landed its manifest-last commit (its bytes are durable, not staged). */
+  const isCommitted = (dir: string): Promise<boolean> => pathExists(join(dir, "manifest.json"));
+
+  /**
+   * Sum the project's OTHER (sibling) uncommitted prefixes: count + staged bytes, excluding
+   * `currentHash` (the caller accounts that prefix's projected total itself). Committed prefixes are
+   * durable and excluded. The M1 per-project staging guard reads this on every `putFile`.
+   */
+  const projectStagedSiblings = async (
+    projectId: string,
+    currentHash: string,
+  ): Promise<{ count: number; bytes: number }> => {
+    const projectDir = join(rootDir, projectId);
+    let dirents: Dirent[];
+    try {
+      dirents = await readdir(projectDir, { withFileTypes: true });
+    } catch (error) {
+      if (hasErrnoCode(error, "ENOENT")) {
+        return { count: 0, bytes: 0 };
+      }
+      throw error;
+    }
+    let count = 0;
+    let bytes = 0;
+    for (const dirent of dirents) {
+      if (!dirent.isDirectory() || dirent.name === currentHash) {
+        continue;
+      }
+      const dir = join(projectDir, dirent.name);
+      if (await isCommitted(dir)) {
+        continue;
+      }
+      const { totalBytes } = await readPrefixStaged(join(dir, "meta"));
+      count += 1;
+      bytes += totalBytes;
+    }
+    return { count, bytes };
+  };
+
   return {
     async putFile(projectId, sourceHash, path, bytes, contentType) {
       assertValidPrefix(projectId, sourceHash);
@@ -327,25 +510,48 @@ export function createLocalArtifactStore(deps: {
       if (bytes.length > maxFileBytes) {
         throw new ArtifactFileTooLargeError(path, maxFileBytes);
       }
-      const dir = prefixDir(projectId, sourceHash);
-      const filesDir = join(dir, "files");
-      const metaDir = join(dir, "meta");
-      const fileTarget = safeJoin(filesDir, path);
-      const metaTarget = safeJoin(metaDir, `${path}.json`);
+      // L2 — serialize per-prefix so the read-modify-write below is atomic against a concurrent
+      // PUT to the SAME prefix (two racers can't both pass the bundle cap on stale totals).
+      return withPrefixLock(prefixDir(projectId, sourceHash), async () => {
+        const dir = prefixDir(projectId, sourceHash);
+        const filesDir = join(dir, "files");
+        const metaDir = join(dir, "meta");
+        const fileTarget = safeJoin(filesDir, path);
+        const metaTarget = safeJoin(metaDir, `${path}.json`);
 
-      const priorBytesByPath = await readMetaBytes(metaDir);
-      const currentTotal = [...priorBytesByPath.values()].reduce((sum, n) => sum + n, 0);
-      const priorForPath = priorBytesByPath.get(path) ?? 0;
-      const projectedTotal = currentTotal - priorForPath + bytes.length;
-      if (projectedTotal > maxBundleBytes) {
-        throw new ArtifactBundleTooLargeError(maxBundleBytes);
-      }
+        const priorBytesByPath = await readMetaBytes(metaDir);
+        const currentTotal = [...priorBytesByPath.values()].reduce((sum, n) => sum + n, 0);
+        const priorForPath = priorBytesByPath.get(path) ?? 0;
+        const projectedTotal = currentTotal - priorForPath + bytes.length;
+        if (projectedTotal > maxBundleBytes) {
+          throw new ArtifactBundleTooLargeError(maxBundleBytes);
+        }
 
-      await mkdir(dirname(fileTarget), { recursive: true });
-      await mkdir(dirname(metaTarget), { recursive: true });
-      await writeFile(fileTarget, bytes);
-      const meta: FileMeta = { contentType, sha256: sha256Hex(bytes), bytes: bytes.length };
-      await writeFile(metaTarget, JSON.stringify(meta));
+        // M1 — per-project staged (UNCOMMITTED) exhaustion guard. A committed prefix is durable
+        // and does not count; sum the project's other uncommitted prefixes and add THIS prefix's
+        // projected total unless it is already committed. Enforced BEFORE any write.
+        const committed = await isCommitted(dir);
+        const siblings = await projectStagedSiblings(projectId, sourceHash);
+        const stagedPrefixCount = siblings.count + (committed ? 0 : 1);
+        const stagedBytes = siblings.bytes + (committed ? 0 : projectedTotal);
+        if (stagedPrefixCount > maxStagedPrefixesPerProject) {
+          throw new ArtifactStagingQuotaError("prefixes", maxStagedPrefixesPerProject);
+        }
+        if (stagedBytes > maxStagedBytesPerProject) {
+          throw new ArtifactStagingQuotaError("bytes", maxStagedBytesPerProject);
+        }
+
+        await mkdir(dirname(fileTarget), { recursive: true });
+        await mkdir(dirname(metaTarget), { recursive: true });
+        await writeFile(fileTarget, bytes);
+        const meta: FileMeta = {
+          contentType,
+          sha256: sha256Hex(bytes),
+          bytes: bytes.length,
+          stagedAt: clock(),
+        };
+        await writeFile(metaTarget, JSON.stringify(meta));
+      });
     },
 
     async commit(projectId, sourceHash, manifest) {
@@ -408,6 +614,53 @@ export function createLocalArtifactStore(deps: {
         throw error;
       }
       return { bytes: new Uint8Array(buffer), contentType: meta.contentType };
+    },
+
+    async sweepStaged(olderThanMs) {
+      // Walk `<rootDir>/<projectId>/<sourceHash>/`; drop every UNCOMMITTED prefix whose newest
+      // staging write is older than the cutoff. Committed prefixes (a `manifest.json` is present)
+      // and freshly-staged ones survive. An absent root is a clean no-op (nothing staged yet).
+      const cutoff = clock() - olderThanMs;
+      let projectDirs: Dirent[];
+      try {
+        projectDirs = await readdir(rootDir, { withFileTypes: true });
+      } catch (error) {
+        if (hasErrnoCode(error, "ENOENT")) {
+          return 0;
+        }
+        throw error;
+      }
+      let removed = 0;
+      for (const projectDirent of projectDirs) {
+        if (!projectDirent.isDirectory()) {
+          continue;
+        }
+        const projectDir = join(rootDir, projectDirent.name);
+        let prefixDirents: Dirent[];
+        try {
+          prefixDirents = await readdir(projectDir, { withFileTypes: true });
+        } catch (error) {
+          if (hasErrnoCode(error, "ENOENT")) {
+            continue;
+          }
+          throw error;
+        }
+        for (const prefixDirent of prefixDirents) {
+          if (!prefixDirent.isDirectory()) {
+            continue;
+          }
+          const dir = join(projectDir, prefixDirent.name);
+          if (await isCommitted(dir)) {
+            continue; // committed prefixes are durable — never swept
+          }
+          const { latestStagedAt } = await readPrefixStaged(join(dir, "meta"));
+          if (latestStagedAt <= cutoff) {
+            await rm(dir, { recursive: true, force: true });
+            removed += 1;
+          }
+        }
+      }
+      return removed;
     },
   };
 }

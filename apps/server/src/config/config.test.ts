@@ -89,6 +89,9 @@ describe("loadConfig — valid env", () => {
     expect(config.artifacts.rootDir).toBe("./data/artifacts");
     expect(config.artifacts.maxFileBytes).toBe(16_777_216);
     expect(config.artifacts.maxBundleBytes).toBe(134_217_728);
+    // M1 per-project staged (uncommitted) exhaustion caps — documented defaults.
+    expect(config.artifacts.maxStagedBytesPerProject).toBe(536_870_912);
+    expect(config.artifacts.maxStagedPrefixesPerProject).toBe(8);
     expect(config.artifacts.srsCacheDir).toBeUndefined();
   });
 
@@ -104,6 +107,8 @@ describe("loadConfig — valid env", () => {
         ARTIFACT_STORE_ROOT: "/srv/artifacts",
         ARTIFACT_MAX_FILE_BYTES: "1024",
         ARTIFACT_MAX_BUNDLE_BYTES: "4096",
+        ARTIFACT_MAX_STAGED_BYTES_PER_PROJECT: "8192",
+        ARTIFACT_MAX_STAGED_PREFIXES_PER_PROJECT: "3",
         SRS_CACHE_DIR: "/srv/srs",
         COMPILE_CHECK_TIMEOUT_MS: "15000",
         COMPILE_FULL_TIMEOUT_MS: "600000",
@@ -112,6 +117,8 @@ describe("loadConfig — valid env", () => {
     expect(config.artifacts.rootDir).toBe("/srv/artifacts");
     expect(config.artifacts.maxFileBytes).toBe(1024);
     expect(config.artifacts.maxBundleBytes).toBe(4096);
+    expect(config.artifacts.maxStagedBytesPerProject).toBe(8192);
+    expect(config.artifacts.maxStagedPrefixesPerProject).toBe(3);
     expect(config.artifacts.srsCacheDir).toBe("/srv/srs");
     expect(config.tunables.compileCheckTimeoutMs).toBe(15_000);
     expect(config.tunables.compileFullTimeoutMs).toBe(600_000);

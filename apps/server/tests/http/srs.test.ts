@@ -46,4 +46,12 @@ describe("registerSrsRoutes — GET /srs/*", () => {
     const response = await app.inject({ method: "GET", url: "/srs/..%2f..%2fetc%2fpasswd" });
     expect(response.statusCode).toBe(400);
   });
+
+  it("rejects a NUL byte in the path with a 4xx, never a 500 (L3)", async () => {
+    // A `%00` decodes to an embedded NUL. Without the shared `isSafePath` C0 guard this reaches
+    // `fs.readFile`, which throws a TypeError → a 500; the guard maps it to a clean 4xx instead.
+    const response = await app.inject({ method: "GET", url: "/srs/poison%00.bin" });
+    expect(response.statusCode).toBeGreaterThanOrEqual(400);
+    expect(response.statusCode).toBeLessThan(500);
+  });
 });

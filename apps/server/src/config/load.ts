@@ -120,6 +120,8 @@ function assemble(env: Env, modelRouting: ModelRoutingTable): Config {
       rootDir: env.ARTIFACT_STORE_ROOT,
       maxFileBytes: env.ARTIFACT_MAX_FILE_BYTES,
       maxBundleBytes: env.ARTIFACT_MAX_BUNDLE_BYTES,
+      maxStagedBytesPerProject: env.ARTIFACT_MAX_STAGED_BYTES_PER_PROJECT,
+      maxStagedPrefixesPerProject: env.ARTIFACT_MAX_STAGED_PREFIXES_PER_PROJECT,
       // Conditional so `exactOptionalPropertyTypes` holds — a `string | undefined` field is
       // fine to assign directly, but keep the explicit value for the optional SRS cache dir.
       srsCacheDir: env.SRS_CACHE_DIR,

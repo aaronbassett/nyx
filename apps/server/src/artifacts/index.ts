@@ -9,6 +9,7 @@ export {
   ArtifactFileTooLargeError,
   ArtifactHashMismatchError,
   ArtifactManifestIncompleteError,
+  ArtifactStagingQuotaError,
   InvalidSourceHashError,
   UnsafePathError,
 } from "./errors.js";

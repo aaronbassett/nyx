@@ -303,6 +303,31 @@ describe("store-error mapping", () => {
     await capped.app.close();
   });
 
+  it("answers 413 when a PUT exceeds the per-project staged-bytes quota (M1)", async () => {
+    // A tight per-project staged (uncommitted) byte budget → the first uploaded file already
+    // exceeds it, so the store's ArtifactStagingQuotaError maps to 413 through the route handler.
+    const capped = await bootArtifacts(
+      createInMemoryArtifactStore({ maxStagedBytesPerProject: 4 }),
+    );
+    const cookie = await capped.seedSession(OWNER);
+    const created = await capped.app.inject({
+      method: "POST",
+      url: "/projects",
+      headers: { cookie },
+      payload: { name: "demo" },
+    });
+    const project = created.json<Project>();
+    const put = await capped.app.inject({
+      method: "PUT",
+      url: `/projects/${project.id}/artifacts/${SOURCE_HASH}/files/${FILE_PATH}`,
+      headers: { cookie, "content-type": FILE_CONTENT_TYPE },
+      payload: Buffer.from(FILE_BYTES),
+    });
+    expect(put.statusCode).toBe(413);
+    expect(put.json<{ error: string; kind: string }>().kind).toBe("bytes");
+    await capped.app.close();
+  });
+
   it("answers 422 with the offending path for a commit missing an uploaded file", async () => {
     const project = await createOwned();
     // No PUT — the manifest lists a file that was never uploaded.

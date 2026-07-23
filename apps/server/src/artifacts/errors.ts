@@ -31,6 +31,29 @@ export class ArtifactBundleTooLargeError extends Error {
   }
 }
 
+/**
+ * A project whose total STAGED (uncommitted) footprint would exceed a per-project cap — either
+ * the cumulative staged-byte budget or the max count of concurrently-staged (uncommitted)
+ * prefixes. Distinct from {@link ArtifactBundleTooLargeError} (a single prefix's committed size):
+ * this bounds how much a project may hold UNCOMMITTED across ALL prefixes, so an attacker cannot
+ * exhaust the shared staging volume by opening unbounded distinct `sourceHash` prefixes and
+ * abandoning each just under the bundle cap. Routes map it to 413 (a resource cap, like the
+ * bundle/file caps).
+ */
+export class ArtifactStagingQuotaError extends Error {
+  constructor(
+    readonly kind: "bytes" | "prefixes",
+    readonly limit: number,
+  ) {
+    super(
+      kind === "bytes"
+        ? `artifact staging exceeds the per-project staged-bytes cap (limit ${String(limit)} bytes)`
+        : `artifact staging exceeds the per-project uncommitted-prefix cap (limit ${String(limit)})`,
+    );
+    this.name = "ArtifactStagingQuotaError";
+  }
+}
+
 /** A committed manifest whose listed sha256 does not match the uploaded bytes. */
 export class ArtifactHashMismatchError extends Error {
   constructor(readonly path: string) {

@@ -1535,6 +1535,42 @@ describe("P2 compile delegation: browser client + compile:results rendezvous (Ta
     expect(outcome.diagnostics).toHaveLength(1);
   });
 
+  it("(e) the compile:results HANDLER forwards ctx.projectId — a foreign delivery is dropped, the owner's resolves (Defense 4 regression, L5)", async () => {
+    // A COORDINATOR-LEVEL regression mirroring the `test:results` Defense 4 test: it pins that the
+    // `compile:results` handler passes the delivering connection's OWN `ctx.projectId` to
+    // `compileInbox.deliver`. If a refactor silently dropped that argument, a FOREIGN tenant's
+    // verdict would resolve the victim's wait — this test would then fail. The wait is armed
+    // DIRECTLY on the shared inbox (owned by PROJECT), and both deliveries go THROUGH the handler.
+    const inbox = createCompileResultsInbox({ delay: neverDelay });
+    const coordinator = createTurnCoordinator(baseDeps({ compileInbox: inbox }));
+    const fake = makeFakeRouter();
+    coordinator.handlers(fake.router);
+    const { ctx: ownerCtx } = makeCtx(); // projectId === PROJECT (the turn owner)
+    const { ctx: foreignCtx } = makeCtx(undefined, "attacker-project"); // a DIFFERENT tenant
+
+    // Arm a wait OWNED by PROJECT for (turn-1, check).
+    const pending = inbox.register("turn-1", "check", PROJECT, CHECK_TIMEOUT_MS);
+
+    // The attacker delivers a GREEN check for the victim's turn — the handler forwards ITS
+    // ctx.projectId (attacker-project), so the inbox drops it (Defense 4). The wait stays pending.
+    await fake.invoke(compileResultsEvent("turn-1", "check", { ok: true }), foreignCtx);
+    const UNRESOLVED = Symbol("unresolved");
+    expect(await Promise.race([pending, Promise.resolve(UNRESOLVED)])).toBe(UNRESOLVED);
+
+    // The real OWNER then delivers a FAILING check — THIS resolves the wait (owner's verdict wins),
+    // so the recorded outcome is the owner's fail, never the attacker's forged pass.
+    await fake.invoke(
+      compileResultsEvent("turn-1", "check", {
+        ok: false,
+        diagnostics: [{ severity: "error", source: "compactc", message: "boom" }],
+      }),
+      ownerCtx,
+    );
+    const resolved = await pending;
+    expect(resolved?.ok).toBe(false);
+    expect(resolved?.diagnostics).toHaveLength(1);
+  });
+
   it("(d) no compile:results ever arrives → the turn SETTLES (exhausted), never hangs (no-hang D42)", async () => {
     // A REAL supervisor + REAL browser client, but the inbox times out IMMEDIATELY and NO
     // compile:results is ever delivered. Every per-cycle check resolves FAILING (a dead/silent

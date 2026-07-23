@@ -38,6 +38,7 @@ import {
   ArtifactFileTooLargeError,
   ArtifactHashMismatchError,
   ArtifactManifestIncompleteError,
+  ArtifactStagingQuotaError,
   InvalidSourceHashError,
   UnsafePathError,
 } from "./errors.js";
@@ -83,8 +84,8 @@ async function loadOwned(
 
 /**
  * Map a named artifact-store error to its HTTP status + body, or rethrow (→ 500) if unknown:
- *  - size caps → 413; a bad source-hash / unsafe path → 400; a manifest gap / hash mismatch
- *    → 422 carrying the offending `path`.
+ *  - size caps (per-file / bundle) + the per-project staging quota → 413; a bad source-hash /
+ *    unsafe path → 400; a manifest gap / hash mismatch → 422 carrying the offending `path`.
  */
 function handleArtifactStoreError(reply: FastifyReply, error: unknown): FastifyReply {
   if (error instanceof ArtifactFileTooLargeError) {
@@ -94,6 +95,11 @@ function handleArtifactStoreError(reply: FastifyReply, error: unknown): FastifyR
   }
   if (error instanceof ArtifactBundleTooLargeError) {
     return reply.code(413).send({ error: "artifact bundle too large", limit: error.limit });
+  }
+  if (error instanceof ArtifactStagingQuotaError) {
+    return reply
+      .code(413)
+      .send({ error: "artifact staging quota exceeded", kind: error.kind, limit: error.limit });
   }
   if (error instanceof InvalidSourceHashError) {
     return reply.code(400).send({ error: "invalid source hash" });

@@ -25,6 +25,7 @@ import {
   ArtifactFileTooLargeError,
   ArtifactHashMismatchError,
   ArtifactManifestIncompleteError,
+  ArtifactStagingQuotaError,
   InvalidSourceHashError,
   UnsafePathError,
 } from "../../src/artifacts/index.js";
@@ -60,14 +61,30 @@ function manifestFor(
   };
 }
 
+/** Caps + clock overrides a test may hand `make` (all optional — sane defaults otherwise). */
+interface StoreCaps {
+  maxFileBytes?: number;
+  maxBundleBytes?: number;
+  maxStagedBytesPerProject?: number;
+  maxStagedPrefixesPerProject?: number;
+  clock?: () => number;
+}
+
 /** Each entry supplies a fresh store + an optional teardown; shared by both impls. */
 interface StoreCase {
   readonly name: string;
-  make(caps?: { maxFileBytes?: number; maxBundleBytes?: number }): Promise<ArtifactStore>;
+  make(caps?: StoreCaps): Promise<ArtifactStore>;
   cleanup(): Promise<void>;
 }
 
 const tmpRoots: string[] = [];
+
+/** Register + return a fresh temp root (swept in `afterAll`). */
+async function freshRoot(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "nyx-artifacts-"));
+  tmpRoots.push(root);
+  return root;
+}
 
 const cases: StoreCase[] = [
   {
@@ -77,21 +94,32 @@ const cases: StoreCase[] = [
         createInMemoryArtifactStore({
           maxFileBytes: caps?.maxFileBytes ?? 1_000_000,
           maxBundleBytes: caps?.maxBundleBytes ?? 10_000_000,
+          ...(caps?.maxStagedBytesPerProject === undefined
+            ? {}
+            : { maxStagedBytesPerProject: caps.maxStagedBytesPerProject }),
+          ...(caps?.maxStagedPrefixesPerProject === undefined
+            ? {}
+            : { maxStagedPrefixesPerProject: caps.maxStagedPrefixesPerProject }),
+          ...(caps?.clock === undefined ? {} : { clock: caps.clock }),
         }),
       ),
     cleanup: () => Promise.resolve(),
   },
   {
     name: "local-disk",
-    make: async (caps) => {
-      const root = await mkdtemp(join(tmpdir(), "nyx-artifacts-"));
-      tmpRoots.push(root);
-      return createLocalArtifactStore({
-        rootDir: root,
+    make: async (caps) =>
+      createLocalArtifactStore({
+        rootDir: await freshRoot(),
         maxFileBytes: caps?.maxFileBytes ?? 1_000_000,
         maxBundleBytes: caps?.maxBundleBytes ?? 10_000_000,
-      });
-    },
+        ...(caps?.maxStagedBytesPerProject === undefined
+          ? {}
+          : { maxStagedBytesPerProject: caps.maxStagedBytesPerProject }),
+        ...(caps?.maxStagedPrefixesPerProject === undefined
+          ? {}
+          : { maxStagedPrefixesPerProject: caps.maxStagedPrefixesPerProject }),
+        ...(caps?.clock === undefined ? {} : { clock: caps.clock }),
+      }),
     cleanup: () => Promise.resolve(),
   },
 ];
@@ -249,6 +277,89 @@ describe.each(cases)("ArtifactStore ($name)", (testCase) => {
     ).resolves.toBeUndefined();
   });
 
+  it("putFile REJECTS UnsafePathError for a NUL / C0 control char in the path (L3)", async () => {
+    // A `\0` truncates at the syscall boundary (poison null) and makes Node fs throw a TypeError
+    // (→ a 500) unless rejected up-front. The shared `isSafePath` now refuses the whole C0 range.
+    const bytes = enc.encode("x");
+    for (const path of ["a\u0000.bin", "dir/\u0000name", "a\u0001b.bin", "a\u001fb.bin"]) {
+      await expect(
+        store.putFile(PROJECT, SOURCE_HASH, path, bytes, "application/octet-stream"),
+      ).rejects.toBeInstanceOf(UnsafePathError);
+    }
+  });
+
+  it("putFile REJECTS ArtifactStagingQuotaError past the per-project staged-BYTES cap (M1)", async () => {
+    // Generous per-prefix bundle cap, but a tight per-project STAGED (uncommitted) byte budget:
+    // two distinct sourceHash prefixes together exceed it → the second PUT is refused.
+    const capped = await testCase.make({ maxBundleBytes: 1_000, maxStagedBytesPerProject: 10 });
+    const otherHash = "b".repeat(64);
+    await capped.putFile(
+      PROJECT,
+      SOURCE_HASH,
+      "a.bin",
+      enc.encode("123456"),
+      "application/octet-stream",
+    ); // 6 staged
+    await expect(
+      capped.putFile(PROJECT, otherHash, "b.bin", enc.encode("12345"), "application/octet-stream"), // +5 → 11 > 10
+    ).rejects.toBeInstanceOf(ArtifactStagingQuotaError);
+  });
+
+  it("putFile REJECTS ArtifactStagingQuotaError past the per-project uncommitted-PREFIX cap; committed prefixes do not count (M1)", async () => {
+    const capped = await testCase.make({ maxStagedPrefixesPerProject: 1 });
+    const hashA = "a".repeat(64);
+    const hashB = "b".repeat(64);
+    const hashC = "c".repeat(64);
+    const bytes = enc.encode("x");
+
+    // Prefix A is staged AND committed → durable, no longer counts against the staged-prefix cap.
+    await capped.putFile(PROJECT, hashA, "f.bin", bytes, "application/octet-stream");
+    await capped.commit(
+      PROJECT,
+      hashA,
+      manifestFor([{ path: "f.bin", bytes, contentType: "application/octet-stream" }]),
+    );
+
+    // Prefix B is the ONE allowed uncommitted prefix …
+    await expect(
+      capped.putFile(PROJECT, hashB, "f.bin", bytes, "application/octet-stream"),
+    ).resolves.toBeUndefined();
+    // … prefix C would be a SECOND uncommitted prefix → refused (A being committed did not count).
+    await expect(
+      capped.putFile(PROJECT, hashC, "f.bin", bytes, "application/octet-stream"),
+    ).rejects.toBeInstanceOf(ArtifactStagingQuotaError);
+  });
+
+  it("sweepStaged removes only uncommitted-and-old prefixes; committed + fresh survive (M1)", async () => {
+    let t = 1_000;
+    const capped = await testCase.make({ clock: () => t });
+    const oldHash = "a".repeat(64);
+    const doneHash = "b".repeat(64);
+    const freshHash = "c".repeat(64);
+    const bytes = enc.encode("payload");
+
+    // OLD: staged at t=1000, never committed.
+    await capped.putFile(PROJECT, oldHash, "f.bin", bytes, "application/octet-stream");
+    // DONE: staged AND committed at t=1000 (durable — must survive the sweep).
+    await capped.putFile(PROJECT, doneHash, "f.bin", bytes, "application/octet-stream");
+    await capped.commit(
+      PROJECT,
+      doneHash,
+      manifestFor([{ path: "f.bin", bytes, contentType: "application/octet-stream" }]),
+    );
+
+    // Advance the clock, then stage FRESH — its recent stagedAt keeps it above the cutoff.
+    t = 5_000;
+    await capped.putFile(PROJECT, freshHash, "f.bin", bytes, "application/octet-stream");
+
+    // Cutoff = 5000 - 2000 = 3000: OLD (stagedAt 1000) is reclaimed; FRESH (5000) + DONE survive.
+    const removed = await capped.sweepStaged(2_000);
+    expect(removed).toBe(1);
+    expect(await capped.getFile(PROJECT, oldHash, "f.bin")).toBeNull();
+    expect(await capped.getManifest(PROJECT, doneHash)).not.toBeNull();
+    expect(await capped.getFile(PROJECT, freshHash, "f.bin")).not.toBeNull();
+  });
+
   it("a second commit for the same (projectId, sourceHash) is idempotent", async () => {
     const wasm = enc.encode("(module)");
     await store.putFile(PROJECT, SOURCE_HASH, "contract.wasm", wasm, "application/wasm");
@@ -278,5 +389,27 @@ describe.each(cases)("ArtifactStore ($name)", (testCase) => {
     expect(await store.getManifest(PROJECT, otherHash)).toBeNull();
     const fromB = await store.getFile(PROJECT, otherHash, "f.bin");
     expect(fromB ? new Uint8Array(fromB.bytes) : null).toEqual(b);
+  });
+});
+
+describe("createLocalArtifactStore — per-prefix write serialization (L2 TOCTOU)", () => {
+  it("two concurrent PUTs to ONE prefix whose sum exceeds the bundle cap → exactly one rejects", async () => {
+    // The disk `putFile` reads the prefix's staged total, checks the bundle cap, THEN writes.
+    // Without per-prefix serialization two racers both read total 0 and both pass (0 rejects) —
+    // a TOCTOU. The mutex serializes them, so the second sees the first's bytes and is refused.
+    const store = createLocalArtifactStore({
+      rootDir: await freshRoot(),
+      maxFileBytes: 1_000,
+      maxBundleBytes: 10,
+    });
+    const ct = "application/octet-stream";
+    const results = await Promise.allSettled([
+      store.putFile(PROJECT, SOURCE_HASH, "a.bin", enc.encode("123456"), ct), // 6
+      store.putFile(PROJECT, SOURCE_HASH, "b.bin", enc.encode("12345"), ct), // +5 → 11 > 10
+    ]);
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(rejected).toHaveLength(1);
+    const reason: unknown = rejected[0]?.status === "rejected" ? rejected[0].reason : undefined;
+    expect(reason).toBeInstanceOf(ArtifactBundleTooLargeError);
   });
 });

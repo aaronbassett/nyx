@@ -55,6 +55,11 @@ import { createTurnCoordinator } from "./turn/coordinator.js";
  */
 const DEPLOY_WALLET_LOW_THRESHOLD_TDUST = 0n;
 
+/** Reclaim an abandoned staged (uncommitted) artifact prefix once it is older than this (M1). */
+const STAGING_MAX_AGE_MS = 60 * 60_000; // 1 h
+/** Cadence of the unref'd boot sweep that reclaims abandoned staged artifact prefixes (M1). */
+const STAGING_SWEEP_INTERVAL_MS = 15 * 60_000; // 15 min
+
 /** Unref'd delay so a bounded compile-inbox wait never pins the process (mirrors the coordinator). */
 function unrefDelay(ms: number): Promise<void> {
   return new Promise<void>((resolve) => {
@@ -143,6 +148,9 @@ async function main(): Promise<void> {
     rootDir: config.artifacts.rootDir,
     maxFileBytes: config.artifacts.maxFileBytes,
     maxBundleBytes: config.artifacts.maxBundleBytes,
+    // M1 — per-project staged (uncommitted) exhaustion caps for the shared disk volume.
+    maxStagedBytesPerProject: config.artifacts.maxStagedBytesPerProject,
+    maxStagedPrefixesPerProject: config.artifacts.maxStagedPrefixesPerProject,
   });
   // ONE shared rendezvous inbox backs both the per-turn client (which awaits `compile:results`)
   // and the WS handler (which delivers to it, ownership-gated). `config.publicOrigin` builds the
@@ -305,6 +313,22 @@ async function main(): Promise<void> {
   reconcileScheduler.start();
   app.addHook("onClose", () => {
     reconcileScheduler.stop();
+  });
+
+  // M1 — reclaim abandoned staged (uncommitted) artifact prefixes on an UNREF'd interval so a
+  // client that PUTs green artifacts then never commits cannot pin the shared disk forever. The
+  // timer never keeps the process alive and is cleared on close; a sweep fault is logged, not fatal.
+  const stagingSweepTimer = setInterval(() => {
+    void artifactStore.sweepStaged(STAGING_MAX_AGE_MS).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      process.stderr.write(
+        `${JSON.stringify({ severity: "warn", source: "artifact-sweep", event: "sweep-error", message })}\n`,
+      );
+    });
+  }, STAGING_SWEEP_INTERVAL_MS);
+  stagingSweepTimer.unref();
+  app.addHook("onClose", () => {
+    clearInterval(stagingSweepTimer);
   });
 
   await app.listen({ port: config.port, host: "0.0.0.0" });

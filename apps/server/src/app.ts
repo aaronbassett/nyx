@@ -248,7 +248,16 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       // because the write routes resolve ownership through the project store; the GET carries no
       // session gate (unguessable content-hash prefixes are the access control). An in-memory
       // store is the default so existing fixtures need no change (see ServerDeps.artifactStore).
-      const artifacts = deps.artifactStore ?? createInMemoryArtifactStore();
+      // L4: thread the config artifact caps into that default so a buildServer caller that does
+      // NOT inject a store still gets FINITE per-file / bundle / staging caps, never `Infinity`.
+      const artifacts =
+        deps.artifactStore ??
+        createInMemoryArtifactStore({
+          maxFileBytes: deps.config.artifacts.maxFileBytes,
+          maxBundleBytes: deps.config.artifacts.maxBundleBytes,
+          maxStagedBytesPerProject: deps.config.artifacts.maxStagedBytesPerProject,
+          maxStagedPrefixesPerProject: deps.config.artifacts.maxStagedPrefixesPerProject,
+        });
       registerArtifactRoutes(app, { store: projectStore, artifacts, requireSession });
 
       // Token-gated (NOT session-gated) smart-HTTP git surface. Registered as a SEPARATE
