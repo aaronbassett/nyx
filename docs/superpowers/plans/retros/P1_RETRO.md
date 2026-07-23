@@ -22,9 +22,13 @@ All eight tasks completed; no deferrals. Both spikes ran concurrently on Fable 5
 
 **Coordinator internals:** `capTestResults` was already wired (coordinator.ts:571/:879/:889 + supervisor.ts:701) — the Phase 7 "US1 must wire" flag is fully satisfied; only coverage telemetry needed adding.
 
+## Review loop (dual: Opus whole-branch + Fable money-path)
+
+No Criticals; settle-always and once-per-turn-commit confirmed proven on every path. Fixes applied in `32ea8d5` (+6 tests): **I1** the post-`ready` record+coverage block is now one throw-proof guard — an injected throwing `logCoverage`/`logError` previously rejected inside the `withInfraRetry`-wrapped `runFullCompile`, causing duplicate full compiles and duplicate `artifacts:ready` (the branch's only D35 violation path; guard proven load-bearing by reproducing the 4× retry storm in a test). **I2 (decision under autonomy rule):** the new pre-settle awaits (`commitFiles`, `recordGreenBuild`) are now bounded by a `Promise.race` timeout (injectable timer, default 10 s) treating timeout as the handled failure branch — a hung store can no longer postpone `turn:settled`. **F1 (decision):** the plan-specified coverage telemetry is information-free on real green runs (the wire DTO carries only FAILING test names; green ⇒ `failures: []` ⇒ all-uncovered report). Tests now assert the honest all-uncovered green case; the call site documents it. The real fix — carrying passing test names in `test:results` — is a **protocol + web testrunner + server change recorded here for P2/P6 re-planning** to schedule deliberately. Minors M3–M6 applied (self-contained persist catch, all four persist call sites tested, rejecting-record test, ownership-checked projectId bound structurally in the coordinator closures). Known carry: `lastResultsByProject`/`consoleByProject`/`projects` maps share a coordinator-lifetime no-eviction pattern — evict together in a future connection-cleanup pass.
+
 ## Deferred items
 
-None. (NyxtVault `deposit`/`burn` were not exercised on-chain by SPIKE-1 — deploy+witness confirmed; SPIKE-2 exercised `deposit` end-to-end twice, so the gap closed across the pair.)
+None. (NyxtVault `deposit`/`burn` were not exercised on-chain by SPIKE-1 — deploy+witness confirmed; SPIKE-2 exercised `deposit` end-to-end twice, so the gap closed across the pair. The coverage-telemetry protocol enrichment is recorded above as future re-planning input, not a deferral of this plan's scope — the plan's specified wiring shipped and is tested honestly.)
 
 ## Impact on remaining plans
 
