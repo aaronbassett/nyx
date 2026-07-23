@@ -1,0 +1,17 @@
+{
+  "compilerVersion": "0.31.1",
+  "languageVersion": "0.23.0",
+  "runtimeVersion": "0.16.0",
+  "zkirVersion": "2.1.0",
+  "compactRev": "0da5b0452eb0c1053d42418bf34b12cc29c7d63e",
+  "provenance": {
+    "sourceRepo": "https://github.com/aaronbassett/compactc-wasm.git",
+    "pocCommit": "95b15912f884d024612b5e398e06759d16e41244",
+    "artifacts": [
+      "compactc.js",
+      "compactc.wasm",
+      "compactc.data"
+    ],
+    "generatedAt": "2026-07-23T20:20:32.455Z"
+  }
+}

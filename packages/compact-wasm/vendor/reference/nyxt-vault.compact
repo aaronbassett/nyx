@@ -1,0 +1,195 @@
+pragma language_version >= 0.23;
+
+import CompactStandardLibrary;
+
+// ── NyxtVault ────────────────────────────────────────────────────────────────
+// The Nyx platform's dogfood deposit contract (US6, decision D45 "Architecture C").
+//
+// One guaranteed-phase circuit, `deposit`, atomically:
+//   1. receives `amount` of unshielded tNIGHT (the native token) into the contract,
+//   2. mints `amount` of the contract's own unshielded fungible token NYXT (1:1)
+//      straight into the contract's own vault (kernel.self()), and
+//   3. records the opaque, orchestrator-issued `depositRef` in public ledger state
+//      so the orchestrator can attribute the deposit off-chain (Compact has no
+//      events and no trustworthy msg.sender — the public record is the only
+//      attribution channel).
+//
+// Duplicate refs are rejected on-chain (idempotency / anti-double-spend guard).
+//
+// A second guaranteed-phase circuit, `burn` (US10, D55), lets the platform's
+// reconcile job destroy NYXT the vault minted so on-chain supply tracks
+// outstanding credit. `burn` is ORCHESTRATOR-ONLY and exactly-once-per-watermark
+// (see the extended notes just above the circuit).
+
+// depositRef  ->  tNIGHT received  (== NYXT minted, 1:1).
+// The value is the on-chain source of truth for the credited amount.
+export ledger deposits: Map<Bytes<32>, Uint<128>>;
+
+// Watermarks already burned. The reconcile job keys each burn by a monotonic
+// watermark; recording it on-chain makes `burn` idempotent per watermark, exactly
+// as `deposits` makes `deposit` idempotent per ref. A Set (membership only) is the
+// minimal state — the burned *amount* is not attribution data the way a deposit's
+// credited amount is, so it is not retained.
+export ledger burnedWatermarks: Set<Bytes<32>>;
+
+// ── Orchestrator authority (US10, D55) ───────────────────────────────────────
+// Compact has NO msg.sender and NO trustworthy caller identity, so "orchestrator-
+// only" CANNOT be a caller check. `ownPublicKey()` is the prover-supplied Zswap
+// coin public key — unbound to the tx signer — so an ownPublicKey()-based gate is
+// bypassable and is a documented anti-pattern. Instead this uses the SECURE
+// witness-secret pattern (the proven zkloan pattern):
+//
+//   * The orchestrator holds a 32-byte secret in its private state (never on-chain).
+//   * At construction the contract pins a domain-separated hash of that secret —
+//     the authority COMMITMENT — into sealed public ledger state.
+//   * `burn` re-derives the commitment from the caller-supplied secret INSIDE the
+//     circuit and asserts equality against the pinned commitment.
+//
+// Soundness: only a prover holding the exact secret whose hash was pinned can
+// reproduce the equality inside the ZK proof. A forged secret hashes to a
+// different value and the assertion fails. The secret never leaves the prover and
+// is never disclosed; only its one-way hash (the commitment) is public. This moves
+// the trust boundary (witness -> derived authority) into code the deployer controls.
+struct OrchestratorSecretKey {
+  bytes: Bytes<32>;
+}
+
+export struct OrchestratorAuthority {
+  bytes: Bytes<32>;
+}
+
+// The orchestrator's private secret, supplied off-chain by its private state.
+witness orchestratorSecret(): OrchestratorSecretKey;
+
+// Domain-separated, deterministic derivation of the authority commitment from the
+// secret. Deterministic => the same secret reproduces the same commitment across
+// transactions, which is what makes the constructor pin and the burn check line up.
+pure circuit deriveOrchestratorAuthority(sk: OrchestratorSecretKey): OrchestratorAuthority {
+  return OrchestratorAuthority { bytes: persistentHash<Vector<2, Bytes<32>>>(
+                                          [pad(32, "nyx:nyxt:orchestrator:v1"), sk.bytes,]
+                                          ), };
+}
+
+// Pinned once at deploy from the deployer/orchestrator's secret; `sealed` makes it
+// write-once and immutable (no runtime path can rotate or overwrite the authority).
+export sealed ledger orchestratorAuthority: OrchestratorAuthority;
+
+constructor() {
+  // Disclosing the derived commitment is correct and required: it is a one-way
+  // hash of the secret and is the public authority anchor. The secret stays private.
+  orchestratorAuthority = disclose(deriveOrchestratorAuthority(orchestratorSecret()));
+}
+
+// Domain separator for NYXT, this contract's native unshielded fungible token.
+// The token color is deterministic: tokenType(nyxtDomainSep(), kernel.self()).
+pure circuit nyxtDomainSep(): Bytes<32> {
+  return pad(32, "nyx:nyxt:v1");
+}
+
+export circuit deposit(depositRef: Bytes<32>, amount: Uint<128>): [] {
+  // All deposit inputs are public attribution data: the depositRef is written to
+  // public state and the amount drives the public token effects. Disclose each
+  // exactly once, here, then reuse the public bindings downstream.
+  const ref = disclose(depositRef);
+  const amt = disclose(amount);
+
+  // Idempotency / anti-double-spend: a ref may only ever be recorded once.
+  assert(!deposits.member(ref), "NyxtVault: depositRef already present");
+
+  // A deposit must move value; a zero deposit would burn a one-time ref while
+  // crediting nothing.
+  assert(amt > 0, "NyxtVault: amount must be positive");
+
+  // NYXT is minted with a Uint<64> value; cap a single deposit accordingly so the
+  // 1:1 mint stays exact (2^64-1 base units is far above any realistic tNIGHT top-up).
+  assert(amt <= 18446744073709551615, "NyxtVault: amount exceeds per-deposit mint cap");
+
+  // 1. Receive the user's tNIGHT into the contract. tNIGHT is an *external* input
+  //    the user's wallet funds when it balances the transaction, so it must be
+  //    claimed with receiveUnshielded.
+  receiveUnshielded(nativeToken(), amt);
+
+  // 2. Mint NYXT 1:1 straight into the contract's own vault. Minting to
+  //    kernel.self() credits the vault's unshielded balance directly — the
+  //    self-mint IS the deposit into the vault. A trailing receiveUnshielded would
+  //    DOUBLE-COUNT the contract's unshielded input (verified on compiler 0.31.1:
+  //    mint-to-self alone yields input == value; mint-to-self + receive yields
+  //    input == 2*value and overflows at value == 2^64-1).
+  mintUnshieldedToken(
+    nyxtDomainSep(),
+    amt as Uint<64>,
+    left<ContractAddress, UserAddress>(kernel.self()),
+    );
+
+  // 3. Public, append-only attribution record.
+  deposits.insert(ref, amt);
+}
+
+// ── burn (US10, D55) ─────────────────────────────────────────────────────────
+// Reduces the vault's own NYXT balance by `amount`, burning NYXT the vault minted
+// so on-chain supply approximates outstanding credit after the reconcile job runs.
+//
+// SEMANTICS (review L1): this reduces the VAULT's NYXT balance, not total NYXT
+// supply — the NYXT is sent to the unspendable all-zero address (see step 6), so
+// the vault balance drops by `amount` while total minted is unchanged. This is
+// correct for reconcile, which measures the vault balance (its Source 3), and
+// permanence rests on the all-zero UserAddress having no signing key.
+//
+// ORCHESTRATOR-ONLY: gated on the witness-secret authority (see the authority
+// notes near the top). Only the holder of the pinned orchestrator secret can pass.
+// Authority is `sealed` (write-once): a lost/compromised secret cannot be rotated
+// in place — the only remedy is a fresh deployment (permanent-contract model), so
+// the orchestrator secret must be backed up and access-controlled (review L3).
+//
+// EXACTLY-ONCE-PER-WATERMARK: a `watermark` already in `burnedWatermarks` is
+// rejected, so a replayed/duplicated reconcile burn is a no-op on-chain — mirroring
+// how `deposit` rejects a duplicate `depositRef`.
+//
+// Guaranteed-phase (no kernel.checkpoint): the whole burn commits atomically or
+// not at all.
+export circuit burn(amount: Uint<64>, watermark: Bytes<32>): [] {
+  // 1. Authorization FIRST (cheapest security gate; fail fast for a wrong caller).
+  //    Re-derive the authority from the caller's secret and compare to the pinned
+  //    commitment. A forged secret hashes differently and fails here. No disclose:
+  //    the witness value is consumed by the hash-and-compare and only pass/fail
+  //    (not the secret) is observable — exactly the proven zkloan gate shape.
+  assert(orchestratorAuthority == deriveOrchestratorAuthority(orchestratorSecret()),
+         "NyxtVault: caller is not the orchestrator"
+         );
+
+  // 2. `watermark` and `amount` are public: the watermark is written to public
+  //    state and the amount drives public token effects. Disclose each once here.
+  const wm = disclose(watermark);
+  const amt = disclose(amount);
+
+  // 3. Idempotency: a watermark may only ever be burned once.
+  assert(!burnedWatermarks.member(wm), "NyxtVault: watermark already burned");
+
+  // 4. A burn must move value; a zero burn would consume a one-time watermark and
+  //    destroy nothing.
+  assert(amt > 0, "NyxtVault: amount must be positive");
+
+  // 5. Reject burning more than the vault holds. `unshieldedBalanceGte` reads the
+  //    vault's NYXT balance at the START of execution (kernel.balance) and, unlike
+  //    the exact `unshieldedBalance`, does not force a construction-vs-application
+  //    exact-match. NYXT's color is derived exactly as the mint derives it.
+  const nyxtColor = tokenType(nyxtDomainSep(), kernel.self());
+  assert(unshieldedBalanceGte(nyxtColor, amt as Uint<128>), "NyxtVault: burn exceeds vault balance");
+
+  // 6. Burn: send the NYXT to the all-zero UserAddress — the unshielded analog of
+  //    the stdlib's `shieldedBurnAddress()` (which sends to the all-zero coin key).
+  //    `sendUnshielded` to a non-self recipient increments the vault's unshielded
+  //    OUTPUTS by `amt` (reducing its net balance) and, because the recipient is
+  //    not self, does NOT auto-receive — the value leaves the vault permanently
+  //    into an address for which no signing key exists, so it can never be spent.
+  //    Verified on the installed toolchain: stdlib exposes no burnUnshieldedToken;
+  //    this send-to-zero is the canonical unshielded burn.
+  sendUnshielded(
+    nyxtColor,
+    amt as Uint<128>,
+    right<ContractAddress, UserAddress>(default<UserAddress>)
+    );
+
+  // 7. Record the burned watermark so a replay is rejected at step 3 next time.
+  burnedWatermarks.insert(wm);
+}

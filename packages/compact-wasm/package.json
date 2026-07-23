@@ -1,0 +1,22 @@
+{
+  "name": "@nyx/compact-wasm",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./meta": {
+      "types": "./src/meta.ts",
+      "default": "./src/meta.ts"
+    }
+  },
+  "scripts": {
+    "vendor": "node scripts/vendor.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  }
+}

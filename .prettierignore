@@ -1,6 +1,7 @@
 node_modules/
 dist/
 build/
+packages/compact-wasm/vendor/
 pnpm-lock.yaml
 pocs/
 .claude/
