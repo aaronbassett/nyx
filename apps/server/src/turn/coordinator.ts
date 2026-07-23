@@ -179,8 +179,12 @@ export interface TurnCoordinatorDeps {
   readonly ledger: LedgerStore;
   /** Chat persistence + rehydration (D23); the cold-start signal (FR-003). */
   readonly chat: ChatStore;
-  /** Turn-end file persistence (US7 store; the US13 exports + US14 editor read path depend on it). */
-  readonly projectStore: Pick<ProjectStore, "commit">;
+  /**
+   * Turn-end file persistence (US7 store; the US13 exports + US14 editor read path depend on it)
+   * plus latest-green-build recording (FR-054): a `ready` full compile is persisted so the US8
+   * deploy handler's greenness gate can read it at deploy time.
+   */
+  readonly projectStore: Pick<ProjectStore, "commit" | "recordGreenBuild">;
   /** The three named MCP clients the swarm retrieves + compiles through. */
   readonly mcp: TurnCoordinatorMcp;
   /** The flat pre-turn reserve in NYXT base units (D34/D47). */
@@ -607,8 +611,28 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
         // `{ ok, diagnostics, … }` verbatim (a structural superset of `CheckOutcome`).
         checkCompile: (input) => deps.compileClient.check(toCheckRequest(input)),
         // The green-only FULL compile: a fresh orchestrator per turn, so `artifacts:ready`
-        // is at-most-once by construction; it announces to the CURRENT live connection.
-        runFullCompile: (input) => orchestratorFor(() => state.liveCtx).runTurn(input),
+        // is at-most-once by construction; it announces to the CURRENT live connection. On a
+        // `ready` outcome, persist it as the project's latest green build (FR-054) so the US8
+        // deploy handler's greenness gate reads it at deploy time. A record failure must NEVER
+        // fail the turn — the artifacts are already announced; a deploy simply won't see the
+        // build. Loud-log and continue (mirrors the commitFiles backstop).
+        runFullCompile: async (input) => {
+          const outcome = await orchestratorFor(() => state.liveCtx).runTurn(input);
+          if (outcome.kind === "ready") {
+            try {
+              await deps.projectStore.recordGreenBuild(input.projectId, {
+                urlPrefix: outcome.urlPrefix,
+                compilerVersion: outcome.compilerVersion,
+              });
+            } catch (error) {
+              logError("green-build record failed; turn continues (deploy won't see this build)", {
+                projectId: input.projectId,
+                error,
+              });
+            }
+          }
+          return outcome;
+        },
         // Signal the client to run the verify suite, then await its `test:results` (bounded).
         // The wait is registered as OWNED by this project (Defense 4): only a connection
         // authorized for `projectId` can later deliver its verdict via the `test:results`

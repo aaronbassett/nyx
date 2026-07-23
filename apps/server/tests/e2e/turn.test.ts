@@ -264,7 +264,10 @@ function makeHarness(options: { intent: IntentResult; verdicts: Verdict[] }): Ha
     compileClient: makeCompileClient(trace),
     ledger: ledger.ledger,
     chat: makeChat(),
-    projectStore: { commit: () => Promise.resolve({ version: 1 }) },
+    projectStore: {
+      commit: () => Promise.resolve({ version: 1 }),
+      recordGreenBuild: () => Promise.resolve(),
+    },
     mcp: stubMcp,
     flatReserve: FLAT_RESERVE,
     now: () => TS,

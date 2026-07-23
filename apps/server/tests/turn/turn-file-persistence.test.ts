@@ -417,6 +417,13 @@ describe("Turn-end file persistence — commitFiles → ProjectStore.commit", ()
     const files = await store.getFiles(projectId);
     expect(files.length).toBeGreaterThan(0);
     expect(files.map((file) => file.path).sort()).toEqual(["contract.compact", "src/App.tsx"]);
+
+    // Task 5: the green FULL compile's `ready` outcome was persisted as the latest green
+    // build (FR-054), so the US8 deploy handler's greenness gate reads it at deploy time.
+    await expect(store.getLatestGreenBuild(projectId)).resolves.toEqual({
+      urlPrefix: "https://r2.nyx.test/proj/abc/",
+      compilerVersion: "0.24.0",
+    });
   });
 
   it("an EXHAUSTED turn still commits its work-in-progress files (D21 keeps WIP)", async () => {

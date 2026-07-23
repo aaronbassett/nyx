@@ -25,6 +25,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { ManifestEntrySchema, ProjectFileResponseSchema, ProjectSchema } from "@nyx/protocol";
 import type { ChatMessage, ManifestEntry, Project, ProjectFileResponse } from "@nyx/protocol";
 import type { Queryable } from "../db/index.js";
+import type { DeployArtifacts } from "../deploy/pipeline.js";
 import { PgChatStore } from "./chat.js";
 import type { ChatStore, ChatWrite } from "./chat.js";
 import {
@@ -107,6 +108,14 @@ export interface ProjectStore extends ChatStore {
   getFiles(projectId: string): Promise<HandoffFile[]>;
   /** Turn/user-edit versions oldest-first, files changed per version — git-synthesis source (D48/D59). */
   getVersionHistory(projectId: string): Promise<VersionSnapshot[]>;
+  /**
+   * Record the latest green build for a project (FR-054). Upserted at every `ready`
+   * CompileOutcome — the LATEST build wins (one row per project). The deploy handler
+   * reads it AT DEPLOY TIME (the US8 stale-build lesson), so overwriting is intentional.
+   */
+  recordGreenBuild(projectId: string, build: DeployArtifacts): Promise<void>;
+  /** The latest recorded green build for a project (the deploy greenness gate), or `null`. */
+  getLatestGreenBuild(projectId: string): Promise<DeployArtifacts | null>;
   /** Mint + persist a fresh clone token for a project, replacing any prior one (D58). */
   mintCloneToken(projectId: string): Promise<string>;
   /** Null the clone token — revocation takes effect immediately (SC-043). */
@@ -483,6 +492,31 @@ export class PgProjectStore implements ProjectStore {
         createdAt: bucket.createdAt,
         files: bucket.files,
       }));
+  }
+
+  async recordGreenBuild(projectId: string, build: DeployArtifacts): Promise<void> {
+    // Upsert: one row per project, latest build wins (the deploy handler reads it at
+    // deploy time). No amounts — plain provenance columns (url prefix + compiler version).
+    await this.db.query(
+      `INSERT INTO project_green_builds (project_id, url_prefix, compiler_version)
+            VALUES ($1, $2, $3)
+       ON CONFLICT (project_id)
+       DO UPDATE SET url_prefix = EXCLUDED.url_prefix,
+                     compiler_version = EXCLUDED.compiler_version,
+                     recorded_at = now()`,
+      [projectId, build.urlPrefix, build.compilerVersion],
+    );
+  }
+
+  async getLatestGreenBuild(projectId: string): Promise<DeployArtifacts | null> {
+    const { rows } = await this.db.query<{ url_prefix: string; compiler_version: string }>(
+      `SELECT url_prefix, compiler_version FROM project_green_builds WHERE project_id = $1`,
+      [projectId],
+    );
+    const row = rows[0];
+    return row === undefined
+      ? null
+      : { urlPrefix: row.url_prefix, compilerVersion: row.compiler_version };
   }
 
   async mintCloneToken(projectId: string): Promise<string> {

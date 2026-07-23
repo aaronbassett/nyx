@@ -197,11 +197,11 @@ async function main(): Promise<void> {
         emit: sinks.emit,
         emitContractDeployed: sinks.emitContractDeployed,
       }),
-    // ⚠️ OPEN WIRING GAP: nothing persists the latest green build per project yet. US1's turn loop
-    // produces the `ready` CompileOutcome `urlPrefix` (the green build), but there is no store for
-    // it — so this STUB returns `null` and every deploy fails the FR-054 greenness gate until US1
-    // wires the persisted green build here. Honest failure, never a phantom deploy.
-    getLatestGreenBuild: () => Promise.resolve(null),
+    // The turn coordinator persists every `ready` full compile as the project's latest green
+    // build (FR-054); the deploy handler reads it here AT DEPLOY TIME (the US8 stale-build
+    // lesson) so the greenness gate reflects the newest green artifacts, not an enqueue-time
+    // snapshot. `null` (no green build yet) honestly fails the gate — never a phantom deploy.
+    getLatestGreenBuild: (projectId) => projectStore.getLatestGreenBuild(projectId),
     wallet: deployWallet,
     // The turn coordinator's turn-observation seam wires straight in (EC-40 / FR-058).
     turnGate: coordinator.turnGate,

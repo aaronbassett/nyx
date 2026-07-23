@@ -355,7 +355,10 @@ function baseDeps(overrides: Partial<TurnCoordinatorDeps> = {}): TurnCoordinator
     compileClient: makeCompileClient().client,
     ledger: makeLedger().ledger,
     chat: makeChat(),
-    projectStore: { commit: () => Promise.resolve({ version: 1 }) },
+    projectStore: {
+      commit: () => Promise.resolve({ version: 1 }),
+      recordGreenBuild: () => Promise.resolve(),
+    },
     mcp: stubMcp,
     flatReserve: FLAT_RESERVE,
     now: () => TS,
@@ -696,7 +699,10 @@ describe("default swarm steering injection (@nyx/scaffold, US1 D3/FR-003/FR-080)
       compileClient: makeCompileClient().client,
       ledger: makeLedger().ledger,
       chat: makeChat(),
-      projectStore: { commit: () => Promise.resolve({ version: 1 }) },
+      projectStore: {
+        commit: () => Promise.resolve({ version: 1 }),
+        recordGreenBuild: () => Promise.resolve(),
+      },
       mcp: routedMcp,
       flatReserve: FLAT_RESERVE,
       now: () => TS,
