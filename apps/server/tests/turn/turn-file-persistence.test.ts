@@ -41,6 +41,7 @@ import type {
   SupervisorDeps,
   SupervisorLedger,
 } from "../../src/agents/supervisor.js";
+import { createCompileResultsInbox } from "../../src/compile/index.js";
 import type { ArtifactManifest, CompileClient } from "../../src/compile/index.js";
 import type { Balance, LedgerEntryRecord, LedgerStore, Turn } from "../../src/ledger/ledger.js";
 import type { ChatStore, ChatWrite } from "../../src/projects/chat.js";
@@ -194,7 +195,7 @@ function makeChat(): ChatStore {
 }
 
 /** A fake {@link CompileClient}: clean check + a `succeeded` full compile (terminal on first poll). */
-function makeCompileClient(): CompileClient {
+function makeFakeCompileClient(): CompileClient {
   return {
     check: () =>
       Promise.resolve({ ok: true, diagnostics: [], compilerVersion: "0.24.0", durationMs: 3 }),
@@ -304,7 +305,8 @@ function coordinatorDeps(
 ): TurnCoordinatorDeps {
   return {
     modelRouter: stubModelRouter,
-    compileClient: makeCompileClient(),
+    makeCompileClient: () => ({ forTurn: () => makeFakeCompileClient() }),
+    compileInbox: createCompileResultsInbox({ delay: neverDelay }),
     ledger: overrides.ledger ?? makeLedgerStore("proj-1"),
     chat: makeChat(),
     mcp: stubMcp,

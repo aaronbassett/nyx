@@ -95,6 +95,19 @@ describe("loadConfig — valid env", () => {
     expect(config.compileService.url).toBe("https://compile.internal/v1");
   });
 
+  it("derives publicOrigin from PORT when PUBLIC_ORIGIN is unset (P2 browser-compile artifact URLs)", () => {
+    const config = loadConfig(validEnv({ PORT: "3000" }));
+    // Optional-with-derivation: no new required env var, but always a parseable absolute origin
+    // the browser-compile artifact URLs (`<publicOrigin>/artifacts/...`) are built under.
+    expect(config.publicOrigin).toBe("http://localhost:3000");
+    expect(() => new URL(config.publicOrigin)).not.toThrow();
+  });
+
+  it("honours an explicit PUBLIC_ORIGIN override", () => {
+    const config = loadConfig(validEnv({ PUBLIC_ORIGIN: "https://nyx.example.com" }));
+    expect(config.publicOrigin).toBe("https://nyx.example.com");
+  });
+
   it("applies env overrides over defaults (numbers, bigints, urls)", () => {
     const config = loadConfig(
       validEnv({
@@ -242,6 +255,11 @@ describe("loadConfig — invalid env (DS-003 fail-fast)", () => {
     expect(vars).toContain("MCP_TOME_URL");
     expect(vars).toContain("PORT");
     expect(vars).toContain("FLAT_RESERVE");
+  });
+
+  it("rejects a non-URL PUBLIC_ORIGIN (must be an absolute origin)", () => {
+    const vars = issuesFor(validEnv({ PUBLIC_ORIGIN: "not-a-url" }));
+    expect(vars).toContain("PUBLIC_ORIGIN");
   });
 
   it("names COMPILE_SERVICE_URL when the Compile Service base URL is missing", () => {

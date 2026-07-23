@@ -705,7 +705,12 @@ class TurnSupervisor implements Supervisor {
         // no announce, D35); a throw → infra path. The FULL compile is never run here:
         // artifacts must not surface before the behavioural tests pass (FR-002/FR-029).
         const changedPaths = work.files.map((file) => file.path);
-        const compileInput: CompileTurnInput = { projectId, files: work.files, changedPaths };
+        const compileInput: CompileTurnInput = {
+          turnId,
+          projectId,
+          files: work.files,
+          changedPaths,
+        };
         const checkOutcome = await this.withInfraRetry(
           () => this.deps.checkCompile(compileInput),
           COMPILE_SERVICE_NAME,

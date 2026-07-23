@@ -80,7 +80,13 @@ import type {
   TurnResult,
 } from "../agents/supervisor.js";
 import { ArtifactOrchestrator } from "../compile/index.js";
-import type { CheckRequest, CompileClient, CompileTurnInput } from "../compile/index.js";
+import type {
+  BrowserCompileSession,
+  CheckRequest,
+  CompileClient,
+  CompileResultsInbox,
+  CompileTurnInput,
+} from "../compile/index.js";
 import type { LedgerStore } from "../ledger/ledger.js";
 import type { ChatStore } from "../projects/chat.js";
 import type { ProjectStore } from "../projects/store.js";
@@ -178,16 +184,32 @@ export interface TestResultsInbox {
 /**
  * Injected dependencies for {@link createTurnCoordinator}.
  *
- * The shared services (`modelRouter`/`compileClient`/`ledger`/`chat`/`mcp`) are the
+ * The shared services (`modelRouter`/`makeCompileClient`/`ledger`/`chat`/`mcp`) are the
  * production wiring the buildServer task constructs from config; the optional seam
  * OVERRIDES (`classifyIntent`/`subAgents`/`buildSupervisor`) let tests drive the whole
- * loop with NO real models, NO Compile Service, and NO WebContainer.
+ * loop with NO real models, NO browser toolchain, and NO WebContainer.
  */
 export interface TurnCoordinatorDeps {
   /** Per-agent model routing (D19) — used to build the default sub-agent swarm. */
   readonly modelRouter: ModelRouter;
-  /** The Compile Service client (US2) — the per-cycle CHECK + the green FULL compile. */
-  readonly compileClient: CompileClient;
+  /**
+   * Build the per-PROJECT browser-compile factory (P2). The coordinator hands it a
+   * {@link BrowserCompileSession} whose `emitCompileRun` sends `compile:run` on the project's
+   * CURRENT live connection; the returned factory's `forTurn(turnId)` yields a
+   * {@link CompileClient} bound to that turn (the per-cycle CHECK + the green FULL compile now
+   * run in the USER'S browser, not a server-side service). Tests inject a fake returning a
+   * canned {@link CompileClient}.
+   */
+  readonly makeCompileClient: (session: BrowserCompileSession) => {
+    forTurn(turnId: string): CompileClient;
+  };
+  /**
+   * The server-side rendezvous the browser's `compile:results` is delivered through (P2). The
+   * per-turn {@link CompileClient} awaits it; the WS `compile:results` handler delivers to it,
+   * ownership-gated on the delivering connection's project (Defense 4). It MUST be the SAME
+   * inbox instance the {@link TurnCoordinatorDeps.makeCompileClient} factory awaits.
+   */
+  readonly compileInbox: CompileResultsInbox;
   /** Reserve-then-settle metering (D34). */
   readonly ledger: LedgerStore;
   /** Chat persistence + rehydration (D23); the cold-start signal (FR-003). */
@@ -632,9 +654,12 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
   // a takeover swaps it so an in-flight turn's remaining frames follow the new socket.
   const projects = new Map<string, ProjectTurnState>();
 
-  const orchestratorFor = (getLiveCtx: () => ConnectionContext): ArtifactOrchestrator =>
+  const orchestratorFor = (
+    getLiveCtx: () => ConnectionContext,
+    client: CompileClient,
+  ): ArtifactOrchestrator =>
     new ArtifactOrchestrator({
-      client: deps.compileClient,
+      client,
       emitArtifactsReady: (payload) => {
         safeEmit(() => {
           getLiveCtx().send({ type: "artifacts:ready", payload, ts: now() });
@@ -699,6 +724,25 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
     // given project therefore shares the SAME owning account, so the captured address can
     // never bind a foreign socket's turns to the owner's ledger account.
     const address = ctx.session.accountAddress;
+
+    // The per-PROJECT browser-compile factory (P2), built ONCE per project state and memoised.
+    // Its {@link BrowserCompileSession} emits `compile:run` on the project's CURRENT live
+    // connection — the deferred `state.liveCtx` closure, so a mid-turn D40 takeover reroutes the
+    // frame exactly like every other ctx-bound seam (and `safeEmit` swallows a dead-socket
+    // throw). `forTurn(turnId)` then yields the turn-bound {@link CompileClient} that the
+    // per-cycle CHECK and the green FULL compile drive; the verdict returns via the
+    // {@link TurnCoordinatorDeps.compileInbox} the WS `compile:results` handler delivers to.
+    let compileFactory: { forTurn(turnId: string): CompileClient } | undefined;
+    const makeClientForProject = (): { forTurn(turnId: string): CompileClient } =>
+      (compileFactory ??= deps.makeCompileClient({
+        projectId,
+        emitCompileRun: (payload) => {
+          safeEmit(() => {
+            state.liveCtx.send({ type: "compile:run", payload, ts: now() });
+          });
+        },
+      }));
+
     const state: ProjectTurnState = {
       liveCtx: ctx,
       turnInFlight: false,
@@ -727,9 +771,12 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
         // structurally unrepresentable here even if a supervisor passed a foreign id.
         commitFiles: (_supervisorProjectId, files) =>
           deps.projectStore.commit(projectId, { author: "agent", files }),
-        // The per-cycle CHECK is the fast path: adapt the input and hand back the service's
-        // `{ ok, diagnostics, … }` verbatim (a structural superset of `CheckOutcome`).
-        checkCompile: (input) => deps.compileClient.check(toCheckRequest(input)),
+        // The per-cycle CHECK is the fast path: the browser toolchain compiles its own live VFS
+        // and returns `{ ok, diagnostics, … }` verbatim (a structural superset of `CheckOutcome`).
+        // The turn-bound client (`forTurn(input.turnId)`) keys its `compile:run`/`compile:results`
+        // rendezvous on the turn, so the verdict lands on THIS turn's wait.
+        checkCompile: (input) =>
+          makeClientForProject().forTurn(input.turnId).check(toCheckRequest(input)),
         // The green-only FULL compile: a fresh orchestrator per turn, so `artifacts:ready`
         // is at-most-once by construction; it announces to the CURRENT live connection. On a
         // `ready` outcome we (a) persist it as the project's latest green build (FR-054) so
@@ -746,7 +793,14 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
         // (which itself can never throw, even with an injected sink). The turn always ends
         // green with the single `artifacts:ready` the orchestrator already emitted.
         runFullCompile: async (input) => {
-          const outcome = await orchestratorFor(() => state.liveCtx).runTurn(input);
+          // P2: the FULL compile is driven through the turn-bound BROWSER client (its own live
+          // VFS builds the artifacts + uploads them); everything downstream — verify-before-
+          // announce over the committed prefix, the single `artifacts:ready`, and the entire
+          // post-`ready` record/coverage guard below — is UNCHANGED (only the client source moved).
+          const outcome = await orchestratorFor(
+            () => state.liveCtx,
+            makeClientForProject().forTurn(input.turnId),
+          ).runTurn(input);
           if (outcome.kind === "ready") {
             try {
               // (I2) Bound the record so a hung store can't postpone the money terminal. M6:
@@ -987,6 +1041,16 @@ export function createTurnCoordinator(deps: TurnCoordinatorDeps): TurnCoordinato
         // socket's verdict for another tenant's in-flight turnId is IGNORED (no false PASS, no
         // budget griefing); an unknown turnId is a no-op. Mirrors Defense 2's project check.
         inbox.deliver(capped, ctx.projectId);
+      })
+      .on("compile:results", (event, ctx) => {
+        // P2 browser-compile rendezvous (mirrors `test:results`). The frame is already
+        // zod-validated at the WS boundary — `router.dispatch` runs `parseEvent("client-to-
+        // server", …)`, which validates `CompileResultsPayloadSchema` (incl. the green-full
+        // `sourceHash` refinement) before this handler ever runs. Defense 4: pass the delivering
+        // connection's OWN `ctx.projectId` so the inbox resolves ONLY a wait OWNED by that
+        // project — a foreign socket's verdict for another tenant's turn is IGNORED (no forged
+        // green, no griefing the owner's compile), and an unknown `(turnId, kind)` is a no-op.
+        deps.compileInbox.deliver(event.payload, ctx.projectId);
       })
       .on("console:log", (event, ctx) => {
         recordConsole(ctx.projectId, "log", event.payload.message);

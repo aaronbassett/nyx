@@ -11,7 +11,8 @@
 import { randomUUID } from "node:crypto";
 import { buildServer } from "./app.js";
 import { createModelRouter } from "./agents/routing.js";
-import { HttpCompileClient } from "./compile/index.js";
+import { createBrowserCompileClient, createCompileResultsInbox } from "./compile/index.js";
+import type { BrowserCompileSession } from "./compile/index.js";
 import { ConfigValidationError, loadConfig } from "./config/index.js";
 import type { Config } from "./config/index.js";
 import { providerApiKeys } from "./config/schema.js";
@@ -52,6 +53,22 @@ import { createTurnCoordinator } from "./turn/coordinator.js";
  * memory). `assertCanDeploy` still fails closed on an EMPTY wallet via the per-deploy floor.
  */
 const DEPLOY_WALLET_LOW_THRESHOLD_TDUST = 0n;
+
+/**
+ * No-hang backstops (D42) for the browser-delegated compile: a dead/silent tab that never
+ * replies `compile:results` resolves as a FAILED verdict after these bounds (a failing check
+ * or a `CompileJobTimeoutError` the orchestrator maps to `timeout`), never an infinite wait.
+ * Generous ceilings — the real verdict lands first on any live browser; owner-tunable later.
+ */
+const BROWSER_CHECK_TIMEOUT_MS = 180_000;
+const BROWSER_FULL_TIMEOUT_MS = 180_000;
+
+/** Unref'd delay so a bounded compile-inbox wait never pins the process (mirrors the coordinator). */
+function unrefDelay(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms).unref();
+  });
+}
 
 /** Structured, bigint-safe stderr sink for the deploy-wallet balance alerts (FR-059). */
 function logWalletAlert(alert: WalletAlert): void {
@@ -124,10 +141,20 @@ async function main(): Promise<void> {
     routing: config.modelRouting,
     apiKeys: providerApiKeys(config.secrets),
   });
-  const compileClient = new HttpCompileClient({
-    token: config.secrets.compileServiceToken,
-    baseUrl: config.compileService.url,
-  });
+  // P2 browser-compile wiring: the per-cycle CHECK + the green FULL compile now run in the
+  // USER'S browser (the retired server-side Compile Service + R2-write path is gone). ONE shared
+  // rendezvous inbox backs both the per-turn client (which awaits `compile:results`) and the WS
+  // handler (which delivers to it, ownership-gated). `config.publicOrigin` builds the artifact
+  // URLs the orchestrator reads over its `fetch` seam before announcing `artifacts:ready`.
+  const compileInbox = createCompileResultsInbox({ delay: unrefDelay });
+  const makeCompileClient = (session: BrowserCompileSession) =>
+    createBrowserCompileClient({
+      inbox: compileInbox,
+      session,
+      publicOrigin: config.publicOrigin,
+      checkTimeoutMs: BROWSER_CHECK_TIMEOUT_MS,
+      fullTimeoutMs: BROWSER_FULL_TIMEOUT_MS,
+    });
   const ledgerStore = createLedgerStore(db, { flatReserve: config.tunables.flatReserveNyxt });
   const depositStore = createDepositStore(db, ledgerStore, {
     minimumDeposit: config.tunables.minimumDepositNyxt,
@@ -153,7 +180,8 @@ async function main(): Promise<void> {
   // The supervisor turn loop (D34): its `handlers` drive one turn per `prompt:submit`.
   const coordinator = createTurnCoordinator({
     modelRouter,
-    compileClient,
+    makeCompileClient,
+    compileInbox,
     ledger: ledgerStore,
     chat,
     // Turn-end file persistence (US7): a settled turn commits its files as one agent

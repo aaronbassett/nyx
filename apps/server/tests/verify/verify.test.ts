@@ -43,6 +43,7 @@ const READY_OUTCOME: CompileOutcome = {
 
 /** A turn's full-compile input — the seam is fully injected, so `files` can be empty. */
 const COMPILE_INPUT: CompileTurnInput = {
+  turnId: "turn-1",
   projectId: "proj-1",
   files: [],
   changedPaths: ["src/counter.compact"],

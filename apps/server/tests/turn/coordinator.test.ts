@@ -27,6 +27,7 @@ import {
   TurnIdSchema,
   type ChatMessage,
   type ClientToServerEvent,
+  type CompileResultsEvent,
   type PromptSubmitEvent,
   type ServerToClientEvent,
   type TestFailure,
@@ -46,10 +47,13 @@ import type {
   SupervisorDeps,
   TurnResult,
 } from "../../src/agents/supervisor.js";
+import { createBrowserCompileClient, createCompileResultsInbox } from "../../src/compile/index.js";
 import type {
   ArtifactManifest,
+  BrowserCompileSession,
   CheckRequest,
   CompileClient,
+  CompileResultsInbox,
   CompileRequest,
 } from "../../src/compile/index.js";
 import type { Balance, LedgerEntryRecord, LedgerStore, Turn } from "../../src/ledger/ledger.js";
@@ -297,7 +301,7 @@ interface CompileHarness {
 }
 
 /** A fake {@link CompileClient}: clean check + a `succeeded` full compile (terminal on the first poll). */
-function makeCompileClient(): CompileHarness {
+function makeFakeCompileClient(): CompileHarness {
   const checkCalls: CheckRequest[] = [];
   const compileCalls: CompileRequest[] = [];
   const client: CompileClient = {
@@ -332,6 +336,18 @@ function makeCompileClient(): CompileHarness {
   return { client, checkCalls, compileCalls };
 }
 
+/**
+ * Wrap a canned {@link CompileClient} as the P2 `makeCompileClient` deps factory: every
+ * `forTurn(turnId)` hands back the SAME client (so a test can inspect its recorded calls),
+ * ignoring the {@link BrowserCompileSession} the coordinator supplies. The real production
+ * factory ({@link createBrowserCompileClient}) is driven directly in the compile-delegation suite.
+ */
+function fakeMakeCompileClient(
+  client: CompileClient,
+): (session: BrowserCompileSession) => { forTurn(turnId: string): CompileClient } {
+  return () => ({ forTurn: () => client });
+}
+
 /** A fake artifact `fetch`: the manifest on GET, a 200 on every file HEAD. */
 const fetchArtifact: typeof fetch = (_input, init) => {
   const method = init?.method ?? "GET";
@@ -354,7 +370,8 @@ const fetchArtifact: typeof fetch = (_input, init) => {
 function baseDeps(overrides: Partial<TurnCoordinatorDeps> = {}): TurnCoordinatorDeps {
   return {
     modelRouter: stubModelRouter,
-    compileClient: makeCompileClient().client,
+    makeCompileClient: fakeMakeCompileClient(makeFakeCompileClient().client),
+    compileInbox: createCompileResultsInbox({ delay: neverDelay }),
     ledger: makeLedger().ledger,
     chat: makeChat(),
     projectStore: {
@@ -449,11 +466,11 @@ describe("TestResultsInbox", () => {
 describe("per-turn ctx-bound seams", () => {
   it("hands the supervisor ctx-bound checkCompile / awaitTestResults / runFullCompile", async () => {
     const spy = makeSpySupervisor({ kind: "green", turnId: "turn-1", cycles: 1, consumed: 5n });
-    const compile = makeCompileClient();
+    const compile = makeFakeCompileClient();
     const { ctx, sent } = makeCtx();
     const coordinator = createTurnCoordinator(
       baseDeps({
-        compileClient: compile.client,
+        makeCompileClient: fakeMakeCompileClient(compile.client),
         fetchArtifact,
         classifyIntent: () => Promise.resolve({ kind: "dapp" }),
         subAgents: makeSubAgents(),
@@ -473,6 +490,7 @@ describe("per-turn ctx-bound seams", () => {
 
     // checkCompile adapts CompileTurnInput → the §4.1 CheckRequest (files only).
     const outcome = await deps.checkCompile({
+      turnId: "turn-1",
       projectId: PROJECT,
       files: [{ path: "src/counter.compact", content: "x" }],
       changedPaths: ["src/counter.compact"],
@@ -493,6 +511,7 @@ describe("per-turn ctx-bound seams", () => {
 
     // runFullCompile drives the orchestrator and announces artifacts:ready exactly once.
     const compiled = await deps.runFullCompile({
+      turnId: "turn-1",
       projectId: PROJECT,
       files: [{ path: "src/counter.compact", content: "x" }],
       changedPaths: ["src/counter.compact"],
@@ -698,7 +717,8 @@ describe("default swarm steering injection (@nyx/scaffold, US1 D3/FR-003/FR-080)
     // takes the default routed-model build path — the one that must inject the steering.
     const deps: TurnCoordinatorDeps = {
       modelRouter,
-      compileClient: makeCompileClient().client,
+      makeCompileClient: fakeMakeCompileClient(makeFakeCompileClient().client),
+      compileInbox: createCompileResultsInbox({ delay: neverDelay }),
       ledger: makeLedger().ledger,
       chat: makeChat(),
       projectStore: {
@@ -792,7 +812,7 @@ describe("BUG-1: the single-active-turn lock is PER-PROJECT, not per-connection"
     const coordinator = createTurnCoordinator(
       baseDeps({
         ledger: ledger.ledger,
-        compileClient: makeCompileClient().client,
+        makeCompileClient: fakeMakeCompileClient(makeFakeCompileClient().client),
         fetchArtifact,
         classifyIntent: () => Promise.resolve({ kind: "dapp" }),
         subAgents: makeSubAgents(),
@@ -987,7 +1007,7 @@ describe("Defense 3: a dead-socket send throw never kills the turn mid-flight", 
     const coordinator = createTurnCoordinator(
       baseDeps({
         ledger: ledger.ledger,
-        compileClient: makeCompileClient().client,
+        makeCompileClient: fakeMakeCompileClient(makeFakeCompileClient().client),
         fetchArtifact,
         classifyIntent: () => Promise.resolve({ kind: "dapp" }),
         subAgents: makeSubAgents(),
@@ -1291,11 +1311,11 @@ describe("coverage telemetry (FR-032 / D41) + green post-processing failure enve
     // runFullCompile → the supervisor's withInfraRetry re-runs it up to 3 more times →
     // DUPLICATE artifacts:ready frames (a D35 at-most-once breach) + the green turn
     // misclassified infra-failed. The guard swallows the throw, so exactly one compile runs.
-    const compile = makeCompileClient();
+    const compile = makeFakeCompileClient();
     const { ctx, sent } = makeCtx();
     const coordinator = createTurnCoordinator(
       greenCoverageDeps({
-        compileClient: compile.client,
+        makeCompileClient: fakeMakeCompileClient(compile.client),
         logCoverage: () => {
           throw new Error("telemetry sink boom");
         },
@@ -1319,11 +1339,11 @@ describe("coverage telemetry (FR-032 / D41) + green post-processing failure enve
   });
 
   it("M5: a REJECTING recordGreenBuild leaves the outcome ready and the turn green", async () => {
-    const compile = makeCompileClient();
+    const compile = makeFakeCompileClient();
     const { ctx, sent } = makeCtx();
     const coordinator = createTurnCoordinator(
       greenCoverageDeps({
-        compileClient: compile.client,
+        makeCompileClient: fakeMakeCompileClient(compile.client),
         projectStore: {
           commit: () => Promise.resolve({ version: 1 }),
           recordGreenBuild: () => Promise.reject(new Error("green-build store down")),
@@ -1353,11 +1373,11 @@ describe("coverage telemetry (FR-032 / D41) + green post-processing failure enve
     const RECORD_TIMEOUT_MS = 5;
     const delay = (ms: number): Promise<void> =>
       ms === RECORD_TIMEOUT_MS ? Promise.resolve() : new Promise<void>(() => undefined);
-    const compile = makeCompileClient();
+    const compile = makeFakeCompileClient();
     const { ctx, sent } = makeCtx();
     const coordinator = createTurnCoordinator(
       greenCoverageDeps({
-        compileClient: compile.client,
+        makeCompileClient: fakeMakeCompileClient(compile.client),
         delay,
         recordGreenBuildTimeoutMs: RECORD_TIMEOUT_MS,
         projectStore: {
@@ -1381,5 +1401,170 @@ describe("coverage telemetry (FR-032 / D41) + green post-processing failure enve
     expect(sent.filter((event) => event.type === "artifacts:ready")).toHaveLength(1);
     expect(wentGreen(sent)).toBe(true);
     expect(sent.filter((event) => event.type === "turn:settled")).toHaveLength(1);
+  });
+});
+
+describe("P2 compile delegation: browser client + compile:results rendezvous (Task 8)", () => {
+  const PUBLIC_ORIGIN = "http://localhost:8080";
+  const CHECK_TIMEOUT_MS = 1_000;
+  const FULL_TIMEOUT_MS = 1_000;
+
+  /** Build a `compile:results` client event (branding via the schema). */
+  function compileResultsEvent(
+    turnId: string,
+    kind: "check" | "full",
+    overrides: Partial<Omit<CompileResultsEvent["payload"], "turnId" | "kind">> = {},
+  ): CompileResultsEvent {
+    return {
+      type: "compile:results",
+      payload: {
+        turnId: TurnIdSchema.parse(turnId),
+        kind,
+        ok: overrides.ok ?? true,
+        diagnostics: overrides.diagnostics ?? [],
+        compilerVersion: overrides.compilerVersion ?? "0.24.0",
+        durationMs: overrides.durationMs ?? 5,
+        ...(overrides.sourceHash === undefined ? {} : { sourceHash: overrides.sourceHash }),
+        ...(overrides.circuits === undefined ? {} : { circuits: overrides.circuits }),
+      },
+      ts: TS,
+    };
+  }
+
+  /**
+   * Coordinator deps wired to the REAL browser-delegating compile client over a shared `inbox`
+   * (the production P2 seam, NOT a canned fake): so a `compile:run` really goes out on the
+   * project's connection and a `compile:results` must be delivered through the WS handler to
+   * resolve it. `inbox` is shared as BOTH the client's rendezvous and the coordinator's
+   * `compileInbox` (the handler delivers to it) — proving the two are the same instance.
+   */
+  function browserDeps(
+    inbox: CompileResultsInbox,
+    overrides: Partial<TurnCoordinatorDeps> = {},
+  ): TurnCoordinatorDeps {
+    return baseDeps({
+      makeCompileClient: (session) =>
+        createBrowserCompileClient({
+          inbox,
+          session,
+          publicOrigin: PUBLIC_ORIGIN,
+          checkTimeoutMs: CHECK_TIMEOUT_MS,
+          fullTimeoutMs: FULL_TIMEOUT_MS,
+        }),
+      compileInbox: inbox,
+      ...overrides,
+    });
+  }
+
+  it("(a)+(b) a check emits compile:run{kind:check} with the ACTIVE turn id; the OWNER's compile:results resolves it", async () => {
+    const spy = makeSpySupervisor({ kind: "green", turnId: "turn-1", cycles: 1, consumed: 5n });
+    const inbox = createCompileResultsInbox({ delay: neverDelay });
+    const { ctx, sent } = makeCtx();
+    const coordinator = createTurnCoordinator(
+      browserDeps(inbox, { buildSupervisor: spy.buildSupervisor }),
+    );
+    const fake = makeFakeRouter();
+    coordinator.handlers(fake.router);
+
+    // The prompt builds the per-project supervisor + state (liveCtx = ctx); capture its seams.
+    await fake.invoke(promptEvent("build a counter"), ctx);
+    const deps = spy.captured[0];
+    if (deps === undefined) {
+      throw new Error("supervisor was never built");
+    }
+
+    // (a) Drive the per-cycle CHECK seam → a compile:run{check} carrying THIS turn's id goes out
+    // on the project's live connection.
+    const pending = deps.checkCompile({
+      turnId: "turn-1",
+      projectId: PROJECT,
+      files: [{ path: "src/counter.compact", content: "x" }],
+      changedPaths: ["src/counter.compact"],
+    });
+    const compileRun = sent.find((event) => event.type === "compile:run");
+    expect(compileRun).toBeDefined();
+    expect(compileRun?.payload).toEqual({ turnId: "turn-1", kind: "check" });
+
+    // (b) The OWNER's connection (ctx.projectId === PROJECT) delivers a clean check verdict
+    // through the WS handler → the in-flight check resolves as clean DATA (never a throw).
+    await fake.invoke(compileResultsEvent("turn-1", "check", { ok: true }), ctx);
+    const outcome = await pending;
+    expect(outcome.ok).toBe(true);
+    expect(outcome.diagnostics).toHaveLength(0);
+  });
+
+  it("(c) a compile:results delivered on a FOREIGN connection is IGNORED; only the owner's resolves (Defense 4)", async () => {
+    const spy = makeSpySupervisor({ kind: "green", turnId: "turn-1", cycles: 1, consumed: 5n });
+    const inbox = createCompileResultsInbox({ delay: neverDelay });
+    const { ctx: ownerCtx } = makeCtx(); // projectId === PROJECT (the turn owner)
+    const { ctx: foreignCtx } = makeCtx(undefined, "attacker-project"); // a DIFFERENT tenant
+    const coordinator = createTurnCoordinator(
+      browserDeps(inbox, { buildSupervisor: spy.buildSupervisor }),
+    );
+    const fake = makeFakeRouter();
+    coordinator.handlers(fake.router);
+
+    await fake.invoke(promptEvent("build a counter"), ownerCtx);
+    const deps = spy.captured[0];
+    if (deps === undefined) {
+      throw new Error("supervisor was never built");
+    }
+
+    const pending = deps.checkCompile({
+      turnId: "turn-1",
+      projectId: PROJECT,
+      files: [{ path: "src/counter.compact", content: "x" }],
+      changedPaths: ["src/counter.compact"],
+    });
+
+    // A FOREIGN project delivers a (green) check verdict for the victim's turn — the handler
+    // passes ITS ctx.projectId as deliveringProjectId, so the inbox drops it (Defense 4). WITHOUT
+    // the ctx.projectId binding this foreign verdict would forge the victim's check.
+    await fake.invoke(compileResultsEvent("turn-1", "check", { ok: true }), foreignCtx);
+    const UNRESOLVED = Symbol("unresolved");
+    expect(await Promise.race([pending, Promise.resolve(UNRESOLVED)])).toBe(UNRESOLVED);
+
+    // The real OWNER then delivers a FAILING check — THIS resolves the wait (owner's verdict wins).
+    await fake.invoke(
+      compileResultsEvent("turn-1", "check", {
+        ok: false,
+        diagnostics: [{ severity: "error", source: "compactc", message: "boom" }],
+      }),
+      ownerCtx,
+    );
+    const outcome = await pending;
+    expect(outcome.ok).toBe(false);
+    expect(outcome.diagnostics).toHaveLength(1);
+  });
+
+  it("(d) no compile:results ever arrives → the turn SETTLES (exhausted), never hangs (no-hang D42)", async () => {
+    // A REAL supervisor + REAL browser client, but the inbox times out IMMEDIATELY and NO
+    // compile:results is ever delivered. Every per-cycle check resolves FAILING (a dead/silent
+    // tab), so the verify budget exhausts after 3 cycles and the turn settles — it never wedges.
+    // The `await` below RESOLVING is itself the no-hang proof.
+    const ledger = makeLedger();
+    const inbox = createCompileResultsInbox({ delay: () => Promise.resolve() });
+    const { ctx, sent } = makeCtx();
+    const coordinator = createTurnCoordinator(
+      browserDeps(inbox, {
+        ledger: ledger.ledger,
+        classifyIntent: () => Promise.resolve({ kind: "dapp" }),
+        subAgents: makeSubAgents(),
+      }),
+    );
+    const fake = makeFakeRouter();
+    coordinator.handlers(fake.router);
+
+    await fake.invoke(promptEvent("build a counter"), ctx);
+
+    // A compile:run{check} went out for each failing cycle (the browser was asked to compile) …
+    expect(sent.filter((event) => event.type === "compile:run").length).toBeGreaterThan(0);
+    // … and the turn SETTLED exactly once (exhausted) with NO green announce — never a hang.
+    expect(sent.filter((event) => event.type === "turn:settled")).toHaveLength(1);
+    expect(sent.filter((event) => event.type === "artifacts:ready")).toHaveLength(0);
+    expect(ledger.settleCalls).toHaveLength(1);
+    for (const event of sent) {
+      expect(() => JSON.stringify(event)).not.toThrow();
+    }
   });
 });

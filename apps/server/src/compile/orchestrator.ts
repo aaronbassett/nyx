@@ -163,6 +163,12 @@ export interface ArtifactOrchestratorDeps {
 
 /** A turn's inputs: the project, its source set, and what changed this turn. */
 export interface CompileTurnInput {
+  /**
+   * The turn this compile belongs to (P2). The orchestrator itself never reads it — it flows
+   * through to the browser-delegating {@link CompileClient} (`forTurn(turnId)`), which keys the
+   * `compile:run`/`compile:results` rendezvous on it so a verdict lands on the right waiting turn.
+   */
+  readonly turnId: string;
   readonly projectId: string;
   readonly files: readonly SourceFile[];
   /** The turn's changed paths — the EC-11 gate reads these. */

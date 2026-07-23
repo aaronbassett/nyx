@@ -322,6 +322,7 @@ describe("createBrowserCompileClient", () => {
     });
 
     const outcome = await orchestrator.runTurn({
+      turnId: "turn-1",
       projectId: PROJECT_ID,
       files: [{ path: "main.compact", content: "x" }],
       changedPaths: ["main.compact"],

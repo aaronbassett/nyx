@@ -104,6 +104,9 @@ function assembleSecrets(env: Env): ServerSecrets {
 function assemble(env: Env, modelRouting: ModelRoutingTable): Config {
   return {
     port: env.PORT,
+    // Derive the public origin from PORT when unset — keeps PUBLIC_ORIGIN optional (no new
+    // required env var) while always yielding a parseable absolute origin for artifact URLs.
+    publicOrigin: env.PUBLIC_ORIGIN ?? `http://localhost:${String(env.PORT)}`,
     network: resolveNetworkProfile(env),
     mcp: {
       toolchainUrl: env.MCP_TOOLCHAIN_URL,

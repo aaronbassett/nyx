@@ -114,6 +114,14 @@ export const EnvSchema = z.object({
   // Connection / infra (validated here, consumed by the db + proxy layers).
   DATABASE_URL: z.string().min(1, "must be a non-empty Postgres connection string"),
   PORT: positiveInt.default(8080),
+  // Absolute public origin the browser-compile artifact URLs are built under (P2). OPTIONAL:
+  // when unset it derives from PORT (`http://localhost:<PORT>`), so no NEW required env var is
+  // introduced (that would break every server test fixture). Only the origin is load-bearing —
+  // the in-process artifact `fetch` adapter parses the path and ignores the host.
+  PUBLIC_ORIGIN: z
+    .string()
+    .url("must be a valid absolute origin (P2 browser-compile artifact URLs)")
+    .optional(),
   MCP_TOOLCHAIN_URL: z.string().url("must be a valid URL (toolchain compile MCP, .flycast)"),
   MCP_TOME_URL: z.string().url("must be a valid URL (Tome skill-routing MCP)"),
   MCP_MNM_URL: z.string().url("must be a valid URL (mnm docs MCP)"),
@@ -299,6 +307,13 @@ export interface ServerSecrets {
 /** The fully validated, frozen server configuration. */
 export interface Config {
   readonly port: number;
+  /**
+   * Absolute public origin (scheme + host + optional port) the P2 browser-compile artifact
+   * URLs are built under, e.g. `http://localhost:8080`. Public, non-secret (an endpoint, not a
+   * credential) — flows into {@link PublicConfig}. Derived from {@link Config.port} when the
+   * `PUBLIC_ORIGIN` env var is unset.
+   */
+  readonly publicOrigin: string;
   readonly network: NetworkConfig;
   readonly mcp: McpConfig;
   readonly prover: ProverConfig;
