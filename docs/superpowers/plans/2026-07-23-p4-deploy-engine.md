@@ -55,6 +55,12 @@ Use the right agent type for each dispatch — do not run everything as a generi
 - Scaffold steering-rule tasks: `devs:typescript-dev`; any Compact snippet inside steering text must be `compact-core:compact-dev`-authored + verified.
 - Pre-PR review loop: `devs:code-reviewer` — always this type for review dispatches.
 
+**Model routing — which model runs what:**
+
+- Implementation dispatches (`devs:typescript-dev`, `compact-core:compact-dev`) and `midnight-verify:*` verification dispatches run on **Opus**: pass `model: "opus"` in the Agent call.
+- Review dispatches (`devs:code-reviewer`) run on **Opus** by default. **Deploys spend real funds and hold the deploy key**: the final pre-PR review of the executor/signing/SC-031 surfaces runs on **Fable 5**. Also escalate any finding still disputed after one fix loop.
+- **Fable 5 is reserved** for the orchestrating session itself, the Task 0 re-planning subagent, and the deploy-key/signing review above. Never run routine implementation on Fable.
+
 ## No-Deferral Policy
 
 Fully implement every task in this plan before moving on. Deferral is permitted only when 100% required — an external hard blocker outside the codebase. "This is hard/slow/complex" or "this could be a follow-up" are not justifications. Every deferral must appear in the retro with: what was deferred, the blocking condition, what unblocks it, and the impact on remaining plans.

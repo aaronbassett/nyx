@@ -53,6 +53,12 @@ Use the right agent type for each dispatch — do not run everything as a generi
 - Pre-PR review loop: `devs:code-reviewer` — always this type for review dispatches.
 - Doc lookups (pnpm settings, socket.dev install): Rover fetch inline; no subagent needed.
 
+**Model routing — which model runs what:**
+
+- Implementation dispatches (`devs:typescript-dev`, `gha:*`) run on **Opus**: pass `model: "opus"` in the Agent call.
+- Review dispatches (`devs:code-reviewer`) run on **Opus** by default. Escalate a review to **Fable 5** only when a finding is still disputed after one fix loop (P0's surface — hooks, lint config, CI — is low-risk; escalation should be rare).
+- **Fable 5 is reserved** for the orchestrating session itself (task sequencing, integration judgment, the retro) and, in later plans, the spikes and Task 0 re-planning subagents. Never run implementation on Fable; never downgrade the reserved dispatches to Opus.
+
 ## No-Deferral Policy
 
 Fully implement every task in this plan before moving on. Deferral is permitted only when 100% required — an external hard blocker outside the codebase. "This is hard/slow/complex" or "this could be a follow-up" are not justifications. Every deferral must appear in the retro with: what was deferred, the blocking condition, what unblocks it, and the impact on remaining plans.

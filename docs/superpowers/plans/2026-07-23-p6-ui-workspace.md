@@ -56,6 +56,12 @@ Use the right agent type for each dispatch — do not run everything as a generi
 - Polish tasks: load the `frontend-design:frontend-design` skill in the executing context (skill, not subagent — it steers the work).
 - Pre-PR review loop: `devs:code-reviewer` — always this type for review dispatches.
 
+**Model routing — which model runs what:**
+
+- Implementation dispatches (`devs:react-dev`, `devs:typescript-dev`) run on **Opus**: pass `model: "opus"` in the Agent call.
+- Review dispatches (`devs:code-reviewer`) run on **Opus** by default. Escalate a review to **Fable 5** when the diff touches the server-side FR-080 context path or the `file:changed` ownership/turn-lock gating (cross-tenant + agent-context surfaces), or when a finding is still disputed after one fix loop.
+- **Fable 5 is reserved** for the orchestrating session itself (including the golden-path rehearsal judgment and the demo-ready report) and the Task 0 re-planning subagent. Never run routine implementation on Fable — including the polish pass, which runs on Opus with the frontend-design skill loaded in the dispatch's context.
+
 ## No-Deferral Policy
 
 Fully implement every task in this plan before moving on. Deferral is permitted only when 100% required — an external hard blocker outside the codebase. "This is hard/slow/complex" or "this could be a follow-up" are not justifications. Every deferral must appear in the retro with: what was deferred, the blocking condition, what unblocks it, and the impact on remaining plans.
