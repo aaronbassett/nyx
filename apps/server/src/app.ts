@@ -19,6 +19,7 @@ import type { DeployRegistry } from "./deploy/registry.js";
 import { registerDeployRoutes } from "./deploy/routes.js";
 import { registerHealthRoutes } from "./http/health.js";
 import { registerSrsRoutes } from "./http/srs.js";
+import { registerVaultArtifactsRoutes } from "./http/vault-artifacts.js";
 import type { DepositStore, LedgerStore } from "./ledger/index.js";
 import { registerLedgerRoutes } from "./ledger/routes.js";
 import type { McpClients } from "./mcp/index.js";
@@ -215,6 +216,13 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   // cache dir, registered only when configured (the demo stack pre-fetches; other envs omit it).
   if (deps.config.artifacts.srsCacheDir !== undefined) {
     registerSrsRoutes(app, { cacheDir: deps.config.artifacts.srsCacheDir });
+  }
+
+  // NyxtVault key-material serve (P3 Task 4): session-less read-only `GET /vault-artifacts/*`
+  // over the native-toolchain vault build dir, so the browser ceremony prover can fetch the
+  // per-circuit `{proverKey, verifierKey, ir}` same-origin. Registered only when configured.
+  if (deps.config.artifacts.vaultArtifactsDir !== undefined) {
+    registerVaultArtifactsRoutes(app, { dir: deps.config.artifacts.vaultArtifactsDir });
   }
 
   const authStore = resolveAuthStore(deps);

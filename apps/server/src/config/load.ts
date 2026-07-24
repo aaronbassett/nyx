@@ -125,6 +125,7 @@ function assemble(env: Env, modelRouting: ModelRoutingTable): Config {
       // Conditional so `exactOptionalPropertyTypes` holds — a `string | undefined` field is
       // fine to assign directly, but keep the explicit value for the optional SRS cache dir.
       srsCacheDir: env.SRS_CACHE_DIR,
+      vaultArtifactsDir: env.VAULT_ARTIFACTS_DIR,
     },
     tunables: {
       exchangeRateNyxtPerTnight: env.NYXT_EXCHANGE_RATE,

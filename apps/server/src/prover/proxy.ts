@@ -36,15 +36,24 @@ import type {
   preHandlerAsyncHookHandler,
 } from "fastify";
 
-/** The route the proxy exposes; a same-origin sibling of the app's other routes. */
-export const PROVE_ROUTE = "/prover/prove";
+/**
+ * The wildcard route the proxy exposes: `POST /prover/*` relays the captured subpath
+ * to `<config.prover.url>/<subpath>`. The modern proof-server protocol POSTs each
+ * circuit's serialized preimage to `/check` AND `/prove` (SPIKE-2 §C), so BOTH the US6
+ * deposit / US8 deploy flows and the P3 ceremony fallback share this same-origin relay.
+ * A same-origin sibling of the app's other routes.
+ */
+export const PROVER_ROUTE = "/prover/*";
 
 /**
  * An opaque proof-server request captured by the proxy. The bytes and content-type
  * are forwarded to the interim prover UNTOUCHED — this is never parsed as an SDK
- * shape (constitution I).
+ * shape (constitution I). `subpath` is the captured wildcard (e.g. `"prove"` or
+ * `"check"`), appended to the prover base URL so the relay stays transparent.
  */
 export interface ProxyRequest {
+  /** The proof-server subpath to relay to (e.g. `"prove"`, `"check"`), path-safe. */
+  readonly subpath: string;
   /** Raw request bytes, relayed to the prover verbatim. */
   readonly body: Buffer;
   /** The caller's `Content-Type`, propagated verbatim (opaque; may be absent). */
@@ -68,27 +77,25 @@ export interface ProxyResult {
 /** The narrow forwarding seam — the ONLY thing the route depends on. */
 export interface ProverClient {
   /**
-   * Relay one opaque proof-server request to the interim prover and return its
-   * response. Rejects with a {@link ProverUnavailableError} on a transport/gateway
-   * fault; a prover HTTP response (any status) resolves as a {@link ProxyResult}.
+   * Relay one opaque proof-server request to the interim prover (at
+   * `<baseUrl>/<request.subpath>`) and return its response. Rejects with a
+   * {@link ProverUnavailableError} on a transport/gateway fault; a prover HTTP
+   * response (any status) resolves as a {@link ProxyResult}.
    */
-  prove(request: ProxyRequest): Promise<ProxyResult>;
+  relay(request: ProxyRequest): Promise<ProxyResult>;
 }
 
 /**
  * Injectable transport for {@link createProverClient}. `baseUrl` is the interim
- * prover's prove endpoint (server-only — `config.prover.url`, never client-bound);
- * `fetch` defaults to the global so tests drive a mock; `provePath` is appended to
- * `baseUrl` when the deployment splits base+path (defaults to `""` so `baseUrl`
- * alone is the full target — the exact path is owner-configured, constitution I).
+ * prover's BASE URL (server-only — `config.prover.url`, never client-bound); the
+ * per-request `subpath` (`"check"`/`"prove"`) is appended to it. `fetch` defaults to
+ * the global so tests drive a mock.
  */
 export interface ProverClientDeps {
-  /** The interim prover prove-endpoint URL (server-only, owner-gated; D37/D52). */
+  /** The interim prover base URL (server-only, owner-gated; D37/D52). */
   readonly baseUrl: string;
   /** `fetch` implementation; defaults to `globalThis.fetch`. */
   readonly fetch?: typeof fetch;
-  /** Optional path appended to `baseUrl`; defaults to `""`. */
-  readonly provePath?: string;
 }
 
 /**
@@ -117,10 +124,11 @@ export class ProverUnavailableError extends Error {
  */
 export function createProverClient(deps: ProverClientDeps): ProverClient {
   const fetchImpl = deps.fetch ?? globalThis.fetch;
-  const target = `${deps.baseUrl}${deps.provePath ?? ""}`;
+  const baseUrl = deps.baseUrl.replace(/\/+$/, "");
 
   return {
-    async prove(request: ProxyRequest): Promise<ProxyResult> {
+    async relay(request: ProxyRequest): Promise<ProxyResult> {
+      const target = `${baseUrl}/${request.subpath}`;
       // Only the caller's own content-type is propagated — no SDK shape is assumed.
       const headers: Record<string, string> = {};
       if (request.contentType !== undefined) {
@@ -195,7 +203,24 @@ function sessionOf(request: FastifyRequest): RateLimitContext | null {
 }
 
 /**
- * Register `POST /prover/prove` — the same-origin proxy to the interim prover.
+ * True for a relay subpath that is a safe, single-level (or nested) path segment set:
+ * non-empty, no leading slash, no `..`/`//` traversal, and only URL-path-safe chars.
+ * The relay appends it to the prover base URL, so a hostile subpath must never be able
+ * to repoint the forward off-base (e.g. `../admin`, `//evil.example`).
+ */
+function isSafeSubpath(subpath: string): boolean {
+  if (subpath.length === 0 || subpath.startsWith("/")) {
+    return false;
+  }
+  if (subpath.includes("..") || subpath.includes("//")) {
+    return false;
+  }
+  return /^[A-Za-z0-9._~/-]+$/.test(subpath);
+}
+
+/**
+ * Register `POST /prover/*` — the same-origin proxy to the interim prover, relaying
+ * the captured subpath (`prove`/`check`) to `<baseUrl>/<subpath>`.
  *
  * Side-effect-free registration. The route is placed in an ENCAPSULATED child scope
  * so the catch-all "read the body as bytes" content-type parser (required for a
@@ -204,10 +229,11 @@ function sessionOf(request: FastifyRequest): RateLimitContext | null {
  *
  * Lifecycle: `requireSession` (preHandler) rejects an unauthenticated caller 401
  * BEFORE the handler runs, so the prover is unreachable without a session
- * (constitution III). The handler then consults the rate-limit seam (429 on denial,
- * no forward), forwards the opaque bytes to {@link ProverClient.prove}, and relays
- * the prover's status + body + content-type back. A client rejection (transport
- * fault) maps to a 502 with a structured error — never an unhandled throw.
+ * (constitution III). The handler validates the subpath (400 on a traversal), consults
+ * the rate-limit seam (429 on denial, no forward), forwards the opaque bytes to
+ * {@link ProverClient.relay}, and relays the prover's status + body + content-type back.
+ * A client rejection (transport fault) maps to a 502 with a structured error — never an
+ * unhandled throw.
  */
 export function registerProverRoutes(app: FastifyInstance, deps: ProverRouteDeps): void {
   const { proverClient, requireSession } = deps;
@@ -221,48 +247,60 @@ export function registerProverRoutes(app: FastifyInstance, deps: ProverRouteDeps
       onDone(null, body);
     });
 
-    scope.post(PROVE_ROUTE, { preHandler: requireSession }, async (request, reply) => {
-      // Defensive: `requireSession` already 401s an unauthenticated request before
-      // the handler runs, so this branch is unreachable in practice — but it keeps
-      // the prover strictly unreachable without a resolved session.
-      const session = sessionOf(request);
-      if (session === null) {
-        return sendError(reply, 401, "unauthenticated");
-      }
-
-      // Per-session rate-limit seam (S9/D52): a denial short-circuits BEFORE any
-      // forward, so a throttled caller never reaches the prover.
-      const decision = await rateLimiter.check(session);
-      if (!decision.allowed) {
-        if (decision.retryAfterMs !== undefined) {
-          reply.header("retry-after", Math.ceil(decision.retryAfterMs / 1000));
+    scope.post<{ Params: { "*": string } }>(
+      PROVER_ROUTE,
+      { preHandler: requireSession },
+      async (request, reply) => {
+        // Defensive: `requireSession` already 401s an unauthenticated request before
+        // the handler runs, so this branch is unreachable in practice — but it keeps
+        // the prover strictly unreachable without a resolved session.
+        const session = sessionOf(request);
+        if (session === null) {
+          return sendError(reply, 401, "unauthenticated");
         }
-        return sendError(reply, 429, "rate limited");
-      }
 
-      const proxyRequest: ProxyRequest = {
-        // The buffer content-type parser guarantees a Buffer body (or none).
-        body: Buffer.isBuffer(request.body) ? request.body : Buffer.alloc(0),
-        contentType: request.headers["content-type"],
-      };
+        // Guard the relay target: a hostile subpath must never repoint the forward
+        // off the configured prover base (constitution III).
+        const subpath = request.params["*"];
+        if (!isSafeSubpath(subpath)) {
+          return sendError(reply, 400, "invalid prover subpath");
+        }
 
-      let result: ProxyResult;
-      try {
-        result = await proverClient.prove(proxyRequest);
-      } catch (error) {
-        // A transport/gateway fault is mapped to a sane 5xx — internals stay in the
-        // log, never in the response body (constitution III).
-        request.log.error({ err: error }, "prover: forward to interim prover failed");
-        return sendError(reply, 502, "prover unavailable");
-      }
+        // Per-session rate-limit seam (S9/D52): a denial short-circuits BEFORE any
+        // forward, so a throttled caller never reaches the prover.
+        const decision = await rateLimiter.check(session);
+        if (!decision.allowed) {
+          if (decision.retryAfterMs !== undefined) {
+            reply.header("retry-after", Math.ceil(decision.retryAfterMs / 1000));
+          }
+          return sendError(reply, 429, "rate limited");
+        }
 
-      // Relay the prover's opaque response (status + bytes + content-type) verbatim.
-      reply.code(result.status);
-      if (result.contentType !== undefined) {
-        reply.header("content-type", result.contentType);
-      }
-      return reply.send(result.body);
-    });
+        const proxyRequest: ProxyRequest = {
+          subpath,
+          // The buffer content-type parser guarantees a Buffer body (or none).
+          body: Buffer.isBuffer(request.body) ? request.body : Buffer.alloc(0),
+          contentType: request.headers["content-type"],
+        };
+
+        let result: ProxyResult;
+        try {
+          result = await proverClient.relay(proxyRequest);
+        } catch (error) {
+          // A transport/gateway fault is mapped to a sane 5xx — internals stay in the
+          // log, never in the response body (constitution III).
+          request.log.error({ err: error }, "prover: forward to interim prover failed");
+          return sendError(reply, 502, "prover unavailable");
+        }
+
+        // Relay the prover's opaque response (status + bytes + content-type) verbatim.
+        reply.code(result.status);
+        if (result.contentType !== undefined) {
+          reply.header("content-type", result.contentType);
+        }
+        return reply.send(result.body);
+      },
+    );
 
     done();
   });

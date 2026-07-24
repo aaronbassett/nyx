@@ -143,6 +143,10 @@ export const EnvSchema = z.object({
   COMPILE_FULL_TIMEOUT_MS: positiveInt.default(300_000),
   // Optional local SRS pre-fetch cache served read-only at `GET /srs/*` (demo prove speed).
   SRS_CACHE_DIR: z.string().min(1).optional(),
+  // Optional NyxtVault key-material dir (native-toolchain `keys/` + `zkir/`) served
+  // read-only at `GET /vault-artifacts/*` for the browser ceremony prover (P3 Task 4,
+  // SPIKE-2 §B/§D). Same idiom as SRS_CACHE_DIR; P5's env generation points it here.
+  VAULT_ARTIFACTS_DIR: z.string().min(1).optional(),
 
   // Network profile selection + optional per-field endpoint overrides. The
   // profile bundles PUBLIC endpoints (node/indexer/proof) + the connector's
@@ -248,6 +252,8 @@ export interface ArtifactStoreConfig {
   /** Per-project cap on the count of concurrently-staged (uncommitted) prefixes (M1). */
   readonly maxStagedPrefixesPerProject: number;
   readonly srsCacheDir: string | undefined;
+  /** Optional NyxtVault key-material dir served read-only at `GET /vault-artifacts/*` (P3). */
+  readonly vaultArtifactsDir: string | undefined;
 }
 
 /**
