@@ -62,4 +62,13 @@ describe.skipIf(!runLive)("devnet deploy executor (live)", () => {
   // `{ outcome: "finalized", address }` with a nonempty address. Unblocks when P5's funded wallet +
   // the two owner-gated SDK seams land (owner-gated; spends devnet tDUST).
   it.todo("deploys a real contract to the devnet and awaits finality to a nonempty address");
+
+  // The real tDUST balance read (P4 Task 3) — build the deploy wallet from a genesis seed via
+  // `createDevnetBalanceQuery`, wire `balance-sdk-adapter.ts`'s `readWalletBalance` seam
+  // (MidnightWalletProvider.build + .start() ~30 s sync + firstValueFrom(wallet.state()) →
+  // state.dust.balance(now), recipe element 5), then assert the query resolves a `bigint > 0n` for a
+  // genesis-funded, DUST-registered seed (`0x…01`–`0x…03`; NIGHT auto-registers for DUST on
+  // `.start()`). Unblocks with P5's funded wallet + the wired read seam (owner-gated; reads live
+  // wallet state, ~30 s wallet sync — no tDUST spent).
+  it.todo("reads the funded deploy wallet's tDUST balance from the devnet as a positive bigint");
 });
