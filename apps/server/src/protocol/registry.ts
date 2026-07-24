@@ -19,6 +19,15 @@ export function sessionKey(accountAddress: string, projectId: string): string {
   return JSON.stringify([accountAddress, projectId]);
 }
 
+/**
+ * Decode the account address a {@link sessionKey} was composed from — the inverse of the tuple
+ * encoding above. Used for account-scoped broadcast (e.g. a finalized-deposit `ledger:update`,
+ * which belongs to an ACCOUNT across all its open projects, not to one (account, project) key).
+ */
+export function accountFromKey(key: string): string {
+  return (JSON.parse(key) as [string, string])[0];
+}
+
 export interface SessionRegistry<TSocket> {
   /**
    * Register `socket` as the live connection for `key`, returning the socket it
@@ -34,6 +43,14 @@ export interface SessionRegistry<TSocket> {
   release(key: string, socket: TSocket): void;
   /** The live socket for `key`, if any. */
   get(key: string): TSocket | undefined;
+  /**
+   * Every live socket whose key belongs to `accountAddress` — an account-scoped broadcast target
+   * (a finalized-deposit `ledger:update` is credited to an account, not a single project). At
+   * most one socket per (account, project) is live (D40), so this is the account's currently-open
+   * projects. Empty when the account has no live connection (a boot-time deposit push is dropped —
+   * the client re-reads `GET /ledger` on next connect, so the balance is never lost).
+   */
+  socketsForAccount(accountAddress: string): TSocket[];
 }
 
 /** Create an in-memory {@link SessionRegistry}. */
@@ -52,6 +69,15 @@ export function createSessionRegistry<TSocket>(): SessionRegistry<TSocket> {
     },
     get(key) {
       return live.get(key);
+    },
+    socketsForAccount(accountAddress) {
+      const sockets: TSocket[] = [];
+      for (const [key, socket] of live) {
+        if (accountFromKey(key) === accountAddress) {
+          sockets.push(socket);
+        }
+      }
+      return sockets;
     },
   };
 }

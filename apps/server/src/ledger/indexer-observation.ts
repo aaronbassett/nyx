@@ -28,12 +28,21 @@
  * `contractAction` query) is production code with an injectable `fetch`; the per-ref amount
  * DECODE ({@link DepositsStateReader}) is an OWNER-GATED SDK seam — see that function's header.
  */
+import { encodeLedgerUpdateEvent } from "@nyx/protocol";
+import type {
+  DepositFailedEvent,
+  LedgerEntry,
+  LedgerUpdateEvent,
+  LedgerUpdateEventWire,
+  MidnightAddress,
+} from "@nyx/protocol";
 import type {
   CreditOutcome,
   DepositObservation,
   DepositStore,
   OpenDepositRef,
 } from "./deposits.js";
+import type { LedgerStore } from "./ledger.js";
 
 // --- The narrow indexer seam ------------------------------------------------
 
@@ -362,5 +371,117 @@ export function createDevnetDepositIndexerQuery(
       }
       return observations;
     },
+  };
+}
+
+// --- The credit-outcome → WS `ledger:update` push sink (Task 8) --------------
+
+/**
+ * One account-scoped outbound frame the boot layer routes to the depositor's live socket(s).
+ * `event` is ALREADY wire-encoded — its monetary `bigint`s are decimal STRINGS (via
+ * `encodeLedgerUpdateEvent`), so it is `JSON.stringify`-safe and the client never has to parse a
+ * bigint. The `deposit:failed` variant carries no money at all (strings only). `address` is the
+ * credit/failure's owning account, so the caller knows exactly whose connections to push to.
+ */
+export interface LedgerPush {
+  /** The account whose live connections receive this frame. */
+  readonly address: string;
+  /** The already-wire-encoded server→client frame. */
+  readonly event: LedgerUpdateEventWire | DepositFailedEvent;
+}
+
+/** Dependencies for {@link creditOutcomeToPush} — the ledger read seam + an event clock. */
+export interface CreditOutcomePushDeps {
+  /** Reads the account's entries to resolve the real `deposit_credit` row (its monotonic id). */
+  readonly ledger: Pick<LedgerStore, "getEntries">;
+  /** Event-timestamp clock; the boot layer passes `Date.now`. */
+  readonly now: () => number;
+}
+
+/**
+ * Map one {@link CreditOutcome} to the single outbound frame it should push, or `null` when it
+ * warrants none (logged-only outcomes). This is a RENDER signal only (FR-070): the client NEVER
+ * computes a balance — it REPLACES both balances from the server payload verbatim. We only
+ * surface what the store ALREADY decided; we never re-derive credit/settle/reserve semantics.
+ *
+ *  - `credited`   → one `ledger:update` carrying the resolved `deposit_credit` entry + the
+ *                   server's authoritative `available`/`reserved` (both server-derived folds).
+ *  - `failed`     → one `deposit:failed` diagnostic, but ONLY when the ref is known (the outcome
+ *                   carries the depositor `address`); an unregistered failure has nobody to route
+ *                   to, so it is a no-op here (the store already logged it).
+ *  - `already-credited` / `orphaned` / `ignored-unfinalized` → NO frame (nothing changed on the
+ *                   depositor's balance; the store's own logs/orphan table own those).
+ */
+export async function creditOutcomeToPush(
+  outcome: CreditOutcome,
+  deps: CreditOutcomePushDeps,
+): Promise<LedgerPush | null> {
+  switch (outcome.kind) {
+    case "credited": {
+      const entry = await resolveDepositCreditEntry(deps.ledger, outcome);
+      const update: LedgerUpdateEvent = {
+        type: "ledger:update",
+        payload: {
+          entry,
+          available: outcome.balance.available,
+          reserved: outcome.balance.reserved,
+        },
+        ts: deps.now(),
+      };
+      // Encode at the boundary: bigint money → decimal strings (the frame is JSON-safe).
+      return { address: outcome.address, event: encodeLedgerUpdateEvent(update) };
+    }
+    case "failed": {
+      if (outcome.address === undefined) {
+        return null; // unregistered failure — no account to route to (store already logged it)
+      }
+      const event: DepositFailedEvent = {
+        type: "deposit:failed",
+        payload: {
+          ref: outcome.ref,
+          txRef: outcome.txRef,
+          detail: `deposit ${outcome.ref} finalized on-chain as a FAILURE — nothing was credited`,
+        },
+        ts: deps.now(),
+      };
+      return { address: outcome.address, event };
+    }
+    case "already-credited":
+    case "orphaned":
+    case "ignored-unfinalized":
+      return null;
+  }
+}
+
+/**
+ * Resolve the `deposit_credit` {@link LedgerEntry} the store just wrote for this credit so the
+ * `ledger:update` carries its REAL monotonic `id` (the web ledger reducer's sequence cursor —
+ * a synthetic id would read as stale and be dropped). Scans newest-first for the entry matching
+ * this credit's `ref`. Mirrors `supervisor.resolveSettlementEntry`: a synthetic `id: 0n`
+ * fallback keeps the emit total in the impossible case the store returns no matching row.
+ */
+async function resolveDepositCreditEntry(
+  ledger: Pick<LedgerStore, "getEntries">,
+  outcome: { readonly address: string; readonly ref: string; readonly amount: bigint },
+): Promise<LedgerEntry> {
+  const entries = await ledger.getEntries(outcome.address);
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry?.kind === "deposit_credit" && entry.ref === outcome.ref) {
+      return {
+        id: entry.id,
+        accountAddress: entry.accountAddress as MidnightAddress,
+        kind: entry.kind,
+        amount: entry.amount,
+        ref: entry.ref,
+      };
+    }
+  }
+  return {
+    id: 0n,
+    accountAddress: outcome.address as MidnightAddress,
+    kind: "deposit_credit",
+    amount: outcome.amount,
+    ref: outcome.ref,
   };
 }

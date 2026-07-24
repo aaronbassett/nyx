@@ -74,6 +74,8 @@ describe("loadConfig — valid env", () => {
     expect(config.tunables.maxProjectBytes).toBe(52_428_800);
     expect(config.tunables.sessionLifetimeMs).toBe(604_800_000);
     expect(config.tunables.reconcileCadenceMs).toBe(86_400_000);
+    expect(config.tunables.depositPollIntervalMs).toBe(5_000);
+    expect(config.nyxtVaultAddress).toBe("");
     expect(config.prover.tokenLifetimeMs).toBe(300_000);
 
     expect(config.modelRouting.supervisor.provider).toBe("anthropic");

@@ -106,6 +106,14 @@ const serverToClientFixtures: Fixture[] = [
       ts,
     },
   },
+  {
+    name: "deposit:failed",
+    event: {
+      type: "deposit:failed",
+      payload: { ref: "dep-1", txRef: "0xtx", detail: "deposit finalized as FAILURE" },
+      ts,
+    },
+  },
 ];
 
 const clientToServerFixtures: Fixture[] = [

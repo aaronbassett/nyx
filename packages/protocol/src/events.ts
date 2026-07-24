@@ -270,6 +270,28 @@ export const encodeLedgerUpdateEvent = (event: LedgerUpdateEvent): LedgerUpdateE
   },
 });
 
+/**
+ * `deposit:failed` — a finalized on-chain deposit FAILURE for a known ref
+ * (scenario 6). `@nyx/protocol` models no `failed` `DepositStatus` nor failure
+ * `LedgerEntryKind`, so a failure cannot ride a raw `ledger:update` (its balances
+ * did NOT change — nothing was credited). This deposit-scoped diagnostic carries
+ * only strings (like `deploy:status`, no monetary `bigint`, hence no `encode*`
+ * helper); the web top-up subscription seam (`wallet/topup.tsx` `DepositUpdate`)
+ * maps it → the `failed` variant, matching on `ref`. It never asserts a balance,
+ * so FR-070 (the client never computes balances) is preserved untouched.
+ */
+export const DepositFailedPayloadSchema = z.object({
+  /** The deposit reference the on-chain failure carried (the subscription match key). */
+  ref: z.string().min(1),
+  /** The on-chain transaction reference (diagnostics / orphan resolution). */
+  txRef: z.string(),
+  /** A human-readable reason surfaced by the top-up UI. */
+  detail: z.string(),
+});
+export type DepositFailedPayload = z.infer<typeof DepositFailedPayloadSchema>;
+export const DepositFailedEventSchema = eventSchema("deposit:failed", DepositFailedPayloadSchema);
+export type DepositFailedEvent = z.infer<typeof DepositFailedEventSchema>;
+
 /** Every event the server may send to the client (D12/D62). */
 export const ServerToClientEventSchema = z.discriminatedUnion("type", [
   FileWriteEventSchema,
@@ -284,6 +306,7 @@ export const ServerToClientEventSchema = z.discriminatedUnion("type", [
   CompileRunEventSchema,
   DeployStatusEventSchema,
   LedgerUpdateEventSchema,
+  DepositFailedEventSchema,
 ]);
 export type ServerToClientEvent = z.infer<typeof ServerToClientEventSchema>;
 

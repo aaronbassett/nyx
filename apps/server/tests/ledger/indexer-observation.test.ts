@@ -21,6 +21,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createDevnetDepositIndexerQuery,
   createObservationPoller,
+  creditOutcomeToPush,
   DepositIndexerNotWiredError,
   IndexerUnavailableError,
   type DepositIndexerQuery,
@@ -31,6 +32,7 @@ import type {
   DepositStore,
   OpenDepositRef,
 } from "../../src/ledger/deposits.js";
+import type { LedgerEntryRecord, LedgerStore } from "../../src/ledger/ledger.js";
 
 // --- Test doubles -----------------------------------------------------------
 
@@ -466,5 +468,106 @@ describe("createDevnetDepositIndexerQuery", () => {
       // readDepositsState omitted → the real SDK decode is owner-gated.
     });
     await expect(query.findDeposits([REF_A])).rejects.toBeInstanceOf(DepositIndexerNotWiredError);
+  });
+});
+
+// --- creditOutcomeToPush (the Task 8 sink → ledger:update push) --------------
+
+/** A `getEntries`-only ledger double returning a canned entry list for one address. */
+function getEntriesMock(entries: LedgerEntryRecord[]): Pick<LedgerStore, "getEntries"> {
+  return { getEntries: vi.fn(() => Promise.resolve(entries)) };
+}
+
+/** A `deposit_credit` ledger row (the entry the credited push resolves for its real id). */
+function creditEntry(overrides: Partial<LedgerEntryRecord> = {}): LedgerEntryRecord {
+  return {
+    id: 77n,
+    accountAddress: "mn_addr_alice",
+    kind: "deposit_credit",
+    amount: 5_000n,
+    ref: "dep-ref-1",
+    createdAt: 1_000,
+    ...overrides,
+  };
+}
+
+const CREDITED: Extract<CreditOutcome, { kind: "credited" }> = {
+  kind: "credited",
+  ref: "dep-ref-1",
+  address: "mn_addr_alice",
+  amount: 5_000n,
+  balance: { available: 5_000n, reserved: 0n },
+};
+
+const NOW = 1_720_000_000_000;
+
+describe("creditOutcomeToPush", () => {
+  it("maps a credited outcome to exactly ONE encoded ledger:update for the depositor's address", async () => {
+    const ledger = getEntriesMock([creditEntry()]);
+    const push = await creditOutcomeToPush(CREDITED, { ledger, now: () => NOW });
+
+    expect(push).not.toBeNull();
+    expect(push?.address).toBe("mn_addr_alice");
+    expect(push?.event.type).toBe("ledger:update");
+    // Money is DECIMAL STRINGS on the wire (encode* helper used) — never JSON numbers/bigint.
+    const payload = (push?.event as { payload: Record<string, unknown> }).payload;
+    expect(payload.available).toBe("5000");
+    expect(payload.reserved).toBe("0");
+    const entry = payload.entry as Record<string, unknown>;
+    expect(entry.id).toBe("77"); // the REAL resolved entry id (monotonic sequence, not synthetic)
+    expect(entry.amount).toBe("5000");
+    expect(entry.kind).toBe("deposit_credit");
+    expect(entry.ref).toBe("dep-ref-1");
+  });
+
+  it("falls back to a synthetic id:0 entry when no matching deposit_credit row is found", async () => {
+    const ledger = getEntriesMock([]); // store returned nothing for this address
+    const push = await creditOutcomeToPush(CREDITED, { ledger, now: () => NOW });
+
+    const entry = (push?.event as { payload: { entry: Record<string, unknown> } }).payload.entry;
+    expect(entry.id).toBe("0");
+    expect(entry.amount).toBe("5000"); // still carries the credited amount + ref
+    expect(entry.ref).toBe("dep-ref-1");
+  });
+
+  it("maps a finalized FAILURE with a known address to a deposit:failed frame (no ledger read)", async () => {
+    const ledger = getEntriesMock([]);
+    const failed: CreditOutcome = {
+      kind: "failed",
+      ref: "dep-ref-9",
+      txRef: "0xdead",
+      amount: 5_000n,
+      address: "mn_addr_bob",
+    };
+    const push = await creditOutcomeToPush(failed, { ledger, now: () => NOW });
+
+    expect(push?.address).toBe("mn_addr_bob");
+    expect(push?.event.type).toBe("deposit:failed");
+    const payload = (push?.event as { payload: Record<string, unknown> }).payload;
+    expect(payload.ref).toBe("dep-ref-9");
+    expect(payload.txRef).toBe("0xdead");
+    expect(typeof payload.detail).toBe("string");
+    // A failure never reads or asserts a balance (nothing was credited) — FR-070 untouched.
+    expect(ledger.getEntries).not.toHaveBeenCalled();
+  });
+
+  it("maps a FAILURE for an UNREGISTERED ref (no address) to no frame (logged only)", async () => {
+    const failed: CreditOutcome = {
+      kind: "failed",
+      ref: "dep-ref-x",
+      txRef: "0xbeef",
+      amount: 5_000n,
+    };
+    const push = await creditOutcomeToPush(failed, { ledger: getEntriesMock([]), now: () => NOW });
+    expect(push).toBeNull();
+  });
+
+  it.each([
+    { kind: "already-credited", ref: "r" },
+    { kind: "orphaned", ref: "r", txRef: "0x", amount: 1n },
+    { kind: "ignored-unfinalized", ref: "r" },
+  ] as CreditOutcome[])("maps $kind to NO frame (logged only)", async (outcome) => {
+    const push = await creditOutcomeToPush(outcome, { ledger: getEntriesMock([]), now: () => NOW });
+    expect(push).toBeNull();
   });
 });

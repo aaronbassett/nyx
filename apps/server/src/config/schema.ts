@@ -200,7 +200,14 @@ export const EnvSchema = z.object({
   VERSION_RETENTION_COUNT: positiveInt.default(50), // versions retained (D48)
   VERSION_RETENTION_DAYS: positiveInt.default(30), // days retained (D48)
   DEPOSIT_REF_TTL_MS: positiveInt.default(3_600_000), // 1 h deposit-ref TTL (D45)
+  DEPOSIT_POLL_INTERVAL_MS: positiveInt.default(5_000), // indexer deposit-observation poll cadence (P3)
   RECONCILE_CADENCE_MS: positiveInt.default(86_400_000), // daily reconcile (D56)
+  // The deployed NyxtVault contract address the deposit-observation poller reads the on-chain
+  // `deposits` map from (P3 Task 7). OPTIONAL with an empty default so no NEW required env var
+  // breaks a test fixture; the real per-deposit decode is owner-gated, so an unset address just
+  // leaves the poller armed-but-gated (a tick faults + is logged, never crediting) — the honest
+  // "not wired" state. A public address (a contract identifier, not a credential).
+  NYXT_VAULT_ADDRESS: z.string().default(""),
   // Clone/handoff git-HTTP rate limit (US13/EC-55) — a token/IP token bucket. All three
   // are OPTIONAL with sane defaults, so no NEW required env var (adding one would break
   // every server test fixture). A ~30-attempt burst refilling 30/min throttles a token
@@ -275,6 +282,8 @@ export interface Tunables {
   readonly versionRetentionCount: number;
   readonly versionRetentionDays: number;
   readonly depositRefTtlMs: number;
+  /** Indexer deposit-observation poll cadence, in ms (P3 Task 8). */
+  readonly depositPollIntervalMs: number;
   readonly reconcileCadenceMs: number;
   readonly sessionLifetimeMs: number;
   /** Bounded per-cycle browser CHECK wait (D42 no-hang backstop), in ms. */
@@ -324,6 +333,12 @@ export interface Config {
    */
   readonly publicOrigin: string;
   readonly network: NetworkConfig;
+  /**
+   * The deployed NyxtVault contract address the deposit-observation poller reads from (P3).
+   * A public contract identifier (never a credential) — flows into {@link PublicConfig}. Empty
+   * when unset (the poller stays armed-but-gated until the owner-gated decode + address land).
+   */
+  readonly nyxtVaultAddress: string;
   readonly mcp: McpConfig;
   readonly prover: ProverConfig;
   /** Durable artifact store root + size caps + optional SRS cache (P2 browser-compile). */
