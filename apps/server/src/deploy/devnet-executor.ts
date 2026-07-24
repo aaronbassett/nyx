@@ -334,7 +334,21 @@ export function createDevnetDeployExecutor(deps: DevnetDeployExecutorDeps): Depl
   const now = deps.now ?? Date.now;
   const delay = deps.delay ?? defaultDelay;
   const pollIntervalMs = deps.finalityPollIntervalMs ?? DEFAULT_FINALITY_POLL_INTERVAL_MS;
-  const logError = deps.logError ?? defaultLogError;
+  const rawLogError = deps.logError ?? defaultLogError;
+  // L-2: a GUARDED log sink (mirrors the pipeline's guarded emit sink). A THROWING injected
+  // `logError` must NEVER reject a seam method — most acutely on the MONEY path: a throw on the
+  // `awaitFinality` address-unavailable branch (the tx is already finalized on-chain) would escape
+  // into the pipeline's generic backstop → marked RETRIABLE → a re-drive → a CERTAIN second on-chain
+  // deploy (tDUST double-spend). Routing every `logError(...)` call through this swallow keeps all
+  // sites named `logError(` (so the SC-031 log-surface audit still greps them) while no site can
+  // reject. (Deliberately no re-log on failure — a log sink that just threw cannot log its own fault.)
+  const logError = (message: string, detail: Record<string, unknown>): void => {
+    try {
+      rawLogError(message, detail);
+    } catch {
+      // A throwing log sink must never abort a deploy seam method (esp. the finalized money path).
+    }
+  };
 
   // Per-wallet submission mutex (SPIKE-2 risk 7): a simple promise chain so every `signAndSubmit`
   // awaits the prior one — concurrent projects' deploys share the one deploy wallet, and their

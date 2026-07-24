@@ -671,6 +671,37 @@ describe("createDeployPipeline", () => {
     expect(h.logs.some((entry) => entry.detail.txRef === TX_REF)).toBe(true);
   });
 
+  // --- M-1: address-unavailable is memoised (a same-requestId re-run replays, never re-drives) ---
+
+  it("M-1: a same-requestId re-run after address-unavailable REPLAYS it — the executor is NOT re-driven (no CERTAIN second on-chain tx)", async () => {
+    // The finality is `address-unavailable`: the tx FINALIZED on-chain but the address could not be
+    // extracted — the money-critical NON-retriable terminal. Because the tx is finalized, a re-drive
+    // would double-deploy for CERTAIN (and there is no registry row, so tx_ref idempotency is no
+    // belt either), so the terminal MUST be memoised exactly like `deployed`/`record-failed`.
+    const h = makeHarness({ finality: { outcome: "address-unavailable" } });
+    const pipeline = createDeployPipeline(h.deps);
+
+    const first = await pipeline.runDeploy(inputWith(GREEN_BUILD));
+    expect(first).toEqual({ kind: "address-unavailable", txRef: TX_REF, retriable: false });
+    // The first run drove the executor EXACTLY once through prove → submit → finality.
+    expect(h.executorCalls.prove).toHaveLength(1);
+    expect(h.executorCalls.submit).toHaveLength(1);
+    expect(h.executorCalls.finality).toHaveLength(1);
+    const statusesAfterFirst = h.statuses.length;
+
+    // A re-run with the SAME requestId REPLAYS the memoised address-unavailable: the executor call
+    // counts do NOT grow (no second prove/submit/finality → no CERTAIN second on-chain tx), nothing
+    // is announced, and no new status is streamed.
+    const replay = await pipeline.runDeploy(inputWith(GREEN_BUILD));
+
+    expect(replay).toEqual(first);
+    expect(h.executorCalls.prove).toHaveLength(1); // NOT re-driven
+    expect(h.executorCalls.submit).toHaveLength(1); // NOT re-driven
+    expect(h.executorCalls.finality).toHaveLength(1); // NOT re-driven
+    expect(h.deployed).toHaveLength(0); // still nothing announced
+    expect(h.statuses).toHaveLength(statusesAfterFirst); // a replay streams no new status
+  });
+
   // --- I2: a submit `unavailable` cause is a PLATFORM fault, never a node rejection --------------
 
   it("I2: a submit `unavailable` (adapter-not-wired) rejection is a PLATFORM fault, never impersonating a node rejection", async () => {

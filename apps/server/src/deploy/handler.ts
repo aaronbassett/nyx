@@ -84,6 +84,7 @@ import type {
   ServerToClientEvent,
 } from "@nyx/protocol";
 import type { ConnectionContext, EventRouter } from "../protocol/router.js";
+import { errorNameOf } from "./devnet-executor.js";
 import type { DeployArtifacts, DeployPipeline } from "./pipeline.js";
 import { InsufficientDeployFundsError, PLATFORM_REFUELLING_MESSAGE } from "./wallet.js";
 import type { DeployWalletMonitor } from "./wallet.js";
@@ -311,7 +312,7 @@ export function createDeployHandler(deps: DeployHandlerDeps): DeployHandler {
           logError("deploy funds gate failed — surfacing a platform fault", {
             projectId,
             requestId,
-            errorName: (error as { name?: unknown } | null)?.name,
+            errorName: errorNameOf(error),
           });
           // EC-38: an exhausted deploy wallet (or any funds-gate fault) is a PLATFORM issue, never
           // the user's fault — surface the platform-framed message and deploy nothing (no pipeline

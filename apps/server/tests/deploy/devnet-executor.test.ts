@@ -594,8 +594,10 @@ describe("createDevnetDeployExecutor.awaitFinality", () => {
     const { store } = await seedStore();
     const clock = injectedClock();
     const logs: { message: string; detail: Record<string, unknown> }[] = [];
-    // The sdk-adapter's finalized-but-no-address signal (matched by name, no SDK import).
-    const notWired = new Error("finalized-deploy address extraction (confirm the subfield ...)");
+    // The sdk-adapter's finalized-but-no-address signal (matched by name, no SDK import). Its MESSAGE
+    // maliciously echoes the signing key (a real SDK error could) — the canary below proves the
+    // key-bearing message never reaches the sink (name-only logging, SC-031).
+    const notWired = new Error(`finalized-deploy address extraction failed key=${CANARY_KEY}`);
     notWired.name = "DeploySdkNotWiredError";
     const executor = createDevnetDeployExecutor({
       signingKey: CANARY_KEY,
@@ -617,6 +619,35 @@ describe("createDevnetDeployExecutor.awaitFinality", () => {
     expect(logs).toHaveLength(1);
     expect(logs[0]?.detail.txRef).toBe("tx-deadbeef");
     expect(logs[0]?.detail.errorName).toBe("DeploySdkNotWiredError");
+    // SC-031 canary: the key-echoing error message never reaches the sink (name-only logging).
+    expect(JSON.stringify(logs)).not.toContain(CANARY_KEY);
+  });
+
+  it("L-2: a THROWING logError on the address-unavailable path still yields the NON-retriable terminal (never rejects → never a retriable double-deploy)", async () => {
+    const { store } = await seedStore();
+    const clock = injectedClock();
+    // The finalized-but-no-address signal — the money-critical path (the tx IS finalized on-chain).
+    const notWired = new Error("finalized-deploy address extraction failed");
+    notWired.name = "DeploySdkNotWiredError";
+    const executor = createDevnetDeployExecutor({
+      signingKey: CANARY_KEY,
+      network: NETWORK,
+      proverClient: fakeProverClient(() => Promise.resolve(okProxyResult(new Uint8Array()))),
+      artifacts: store,
+      sdk: fakeSdk({ queryFinality: () => Promise.reject(notWired) }),
+      now: clock.now,
+      delay: clock.delay,
+      // A THROWING log sink: if awaitFinality did not guard the logError call, this throw would
+      // reject awaitFinality → the pipeline backstop marks it RETRIABLE → a re-drive → a CERTAIN
+      // second on-chain deploy (double-spend). The guard swallows it and preserves the terminal.
+      logError: () => {
+        throw new Error("log sink is down");
+      },
+    });
+
+    const finality = await executor.awaitFinality({ txRef: "tx-deadbeef", timeoutMs: 60_000 });
+    // Never rejects; still the distinct NON-retriable terminal despite the throwing sink.
+    expect(finality).toEqual({ outcome: "address-unavailable" });
   });
 });
 

@@ -79,6 +79,25 @@ const EMITTED_FRAME_LINE =
 const LOG_SURFACE_LINE =
   /console\s*\.\s*\w+\s*\(|process\s*\.\s*(?:stdout|stderr)\s*\.\s*write\s*\(|logError\s*\(/;
 
+/**
+ * The FULL argument span of a `logError(...)` CALL, across newlines, up to its terminating `);`.
+ * The per-line {@link LOG_SURFACE_LINE} scan sees a multi-line call's `logError(` OPENER line only —
+ * so a `signingKey` on a CONTINUATION line (the detail object below the opener, as in the executor's
+ * money-critical address-unavailable log) would slip past it. This span match captures every line of
+ * the call so a key on ANY of them is caught. The `logError` token is lowercase-anchored, matching
+ * the seams' guarded `logError(...)` call sites but NOT the `defaultLogError`/`rawLogError`
+ * definitions (capital L → no lowercase `logError(` substring), so only real calls are scanned.
+ * The terminator is an END-OF-LINE `);` (the `m` flag anchors `$` per line) — NOT merely the first
+ * `);`. That matters: the executor's address-unavailable message literally contains "double-deploy);
+ * ops reconcile", whose mid-line `);` would otherwise truncate the span BEFORE the detail object —
+ * the exact blind spot L-1 closes. A real call's closing `);` sits alone at the end of its line, so
+ * anchoring to end-of-line captures the WHOLE call (message + detail). Built fresh per use (`gm`) to
+ * avoid shared `lastIndex` state.
+ */
+const LOG_ERROR_CALL_SPAN_SOURCE = String.raw`logError\s*\(([\s\S]*?)\);\s*$`;
+/** Flags for {@link LOG_ERROR_CALL_SPAN_SOURCE}: `g` to scan all calls, `m` to anchor `$` per line. */
+const LOG_ERROR_CALL_SPAN_FLAGS = "gm";
+
 // --- A complete, valid env (mirrors config.test.ts) so `loadConfig` yields a real Config. ---
 
 function routingJson(): string {
@@ -224,6 +243,45 @@ describe("SC-031: the deploy key never flows into an outbound frame (source audi
     }
   });
 
+  it("no logError(...) call span carries key material — even on a continuation line (L-1)", () => {
+    // The per-line scan above cannot see a `signingKey` on a logError CONTINUATION line (a multi-line
+    // call whose detail object sits below the `logError(` opener — e.g. the executor's money-critical
+    // address-unavailable log). Scan each call's FULL argument span so a key on ANY of its lines is
+    // caught. The seams pass `errorName`/`txRef`/key-free context only, so this must PASS today.
+    for (const { file, source } of readOutboundSurfaceSources()) {
+      for (const [span] of source.matchAll(
+        new RegExp(LOG_ERROR_CALL_SPAN_SOURCE, LOG_ERROR_CALL_SPAN_FLAGS),
+      )) {
+        expect(
+          span,
+          `${file}: a logError(...) call must not reference a key/secret (incl. signingKey) on ANY of its lines`,
+        ).not.toMatch(FORBIDDEN_KEY_TOKENS);
+      }
+    }
+  });
+
+  it("the span scan captures the executor's address-unavailable call WHOLE (message + detail, no truncation)", () => {
+    // Positive coverage / regression guard: the executor's money-critical address-unavailable log
+    // has a message that literally contains "double-deploy);" — a mid-line `);`. The span terminator
+    // must NOT stop there (that would drop the detail object below it from the scan), so at least one
+    // captured span must contain BOTH the "UNAVAILABLE" message marker AND its `errorName` detail key.
+    const executor = readDeploySources().find((entry) => entry.file === "devnet-executor.ts");
+    expect(executor).toBeDefined();
+    const spans = [
+      ...(executor?.source ?? "").matchAll(
+        new RegExp(LOG_ERROR_CALL_SPAN_SOURCE, LOG_ERROR_CALL_SPAN_FLAGS),
+      ),
+    ].map(([span]) => span);
+    const addressUnavailableSpan = spans.find((span) => span.includes("UNAVAILABLE"));
+    expect(
+      addressUnavailableSpan,
+      "the address-unavailable logError call must be captured",
+    ).toBeDefined();
+    // Whole-call capture: the detail's `errorName` (which sits BELOW the mid-line `);`) is in the span.
+    expect(addressUnavailableSpan).toContain("errorName");
+    expect(addressUnavailableSpan).toContain("txRef");
+  });
+
   it("the publicConfig constructor references no secret/deployKey", () => {
     const configIndex = readFileSync(
       fileURLToPath(new URL("../../src/config/index.ts", import.meta.url)),
@@ -326,6 +384,30 @@ describe("SC-031: the audit catches a real leak (regex self-check)", () => {
     // The sanctioned shape the executor/handler actually use: the error NAME only, never the key.
     const safe = '    logError("deploy build failed", { phase: "proving", errorName: name });';
     expect(safe).not.toMatch(FORBIDDEN_KEY_TOKENS);
+  });
+
+  it("the span scan catches a MULTI-LINE logError with signingKey on a continuation line (L-1)", () => {
+    // The exact blind spot L-1 closes: a multi-line call whose OPENER line is clean but whose detail
+    // object (a continuation line) carries the key — the shape of the executor's money-critical
+    // address-unavailable log.
+    const violation = [
+      "          logError(",
+      '            "deploy FINALIZED on-chain but the contract address was UNAVAILABLE",',
+      "            { txRef: request.txRef, signingKey: deps.signingKey },",
+      "          );",
+    ].join("\n");
+    const openerLine = violation.split("\n")[0] ?? "";
+    // The per-line scan sees the opener (a log surface) but the opener alone is CLEAN — so the old
+    // per-line check would MISS the key sitting on the continuation line below it.
+    expect(openerLine).toMatch(LOG_SURFACE_LINE);
+    expect(openerLine).not.toMatch(FORBIDDEN_KEY_TOKENS);
+    // The full-span scan captures every line of the call and DOES catch the leaked signingKey.
+    const [span] =
+      [
+        ...violation.matchAll(new RegExp(LOG_ERROR_CALL_SPAN_SOURCE, LOG_ERROR_CALL_SPAN_FLAGS)),
+      ][0] ?? [];
+    expect(span).toBeDefined();
+    expect(span).toMatch(FORBIDDEN_KEY_TOKENS);
   });
 
   it("does NOT flag the executor's legitimate signingKey field type declaration or private read", () => {

@@ -12,10 +12,11 @@
  * `contract:deployed` and the registry write happen ONLY on a `finalized` finality — never
  * before, and never on a `reorged` / `timeout` / `failed` finality. So a reorg produces NO
  * phantom address (SC-029/EC-42), a timeout is an explicit, retriable pending-then-timeout
- * (EC-39 — never a hanging spinner), and a re-run of an already-TERMINAL `requestId` — `deployed`
- * OR `record-failed` (BUG 2) — is a pure replay that re-drives NOTHING on-chain (no second tx)
- * and neither re-records nor re-emits (the in-process `completed` memo holds both terminal arms,
- * backed by the registry's own idempotency — the deposits belt-and-suspenders shape).
+ * (EC-39 — never a hanging spinner), and a re-run of an already-TERMINAL `requestId` — `deployed`,
+ * `record-failed` (BUG 2), OR `address-unavailable` (M-1) — is a pure replay that re-drives NOTHING
+ * on-chain (no second tx) and neither re-records nor re-emits (the in-process `completed` memo holds
+ * all three terminal arms, backed by the registry's own idempotency — the deposits belt-and-
+ * suspenders shape; for `address-unavailable` there is no registry row, so the memo is the sole belt).
  *
  * NEVER-REJECT BACKSTOP (defect C1, mirrors the turn coordinator's catch-all). The
  * {@link DeployExecutor} seam is documented "failure is DATA, never a throw", but the real
@@ -294,7 +295,9 @@ export type DeployResult =
    * SECOND on-chain deploy (real tDUST double-spend). `contract:deployed` is NOT announced (there
    * is no address); ops reconcile the on-chain contract into the registry from the `txRef` + the
    * loud server log. Distinct from `record-failed` (which HAS an address) — here the address is
-   * the very thing that is missing.
+   * the very thing that is missing. It IS memoised (M-1), so a same-`requestId` re-run REPLAYS this
+   * terminal verbatim (no re-drive, no CERTAIN second on-chain tx); and because there is no registry
+   * row, the memo is the SOLE guard — only a fresh `requestId` deliberately double-deploys.
    */
   | {
       readonly kind: "address-unavailable";
@@ -308,15 +311,22 @@ type DeployedResult = Extract<DeployResult, { readonly kind: "deployed" }>;
 /** The `record-failed` arm of {@link DeployResult} — a finalized-but-unrecordable deploy (C1). */
 type RecordFailedResult = Extract<DeployResult, { readonly kind: "record-failed" }>;
 
+/** The `address-unavailable` arm of {@link DeployResult} — a finalized-but-address-less deploy (I1). */
+type AddressUnavailableResult = Extract<DeployResult, { readonly kind: "address-unavailable" }>;
+
 /**
- * The TERMINAL, memoised arms of {@link DeployResult} (BUG 2) — `deployed` OR `record-failed`.
- * Both are the FINAL on-chain outcome of a `requestId` (the contract either recorded, or landed
- * on-chain but was unrecordable), so a same-`requestId` re-run REPLAYS the memoised result
- * verbatim — it never re-drives `prove`→`signAndSubmit`→`awaitFinality` (no second on-chain tx /
- * tDUST double-spend). The honestly-retriable arms (`failed`/`timeout`/`reorged`/`rejected`) are
- * deliberately NOT memoised — a same-`requestId` re-run of those genuinely re-attempts.
+ * The TERMINAL, memoised arms of {@link DeployResult} (BUG 2 / M-1) — `deployed`, `record-failed`,
+ * OR `address-unavailable`. All three are the FINAL on-chain outcome of a `requestId` (the contract
+ * either recorded, or landed on-chain but was unrecordable, or landed on-chain with no extractable
+ * address), so a same-`requestId` re-run REPLAYS the memoised result verbatim — it never re-drives
+ * `prove`→`signAndSubmit`→`awaitFinality` (no second on-chain tx / tDUST double-spend). This is
+ * ESPECIALLY load-bearing for `address-unavailable`: the tx IS finalized yet there is NO registry
+ * row, so the registry's tx_ref idempotency is no belt — the memo is the ONLY guard against a
+ * CERTAIN second on-chain deploy on a same-`requestId` re-entry. The honestly-retriable arms
+ * (`failed`/`timeout`/`reorged`/`rejected`) are deliberately NOT memoised — a same-`requestId`
+ * re-run of those genuinely re-attempts.
  */
-type TerminalDeployResult = DeployedResult | RecordFailedResult;
+type TerminalDeployResult = DeployedResult | RecordFailedResult | AddressUnavailableResult;
 
 /** The public pipeline surface. */
 export interface DeployPipeline {
@@ -431,12 +441,13 @@ function defaultDelay(ms: number): Promise<void> {
 
 /**
  * Build the deploy pipeline over its injected seams. The returned `runDeploy` closes over an
- * in-process `completed` memo (keyed by `requestId`) holding BOTH terminal on-chain arms
- * ({@link TerminalDeployResult} — `deployed` OR `record-failed`, BUG 2), so a re-run of an
- * already-terminal request is a pure replay — it never re-drives the executor (no second on-chain
- * tx), never re-records, and never re-emits `contract:deployed` (exactly-once, SC-029). Durable
- * exactly-once rests on the registry's own idempotency; the memo is the fast in-process guard,
- * mirroring the deposits credit-first / flip-second belt-and-suspenders.
+ * in-process `completed` memo (keyed by `requestId`) holding ALL THREE terminal on-chain arms
+ * ({@link TerminalDeployResult} — `deployed`, `record-failed`, OR `address-unavailable`; BUG 2 /
+ * M-1), so a re-run of an already-terminal request is a pure replay — it never re-drives the
+ * executor (no second on-chain tx), never re-records, and never re-emits `contract:deployed`
+ * (exactly-once, SC-029). Durable exactly-once rests on the registry's own idempotency where a row
+ * exists; for `address-unavailable` (no registry row) the memo is the sole guard against a certain
+ * double-deploy. It mirrors the deposits credit-first / flip-second belt-and-suspenders.
  */
 export function createDeployPipeline(deps: DeployPipelineDeps): DeployPipeline {
   const now = deps.now ?? Date.now;
@@ -593,10 +604,11 @@ export function createDeployPipeline(deps: DeployPipelineDeps): DeployPipeline {
   }
 
   async function runDeploy(input: DeployInput): Promise<DeployResult> {
-    // Exactly-once replay (SC-029 + BUG 2): a `requestId` that already reached a TERMINAL on-chain
-    // outcome — `deployed` OR `record-failed` — returns its memoised result with NO re-drive of the
-    // executor (no second on-chain tx), NO re-record, and NO re-emit, even if runDeploy is
-    // re-entered. Only the retriable arms are not memoised, so those genuinely re-attempt.
+    // Exactly-once replay (SC-029 + BUG 2 + M-1): a `requestId` that already reached a TERMINAL
+    // on-chain outcome — `deployed`, `record-failed`, OR `address-unavailable` — returns its memoised
+    // result with NO re-drive of the executor (no second on-chain tx), NO re-record, and NO re-emit,
+    // even if runDeploy is re-entered. Only the retriable arms (`failed`/`timeout`/`reorged`/
+    // `rejected`) are not memoised, so those genuinely re-attempt.
     const prior = completed.get(input.requestId);
     if (prior !== undefined) {
       return prior;
@@ -694,7 +706,7 @@ export function createDeployPipeline(deps: DeployPipelineDeps): DeployPipeline {
             reason: finality.reason,
             retriable: true,
           };
-        case "address-unavailable":
+        case "address-unavailable": {
           // I1 (money-critical) — the tx FINALIZED on-chain but the executor could not extract the
           // contract address. Do NOT retry (a retry double-deploys — the tx is finalized). Announce
           // nothing (there is no address); log LOUDLY (ops reconcile from the txRef); give a
@@ -708,7 +720,20 @@ export function createDeployPipeline(deps: DeployPipelineDeps): DeployPipeline {
             },
           );
           emitStatus(input.requestId, "failed", DEPLOY_FAILURE_DETAIL.addressUnavailable);
-          return { kind: "address-unavailable", txRef: submitOutcome.txRef, retriable: false };
+          // M-1: memoise this terminal too (mirror `record-failed`). `requestId` is the exactly-once
+          // idempotency key, so a same-`requestId` re-run must REPLAY this terminal — NOT re-drive
+          // prove→signAndSubmit→awaitFinality (which would fund a CERTAIN second on-chain tx: the tx
+          // IS finalized). And there is NO registry row here, so the registry's tx_ref idempotency is
+          // no belt — the memo is the ONLY guard. Only a fresh `requestId` deliberately double-deploys
+          // (ops' explicit reconcile choice).
+          const addressUnavailable: AddressUnavailableResult = {
+            kind: "address-unavailable",
+            txRef: submitOutcome.txRef,
+            retriable: false,
+          };
+          completed.set(input.requestId, addressUnavailable);
+          return addressUnavailable;
+        }
         default:
           return assertNever(finality);
       }
