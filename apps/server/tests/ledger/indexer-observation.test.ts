@@ -383,6 +383,49 @@ describe("createObservationPoller", () => {
     await expect(listOpenRefs(0)).resolves.toEqual([]);
   });
 
+  it("isolates a rejecting expireStale: the tick still lists + credits its observations (I4)", async () => {
+    const timer = makeFakeTimer();
+    const boom = new Error("sweep hiccup");
+    // The sweep rejects, but that must NOT abort listing/query/crediting this tick.
+    const expireStale = vi.fn<DepositStore["expireStale"]>(() => Promise.reject(boom));
+    const credited: CreditOutcome = {
+      kind: "credited",
+      ref: FINALIZED_SUCCESS.ref,
+      address: "mn_addr_alice",
+      amount: 5_000n,
+      balance: { available: 5_000n, reserved: 0n },
+    };
+    const observeFinalized = vi.fn<DepositStore["observeFinalized"]>(() =>
+      Promise.resolve(credited),
+    );
+    const listOpenRefs = listOpenRefsMock(FINALIZED_SUCCESS.ref);
+    const findDeposits = vi.fn<DepositIndexerQuery["findDeposits"]>(() =>
+      Promise.resolve([FINALIZED_SUCCESS]),
+    );
+    const outcomes: CreditOutcome[] = [];
+    const errors: unknown[] = [];
+    const poller = createObservationPoller({
+      store: { listOpenRefs, observeFinalized, expireStale },
+      query: { findDeposits },
+      intervalMs: 1_000,
+      graceMs: 0,
+      onOutcome: (o) => outcomes.push(o),
+      onError: (e) => errors.push(e),
+      schedule: timer.schedule,
+    });
+
+    poller.start();
+    await timer.fire();
+
+    // The sweep fault is reported, but listing + query + crediting proceeded regardless.
+    expect(errors).toEqual([boom]);
+    expect(listOpenRefs).toHaveBeenCalledTimes(1);
+    expect(findDeposits).toHaveBeenCalledTimes(1);
+    expect(observeFinalized).toHaveBeenCalledTimes(1);
+    expect(outcomes).toEqual([credited]); // credit delivered THIS tick, not deferred by the sweep
+    expect(timer.armed()).toBe(true); // and the loop survives to the next tick
+  });
+
   it("isolates a per-observation store rejection: later observations still credit (I3)", async () => {
     const timer = makeFakeTimer();
     const obsA: DepositObservation = { ...FINALIZED_SUCCESS, ref: "aa".repeat(32) };

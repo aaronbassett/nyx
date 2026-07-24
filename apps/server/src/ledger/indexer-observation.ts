@@ -137,8 +137,15 @@ export function createObservationPoller(deps: ObservationPollerDeps): Observatio
   async function tick(gen: number): Promise<void> {
     try {
       // I2 — sweep abandoned pre-registered refs past their TTL → `expired` (EC-29) BEFORE
-      // listing, so they leave `listOpenRefs` and stop accruing poller work / row growth.
-      await deps.store.expireStale();
+      // listing, so they leave `listOpenRefs` and stop accruing poller work / row growth. The
+      // sweep is ISOLATED in its own try/catch (I4): a sweep rejection must NOT abort this tick's
+      // listing/query/crediting (that only DELAYS a credit — money-safe, the store is idempotent —
+      // but is avoidable). Report the sweep fault and carry on to the observations regardless.
+      try {
+        await deps.store.expireStale();
+      } catch (error) {
+        deps.onError?.(error);
+      }
       const open: readonly OpenDepositRef[] = await deps.store.listOpenRefs(deps.graceMs);
       if (open.length > 0) {
         const observations = await deps.query.findDeposits(open.map((row) => row.ref));
