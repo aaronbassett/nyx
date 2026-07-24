@@ -192,6 +192,20 @@ query (the P3 `indexer-observation.ts` transport pattern) — with the pipeline'
 available and live-probed: `chain_getFinalizedHead` + `chain_getHeader` (both in the node's
 `rpc_methods`) to assert `tx.blockHeight <= finalizedHeight`.
 
+**RAW indexer schema for the bound-variable query — CORRECTION (live-introspected 2026-07-24,
+indexer `4.2.1` `/api/v4/graphql`; supersedes the SDK-layer prose above, which implied
+`transactionResult` sits on `Transaction` and used `SucceedEntirely` as a wire value):**
+`Transaction` is an INTERFACE (`possibleTypes`: `RegularTransaction | SystemTransaction`).
+`transactionResult` exists ONLY on `RegularTransaction`, so the raw query MUST use an inline
+fragment — `... on RegularTransaction { transactionResult { status } }`; selecting
+`transactionResult` on the `Transaction` interface directly is a GraphQL error. The raw
+`TransactionResultStatus` enum is `SUCCESS | PARTIAL_SUCCESS | FAILURE` (the SDK's `TxStatus`
+`SucceedEntirely | FailFallible | FailEntirely` is its OWN mapped layer via
+`indexerPublicDataProvider`'s `toTxStatus`, NOT the wire value — never compare a raw response
+against `SucceedEntirely`). `block { height hash }` and `contractActions { address }` are on
+the interface. This is exactly the query `deploy/sdk-adapter.ts` `TX_FINALITY_QUERY` ships (and
+the same `Transaction`-interface shape the P3 `contractAction` query depends on).
+
 **The `reorged` outcome can never be produced by this signal** — the indexer never serves a
 block that later reorgs. Keep the pipeline's `reorged` mapping as dead-defensive code, or
 reserve it for the node-side cross-check disagreeing (log-loud).
