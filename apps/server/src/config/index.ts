@@ -48,6 +48,18 @@ export type { NetworkEnv, NetworkProfile } from "./network.js";
  * this cannot leak them (constitution III).
  */
 export function publicConfig(config: Config): PublicConfig {
-  const { port, publicOrigin, network, mcp, prover, artifacts, tunables, modelRouting } = config;
-  return { port, publicOrigin, network, mcp, prover, artifacts, tunables, modelRouting };
+  const { port, publicOrigin, network, nyxtVaultAddress, mcp, prover, artifacts, tunables } =
+    config;
+  const { modelRouting } = config;
+  return {
+    port,
+    publicOrigin,
+    network,
+    nyxtVaultAddress,
+    mcp,
+    prover,
+    artifacts,
+    tunables,
+    modelRouting,
+  };
 }

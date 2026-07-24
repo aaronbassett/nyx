@@ -9,6 +9,8 @@
  * server, and listen on the validated port.
  */
 import { randomUUID } from "node:crypto";
+import { WebSocket } from "ws";
+import type { ServerToClientEvent } from "@nyx/protocol";
 import { buildServer } from "./app.js";
 import { createModelRouter } from "./agents/routing.js";
 import { createLocalArtifactStore, storeFetchAdapter } from "./artifacts/index.js";
@@ -25,6 +27,12 @@ import { createDeployRegistry } from "./deploy/registry.js";
 import { createDeployWalletMonitor } from "./deploy/wallet.js";
 import type { WalletAlert } from "./deploy/wallet.js";
 import { createDepositStore, createLedgerStore } from "./ledger/index.js";
+import type { CreditOutcome } from "./ledger/index.js";
+import {
+  createDevnetDepositIndexerQuery,
+  createObservationPoller,
+  creditOutcomeToPush,
+} from "./ledger/indexer-observation.js";
 import {
   createReconcileJob,
   createReconcileStore,
@@ -43,7 +51,12 @@ import {
   PgProjectStore,
 } from "./projects/index.js";
 import { createProverClient } from "./prover/index.js";
-import { PgSessionStore, createWsHandler } from "./protocol/index.js";
+import {
+  PgSessionStore,
+  createSessionRegistry,
+  createWsHandler,
+  sendEvent,
+} from "./protocol/index.js";
 import { createTurnCoordinator } from "./turn/coordinator.js";
 
 /**
@@ -100,6 +113,41 @@ function logReconcileTickError(error: unknown): void {
   process.stderr.write(`${line}\n`);
 }
 
+/**
+ * Structured, bigint-safe stderr sink for the deposit store's LOUD warnings — the EC-28 amount
+ * mismatch (chain-vs-expected) and the late-deposit-after-TTL credit. Phase 8 flagged the store's
+ * DEFAULT logger is a SILENT no-op; wiring this closes that gap so those money-audit signals
+ * actually surface. `warn(context, message)` matches the `DepositLogger` seam (a `request.log`
+ * subset). Bigints in `context` → decimal strings so the line itself can never throw.
+ */
+function logDepositWarning(context: Record<string, unknown>, message: string): void {
+  const line = JSON.stringify(
+    { severity: "warn", source: "deposit", event: "store-warning", message, ...context },
+    (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value),
+  );
+  process.stderr.write(`${line}\n`);
+}
+
+/**
+ * Stderr sink for a deposit-observation poll TICK fault (the indexer is unreachable, or the
+ * owner-gated on-chain decode is not wired). Reported, never fatal — the poll loop survives and
+ * the next interval still fires (the honest "armed but gated" state, mirrors the reconcile tick).
+ */
+function logDepositPollError(error: unknown): void {
+  const detail = error instanceof Error ? error.message : String(error);
+  process.stderr.write(
+    `${JSON.stringify({ severity: "warn", source: "deposit-poller", event: "tick-error", detail })}\n`,
+  );
+}
+
+/** Stderr sink for a failure to build/route a `ledger:update` push from a credit outcome. */
+function logDepositPushError(error: unknown): void {
+  const detail = error instanceof Error ? error.message : String(error);
+  process.stderr.write(
+    `${JSON.stringify({ severity: "warn", source: "deposit-push", event: "push-error", detail })}\n`,
+  );
+}
+
 function loadConfigOrExit(): Config {
   try {
     return loadConfig(process.env);
@@ -120,6 +168,12 @@ async function main(): Promise<void> {
   const db = getDb();
   const mcp = createMcpClients(config.mcp);
   const sessionStore = new PgSessionStore(db);
+  // ONE shared single-live-session registry (D40) for the whole process: the WS handler claims
+  // (account, project) sockets into it, and the boot-level deposit-observation push reads it back
+  // to route a finalized deposit's `ledger:update` to the depositor's live connection(s). Sharing
+  // the SAME instance is load-bearing — a second, private registry inside `createWsHandler` would
+  // hold the live sockets the push could never see.
+  const registry = createSessionRegistry<WebSocket>();
   // The authoritative project store (US7): built ONCE here and shared by the WS
   // connect-time ownership check (Defense 1) and `buildServer`'s project routes, so a
   // connection can only OPEN for a project the session's account owns.
@@ -169,6 +223,9 @@ async function main(): Promise<void> {
   const depositStore = createDepositStore(db, ledgerStore, {
     minimumDeposit: config.tunables.minimumDepositNyxt,
     depositRefTtlMs: config.tunables.depositRefTtlMs,
+    // Inject a REAL logger (closes the Phase 8 silent-no-op gap): the store's default is silent,
+    // so EC-28 amount-mismatch + late-deposit warnings would otherwise vanish. This surfaces them.
+    logger: { warn: logDepositWarning },
   });
   const proverClient = createProverClient({ baseUrl: config.prover.url });
   const chat = new PgChatStore(db);
@@ -262,6 +319,9 @@ async function main(): Promise<void> {
       deployHandler.handlers(router);
     },
     authorizeProject: createProjectAuthorizer(projectStore),
+    // Share the one process-wide registry so the deposit-observation push (below) can find the
+    // depositor's live sockets — the WS handler claims into this exact instance.
+    registry,
   });
   const app = await buildServer({
     config,
@@ -331,7 +391,66 @@ async function main(): Promise<void> {
     clearInterval(stagingSweepTimer);
   });
 
+  // P3 — the indexer deposit-OBSERVATION poller: the on-chain→off-chain crediting bridge. Each
+  // tick lists the still-open deposit refs, asks the indexer for exactly those, and hands every
+  // observation VERBATIM to the store's exactly-once credit CAS (the poller never classifies or
+  // credits — `deposits.ts` does). It mirrors the reconcile scheduler's lifecycle: started after
+  // listen, stopped on close. The real per-deposit on-chain DECODE (`readDepositsState`) is
+  // OWNER-GATED (constitution I) and deliberately NOT injected here, so until it + a deployed
+  // vault address land, every tick faults on the gated decode, is logged, and the loop survives —
+  // the honest "armed but gated" state (identical to the reconcile job's gated sources).
+  const depositIndexerQuery = createDevnetDepositIndexerQuery({
+    indexerUrl: config.network.indexerUrl,
+    vaultAddress: config.nyxtVaultAddress,
+    // readDepositsState OWNER-GATED — omitted → findDeposits rejects (DepositIndexerNotWiredError).
+  });
+
+  // Route a credit OUTCOME to the depositor's live socket(s) as a RENDER signal (FR-070): the
+  // client never computes a balance, it REPLACES it from this server payload. A `credited` outcome
+  // → an encoded `ledger:update` (bigint money → decimal strings); a known-ref `failed` → a
+  // `deposit:failed` diagnostic; every other outcome (already-credited / orphaned / unfinalized /
+  // unregistered failure) → no frame. Best-effort: if the depositor has no live connection the
+  // frame is simply dropped (the client re-reads `GET /ledger` on reconnect), and any push fault
+  // is logged, never allowed to break the poll loop.
+  const pushLedgerOutcome = async (outcome: CreditOutcome): Promise<void> => {
+    try {
+      const push = await creditOutcomeToPush(outcome, {
+        ledger: ledgerStore,
+        now: () => Date.now(),
+        onInvariantBreak: logDepositWarning,
+      });
+      if (push === null) {
+        return;
+      }
+      // The event is already WIRE-encoded (decimal-string money); `sendEvent` re-validates it
+      // against the server→client schema (whose input IS the wire form) and serializes it.
+      const frame = push.event as unknown as ServerToClientEvent;
+      for (const socket of registry.socketsForAccount(push.address)) {
+        sendEvent(socket, frame);
+      }
+    } catch (error) {
+      logDepositPushError(error);
+    }
+  };
+
+  const depositPoller = createObservationPoller({
+    store: depositStore,
+    query: depositIndexerQuery,
+    intervalMs: config.tunables.depositPollIntervalMs,
+    graceMs: config.tunables.depositRefTtlMs,
+    onOutcome: (outcome) => {
+      void pushLedgerOutcome(outcome);
+    },
+    onError: logDepositPollError,
+  });
+  app.addHook("onClose", () => {
+    depositPoller.stop();
+  });
+
   await app.listen({ port: config.port, host: "0.0.0.0" });
+
+  // Arm the poll loop only after the server is listening (mirrors the reconcile scheduler).
+  depositPoller.start();
 }
 
 main().catch((error: unknown) => {

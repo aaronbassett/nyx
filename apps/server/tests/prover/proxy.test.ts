@@ -7,16 +7,18 @@
  *
  * Coverage:
  *  - AUTH GATES THE PROVER (constitution III): an unauthenticated request → 401
- *    and the fake `prove` is NEVER called (auth precedes any forward);
- *  - transparent forward: the exact opaque request bytes + content-type reach the
- *    client, and the prover's status + body + content-type round-trip back verbatim;
+ *    and the fake `relay` is NEVER called (auth precedes any forward);
+ *  - transparent forward: the exact opaque request bytes + content-type + captured
+ *    subpath reach the client, and the prover's status/body/content-type round-trip;
+ *  - BOTH `prove` and `check` subpaths relay (the modern proof-server protocol, P3);
+ *  - a hostile subpath (`..` traversal) → 400 and the prover is never contacted;
  *  - a prover HTTP error status is relayed as DATA (distinct from a transport 502);
  *  - a prover-client transport failure (the client rejects) → 502 with a structured
  *    error and no unhandled throw;
  *  - the injected per-session rate-limit SEAM: a denial → 429, prover not called,
  *    and the limiter receives the session identity;
  *  - the {@link createProverClient} HTTP seam: it POSTs the opaque body + content-type
- *    to the injected prover URL and maps the response, and a `fetch` throw becomes a
+ *    to `<baseUrl>/<subpath>` and maps the response, and a `fetch` throw becomes a
  *    named {@link ProverUnavailableError}.
  */
 import Fastify from "fastify";
@@ -74,7 +76,7 @@ class FakeProverClient implements ProverClient {
 
   constructor(private readonly behavior: FakeBehavior) {}
 
-  prove(request: ProxyRequest): Promise<ProxyResult> {
+  relay(request: ProxyRequest): Promise<ProxyResult> {
     this.calls.push(request);
     if (this.behavior.reject !== undefined) {
       return Promise.reject(this.behavior.reject);
@@ -161,8 +163,8 @@ describe("POST /prover/prove — auth gates the prover (constitution III)", () =
   });
 });
 
-describe("POST /prover/prove — transparent same-origin forward", () => {
-  it("forwards the opaque request body + content-type and relays status/body/content-type", async () => {
+describe("POST /prover/* — transparent same-origin forward", () => {
+  it("forwards the opaque request body + content-type + subpath and relays the response", async () => {
     const proofBytes = Buffer.from([0x00, 0x01, 0x02, 0xff, 0x7f]);
     const client = new FakeProverClient({
       result: { status: 200, body: proofBytes, contentType: "application/x-midnight-proof" },
@@ -178,9 +180,10 @@ describe("POST /prover/prove — transparent same-origin forward", () => {
       payload: requestBytes,
     });
 
-    // The EXACT request bytes + content-type reached the prover client.
+    // The EXACT request bytes + content-type + captured subpath reached the prover client.
     expect(client.calls).toHaveLength(1);
     const forwarded = client.calls[0];
+    expect(forwarded?.subpath).toBe("prove");
     expect(forwarded?.body.equals(requestBytes)).toBe(true);
     expect(forwarded?.contentType).toBe("application/octet-stream");
 
@@ -188,6 +191,42 @@ describe("POST /prover/prove — transparent same-origin forward", () => {
     expect(response.statusCode).toBe(200);
     expect(response.headers["content-type"]).toBe("application/x-midnight-proof");
     expect(response.rawPayload.equals(proofBytes)).toBe(true);
+  });
+
+  it("relays the `/prover/check` subpath too (modern proof-server protocol, P3)", async () => {
+    const checkBytes = Buffer.from([0x2a, 0x00]);
+    const client = new FakeProverClient({
+      result: { status: 200, body: checkBytes, contentType: "application/octet-stream" },
+    });
+    const h = await bootProver({ client });
+    const cookie = await h.seedSession(OWNER);
+
+    const response = await h.app.inject({
+      method: "POST",
+      url: "/prover/check",
+      headers: { cookie, "content-type": "application/octet-stream" },
+      payload: Buffer.from("check-preimage"),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(client.calls).toHaveLength(1);
+    expect(client.calls[0]?.subpath).toBe("check");
+  });
+
+  it("rejects a hostile subpath (`..` traversal) with 400 and never contacts the prover", async () => {
+    const client = new FakeProverClient({ result: okResult() });
+    const h = await bootProver({ client });
+    const cookie = await h.seedSession(OWNER);
+
+    const response = await h.app.inject({
+      method: "POST",
+      url: "/prover/..%2f..%2fadmin",
+      headers: { cookie, "content-type": "application/octet-stream" },
+      payload: Buffer.from("req"),
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(client.calls).toHaveLength(0);
   });
 
   it("relays a prover error STATUS as data (distinct from a transport 502)", async () => {
@@ -264,7 +303,7 @@ describe("POST /prover/prove — per-session rate-limit seam (S9/D52)", () => {
 });
 
 describe("createProverClient — transparent HTTP forward to the interim prover", () => {
-  it("POSTs the opaque body + content-type to the prover URL and maps the response", async () => {
+  it("POSTs the opaque body + content-type to <baseUrl>/<subpath> and maps the response", async () => {
     const proofBytes = Buffer.from([0xde, 0xad, 0xbe, 0xef]);
     const fetchMock = vi.fn<typeof fetch>();
     fetchMock.mockResolvedValueOnce(
@@ -274,12 +313,14 @@ describe("createProverClient — transparent HTTP forward to the interim prover"
       }),
     );
 
+    // A trailing slash on the base is normalized so the subpath join stays single-slash.
     const client = createProverClient({
-      baseUrl: "http://prover.internal/prove-tx",
+      baseUrl: "http://prover.internal/",
       fetch: fetchMock,
     });
     const requestBytes = Buffer.from("proof-request");
-    const result = await client.prove({
+    const result = await client.relay({
+      subpath: "prove",
       body: requestBytes,
       contentType: "application/octet-stream",
     });
@@ -289,7 +330,7 @@ describe("createProverClient — transparent HTTP forward to the interim prover"
     expect(result.body.equals(proofBytes)).toBe(true);
 
     const call = fetchMock.mock.calls[0];
-    expect(call?.[0]).toBe("http://prover.internal/prove-tx");
+    expect(call?.[0]).toBe("http://prover.internal/prove");
     const init = call?.[1];
     expect(init?.method).toBe("POST");
     expect((init?.headers as Record<string, string>)["content-type"]).toBe(
@@ -298,17 +339,27 @@ describe("createProverClient — transparent HTTP forward to the interim prover"
     expect(Buffer.from(init?.body as Uint8Array).equals(requestBytes)).toBe(true);
   });
 
+  it("relays the check subpath to <baseUrl>/check", async () => {
+    const fetchMock = vi.fn<typeof fetch>();
+    fetchMock.mockResolvedValueOnce(new Response(Buffer.from([1]), { status: 200 }));
+
+    const client = createProverClient({ baseUrl: "http://prover.internal", fetch: fetchMock });
+    await client.relay({ subpath: "check", body: Buffer.from("x"), contentType: undefined });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("http://prover.internal/check");
+  });
+
   it("maps a fetch transport throw to a named ProverUnavailableError", async () => {
     const fetchMock = vi.fn<typeof fetch>();
     fetchMock.mockRejectedValueOnce(new Error("ECONNREFUSED"));
 
     const client = createProverClient({
-      baseUrl: "http://prover.internal/prove-tx",
+      baseUrl: "http://prover.internal",
       fetch: fetchMock,
     });
 
     await expect(
-      client.prove({ body: Buffer.from("req"), contentType: undefined }),
+      client.relay({ subpath: "prove", body: Buffer.from("req"), contentType: undefined }),
     ).rejects.toBeInstanceOf(ProverUnavailableError);
   });
 });

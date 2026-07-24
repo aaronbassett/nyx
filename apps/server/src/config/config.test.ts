@@ -74,6 +74,8 @@ describe("loadConfig — valid env", () => {
     expect(config.tunables.maxProjectBytes).toBe(52_428_800);
     expect(config.tunables.sessionLifetimeMs).toBe(604_800_000);
     expect(config.tunables.reconcileCadenceMs).toBe(86_400_000);
+    expect(config.tunables.depositPollIntervalMs).toBe(5_000);
+    expect(config.nyxtVaultAddress).toBe("");
     expect(config.prover.tokenLifetimeMs).toBe(300_000);
 
     expect(config.modelRouting.supervisor.provider).toBe("anthropic");
@@ -93,6 +95,7 @@ describe("loadConfig — valid env", () => {
     expect(config.artifacts.maxStagedBytesPerProject).toBe(536_870_912);
     expect(config.artifacts.maxStagedPrefixesPerProject).toBe(8);
     expect(config.artifacts.srsCacheDir).toBeUndefined();
+    expect(config.artifacts.vaultArtifactsDir).toBeUndefined();
   });
 
   it("resolves the browser-compile CHECK/FULL timeout tunables with defaults (D42 no-hang)", () => {
@@ -110,6 +113,7 @@ describe("loadConfig — valid env", () => {
         ARTIFACT_MAX_STAGED_BYTES_PER_PROJECT: "8192",
         ARTIFACT_MAX_STAGED_PREFIXES_PER_PROJECT: "3",
         SRS_CACHE_DIR: "/srv/srs",
+        VAULT_ARTIFACTS_DIR: "/srv/vault",
         COMPILE_CHECK_TIMEOUT_MS: "15000",
         COMPILE_FULL_TIMEOUT_MS: "600000",
       }),
@@ -120,6 +124,7 @@ describe("loadConfig — valid env", () => {
     expect(config.artifacts.maxStagedBytesPerProject).toBe(8192);
     expect(config.artifacts.maxStagedPrefixesPerProject).toBe(3);
     expect(config.artifacts.srsCacheDir).toBe("/srv/srs");
+    expect(config.artifacts.vaultArtifactsDir).toBe("/srv/vault");
     expect(config.tunables.compileCheckTimeoutMs).toBe(15_000);
     expect(config.tunables.compileFullTimeoutMs).toBe(600_000);
   });

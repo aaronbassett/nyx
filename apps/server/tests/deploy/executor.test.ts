@@ -34,7 +34,7 @@ const NETWORK: NetworkProfile = {
 
 /** An inert prover client — never invoked by the stub. */
 const PROVER: ProverClient = {
-  prove: () => Promise.reject(new Error("prover must not be reached by the stub")),
+  relay: () => Promise.reject(new Error("prover must not be reached by the stub")),
 };
 
 const ARTIFACTS: DeployArtifacts = {

@@ -29,6 +29,7 @@ import type {
   DepositRegistration,
   DepositStore,
   DepositView,
+  OpenDepositRef,
 } from "../../src/ledger/deposits.js";
 import type { Balance, LedgerEntryRecord, LedgerStore, Turn } from "../../src/ledger/ledger.js";
 import { InMemoryAuthStore } from "../auth/helpers.js";
@@ -140,6 +141,9 @@ class FakeDepositStore implements DepositStore {
   }
   expireStale(): Promise<number> {
     return Promise.reject(new Error("expireStale not used by the deposit routes"));
+  }
+  listOpenRefs(): Promise<readonly OpenDepositRef[]> {
+    return Promise.reject(new Error("listOpenRefs not used by the deposit routes"));
   }
 }
 

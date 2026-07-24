@@ -19,6 +19,7 @@ import type { DeployRegistry } from "./deploy/registry.js";
 import { registerDeployRoutes } from "./deploy/routes.js";
 import { registerHealthRoutes } from "./http/health.js";
 import { registerSrsRoutes } from "./http/srs.js";
+import { registerVaultArtifactsRoutes } from "./http/vault-artifacts.js";
 import type { DepositStore, LedgerStore } from "./ledger/index.js";
 import { registerLedgerRoutes } from "./ledger/routes.js";
 import type { McpClients } from "./mcp/index.js";
@@ -32,6 +33,13 @@ import {
   registerProjectRoutes,
 } from "./projects/index.js";
 import type { CloneService, DeletionCascade, ProjectStore } from "./projects/index.js";
+import {
+  createDevnetForwarder,
+  createDevnetWsRelay,
+  httpToWs,
+  INDEXER_WS_SUBPATH,
+  registerDevnetRoutes,
+} from "./devnet/index.js";
 import { registerProverRoutes } from "./prover/index.js";
 import type { ProverClient } from "./prover/index.js";
 import { registerWs } from "./ws/index.js";
@@ -210,6 +218,13 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     registerSrsRoutes(app, { cacheDir: deps.config.artifacts.srsCacheDir });
   }
 
+  // NyxtVault key-material serve (P3 Task 4): session-less read-only `GET /vault-artifacts/*`
+  // over the native-toolchain vault build dir, so the browser ceremony prover can fetch the
+  // per-circuit `{proverKey, verifierKey, ir}` same-origin. Registered only when configured.
+  if (deps.config.artifacts.vaultArtifactsDir !== undefined) {
+    registerVaultArtifactsRoutes(app, { dir: deps.config.artifacts.vaultArtifactsDir });
+  }
+
   const authStore = resolveAuthStore(deps);
   if (authStore !== undefined) {
     registerAuthRoutes(app, { store: authStore, config: deps.config });
@@ -295,6 +310,22 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     if (deps.proverClient !== undefined) {
       registerProverRoutes(app, { proverClient: deps.proverClient, requireSession });
     }
+
+    // Same-origin devnet forwarding (P3): the isolated (COOP/COEP) browser reaches the local
+    // devnet node/indexer THROUGH the server. HTTP byte forwarders + session-gated WebSocket
+    // relays on `/devnet/node/*` + `/devnet/indexer/*`. Endpoints come from the server-side
+    // NetworkProfile (`config.network.*`), never client-routed (constitution I/III). The WS
+    // targets add the indexer's GraphQL-subscriptions sub-path (SPIKE-1 risk 7 / SPIKE-2).
+    const { network } = deps.config;
+    registerDevnetRoutes(app, {
+      nodeForwarder: createDevnetForwarder({ baseUrl: network.nodeUrl }),
+      indexerForwarder: createDevnetForwarder({ baseUrl: network.indexerUrl }),
+      nodeWsRelay: createDevnetWsRelay({ targetUrl: httpToWs(network.nodeUrl) }),
+      indexerWsRelay: createDevnetWsRelay({
+        targetUrl: `${httpToWs(network.indexerUrl)}${INDEXER_WS_SUBPATH}`,
+      }),
+      requireSession,
+    });
   }
 
   if (deps.wsHandler === undefined) {

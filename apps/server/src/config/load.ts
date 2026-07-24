@@ -104,6 +104,7 @@ function assemble(env: Env, modelRouting: ModelRoutingTable): Config {
     // required env var) while always yielding a parseable absolute origin for artifact URLs.
     publicOrigin: env.PUBLIC_ORIGIN ?? `http://localhost:${String(env.PORT)}`,
     network: resolveNetworkProfile(env),
+    nyxtVaultAddress: env.NYXT_VAULT_ADDRESS,
     mcp: {
       tomeUrl: env.MCP_TOME_URL,
       mnmUrl: env.MCP_MNM_URL,
@@ -125,6 +126,7 @@ function assemble(env: Env, modelRouting: ModelRoutingTable): Config {
       // Conditional so `exactOptionalPropertyTypes` holds — a `string | undefined` field is
       // fine to assign directly, but keep the explicit value for the optional SRS cache dir.
       srsCacheDir: env.SRS_CACHE_DIR,
+      vaultArtifactsDir: env.VAULT_ARTIFACTS_DIR,
     },
     tunables: {
       exchangeRateNyxtPerTnight: env.NYXT_EXCHANGE_RATE,
@@ -137,6 +139,7 @@ function assemble(env: Env, modelRouting: ModelRoutingTable): Config {
       versionRetentionCount: env.VERSION_RETENTION_COUNT,
       versionRetentionDays: env.VERSION_RETENTION_DAYS,
       depositRefTtlMs: env.DEPOSIT_REF_TTL_MS,
+      depositPollIntervalMs: env.DEPOSIT_POLL_INTERVAL_MS,
       reconcileCadenceMs: env.RECONCILE_CADENCE_MS,
       sessionLifetimeMs: env.SESSION_LIFETIME_MS,
       compileCheckTimeoutMs: env.COMPILE_CHECK_TIMEOUT_MS,

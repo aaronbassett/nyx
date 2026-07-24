@@ -8,7 +8,7 @@
 export { SESSION_COOKIE_NAME, PgSessionStore } from "./session.js";
 export type { Session, SessionStore } from "./session.js";
 export { readSessionCookie } from "./cookies.js";
-export { createSessionRegistry, sessionKey } from "./registry.js";
+export { accountFromKey, createSessionRegistry, sessionKey } from "./registry.js";
 export type { SessionRegistry } from "./registry.js";
 export { createEventRouter, sendEvent, serializeEvent } from "./router.js";
 export type {
