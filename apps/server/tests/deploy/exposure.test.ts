@@ -12,25 +12,28 @@
  *  2. WIRE PAYLOADS — the deploy protocol payloads a client can receive (`DeployStatusPayload`,
  *     `ContractDeployedPayload`, `DeployRegistryRow`) have EXACTLY their known safe keys — none
  *     of which could carry key material — asserted against each schema's own shape.
- *  3. SOURCE AUDIT — a grep-style scan of `apps/server/src/deploy/*.ts` **and the executor
- *     construction site `apps/server/src/index.ts`** + the `publicConfig` constructor: the deploy
- *     modules never reference `deployKey`/`DEPLOY_KEY`, and no emitted-frame line
- *     (`ctx.send`/`emit`/`emitContractDeployed`/`reply.send`) nor log line (`console`/
- *     `process.std*.write`) nor the `publicConfig` body names key material.
+ *  3. SOURCE AUDIT — a grep-style scan of `apps/server/src/deploy/*.ts` (which now includes the real
+ *     `devnet-executor.ts`, `sdk-adapter.ts`, `balance.ts`, and `balance-sdk-adapter.ts` — all read
+ *     verbatim by `readdirSync`) **and the construction site `apps/server/src/index.ts`** + the
+ *     `publicConfig` constructor: the deploy modules never reference `deployKey`/`DEPLOY_KEY`, and no
+ *     emitted-frame line (`ctx.send`/`emit`/`emitContractDeployed`/`reply.send`) nor log line
+ *     (`console`/`process.std*.write`) nor the `publicConfig` body names key material.
  *  4. CONSTRUCTION SITE — in `index.ts` the deploy key (`config.secrets.deployKey`) flows ONLY into
- *     the `createOwnerGatedDeployExecutor({ signingKey: ... })` dependency and NOWHERE else — not an
- *     emit sink, a log, or a `publicConfig` projection.
+ *     the two sanctioned deploy dependencies — `createDevnetDeployExecutor({ signingKey: ... })` and
+ *     `createDevnetBalanceQuery({ signingKey: ... })` — and NOWHERE else: not an emit sink, a log,
+ *     the deposit-indexer/vault-reader wiring, or a `publicConfig` projection.
  *
- * WHY `signingKey` IS LOAD-BEARING HERE. `signingKey` is the deploy executor's key-FIELD name
- * (`OwnerGatedDeployExecutorDeps.signingKey` in `deploy/executor.ts`); the value it holds is
- * `config.secrets.deployKey`, wired in exactly once by `index.ts`. The line that actually MOVES the
- * key is the executor construction in `index.ts` — which the original audit never scanned — and the
- * highest-risk future regression is a real Midnight-SDK adapter in `deploy/executor.ts` that does
- * `console.log(deps.signingKey)` or folds it into a proof/error/`deploy:status.detail`. Neither
- * would have named `deployKey`/`DEPLOY_KEY`, so both would have SAILED THROUGH the old gate at the
- * exact spot constitution III cares about most. So `signingKey` is now a forbidden token on any
- * emitted-frame / log / `publicConfig` line — while the executor's LEGITIMATE `signingKey` field
- * TYPE declaration and its private dependency read stay server-side and MUST keep passing.
+ * WHY `signingKey` IS LOAD-BEARING HERE. `signingKey` is the deploy seams' key-FIELD name
+ * (`DevnetDeployExecutorDeps.signingKey` in `deploy/devnet-executor.ts`, `DevnetBalanceQueryDeps.
+ * signingKey` in `deploy/balance.ts`); the value it holds is `config.secrets.deployKey`, wired in by
+ * `index.ts` at exactly those two construction sites. The lines that actually MOVE the key are those
+ * constructions — and the highest-risk future regression is a real Midnight-SDK adapter
+ * (`deploy/sdk-adapter.ts` / `deploy/balance-sdk-adapter.ts`) that does `console.log(deps.signingKey)`
+ * or folds it into a proof/error/`deploy:status.detail`. Neither would have named
+ * `deployKey`/`DEPLOY_KEY`, so both would have SAILED THROUGH the old gate at the exact spot
+ * constitution III cares about most. So `signingKey` is now a forbidden token on any emitted-frame /
+ * log / `publicConfig` line — while the seams' LEGITIMATE `signingKey` field TYPE declarations and
+ * their private dependency reads stay server-side and MUST keep passing.
  *
  * This is the SC-031 CI audit hook: a regression that routed the deploy key toward a client
  * surface (a leaked payload field, a `ctx.send`/log of a secret, a `signingKey` on an outbound
@@ -176,8 +179,9 @@ function readOutboundSurfaceSources(): { file: string; source: string }[] {
 
 describe("SC-031: the deploy key never flows into an outbound frame (source audit)", () => {
   it("no deploy module references deployKey / DEPLOY_KEY / secrets.deployKey", () => {
-    // Scoped to deploy/*.ts ONLY — `index.ts` legitimately names `config.secrets.deployKey` at the
-    // sanctioned construction site (covered by the dedicated construction-site audit below).
+    // Scoped to deploy/*.ts ONLY (incl. the real devnet-executor/sdk-adapter/balance/balance-sdk-
+    // adapter modules) — `index.ts` legitimately names `config.secrets.deployKey` at the two
+    // sanctioned construction sites (covered by the dedicated construction-site audit below).
     const forbidden = [/\bdeployKey\b/, /\bDEPLOY_KEY\b/, /secrets\s*\.\s*deployKey/];
     for (const { file, source } of readDeploySources()) {
       for (const pattern of forbidden) {
@@ -229,27 +233,34 @@ describe("SC-031: the deploy key never flows into an outbound frame (source audi
 
 // --- 4. Construction-site audit (index.ts) ---------------------------------
 
-describe("SC-031: in index.ts the deploy key flows ONLY into the executor construction", () => {
-  it("names the deploy key exactly once — as the executor's signingKey dependency", () => {
+describe("SC-031: in index.ts the deploy key flows ONLY into the deploy-seam constructions", () => {
+  it("names the deploy key exactly twice — each as a `signingKey:` dependency", () => {
     const { source } = readServerIndex();
     // The key value (`config.secrets.deployKey`) and the bare `signingKey` identifier each appear
-    // EXACTLY once, together, as the executor's `signingKey:` dependency — nothing else in the
-    // entry point may name either.
-    expect(source.match(/config\s*\.\s*secrets\s*\.\s*deployKey/g) ?? []).toHaveLength(1);
-    expect(source.match(/\bsigningKey\b/g) ?? []).toHaveLength(1);
-    expect(source).toMatch(/signingKey\s*:\s*config\s*\.\s*secrets\s*\.\s*deployKey/);
+    // EXACTLY twice — once for the executor construction, once for the balance-query construction —
+    // and EVERY occurrence is a `signingKey: config.secrets.deployKey` dependency. Nothing else in
+    // the entry point may name either. (The vault-state-reader/deposit-indexer wiring takes NO key.)
+    expect(source.match(/config\s*\.\s*secrets\s*\.\s*deployKey/g) ?? []).toHaveLength(2);
+    expect(source.match(/\bsigningKey\b/g) ?? []).toHaveLength(2);
+    expect(
+      source.match(/signingKey\s*:\s*config\s*\.\s*secrets\s*\.\s*deployKey/g) ?? [],
+    ).toHaveLength(2);
   });
 
-  it("holds the key inside createOwnerGatedDeployExecutor(...) and NOWHERE else (no emit/log/publicConfig)", () => {
+  it("holds the key inside the two deploy-seam constructions and NOWHERE else (no emit/log/publicConfig)", () => {
     const { source } = readServerIndex();
-    // The sanctioned server-side sink: the executor factory argument.
-    const construction =
-      /createOwnerGatedDeployExecutor\s*\(\s*\{[\s\S]*?\}\s*\)/.exec(source)?.[0] ?? "";
-    expect(construction).not.toBe("");
-    expect(construction).toMatch(/signingKey\s*:\s*config\s*\.\s*secrets\s*\.\s*deployKey/);
-    // Excise the construction site; the key value AND its field name vanish entirely from the rest
+    // The sanctioned server-side sinks: the executor + balance-query factory arguments.
+    const executorConstruction =
+      /createDevnetDeployExecutor\s*\(\s*\{[\s\S]*?\}\s*\)/.exec(source)?.[0] ?? "";
+    const balanceConstruction =
+      /createDevnetBalanceQuery\s*\(\s*\{[\s\S]*?\}\s*\)/.exec(source)?.[0] ?? "";
+    expect(executorConstruction).not.toBe("");
+    expect(balanceConstruction).not.toBe("");
+    expect(executorConstruction).toMatch(/signingKey\s*:\s*config\s*\.\s*secrets\s*\.\s*deployKey/);
+    expect(balanceConstruction).toMatch(/signingKey\s*:\s*config\s*\.\s*secrets\s*\.\s*deployKey/);
+    // Excise BOTH construction sites; the key value AND its field name vanish entirely from the rest
     // of index.ts — so no `ctx.send`/`emit`/`reply.send`, log, or `publicConfig` line can name them.
-    const rest = source.replace(construction, "");
+    const rest = source.replace(executorConstruction, "").replace(balanceConstruction, "");
     expect(rest).not.toMatch(/config\s*\.\s*secrets\s*\.\s*deployKey/);
     expect(rest).not.toMatch(/\bsigningKey\b/);
   });
