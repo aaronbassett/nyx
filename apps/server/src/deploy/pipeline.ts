@@ -96,10 +96,13 @@ export type ProveOutcome =
 
 /**
  * Why a signed deploy submission was rejected by the node. `insufficient-tdust` is EC-38 — a
- * PLATFORM fault (the server deploy wallet is out of tDUST, D52/FR-059), NOT a user error —
- * and is surfaced as such; `rejected` is any other node-side rejection.
+ * PLATFORM fault (the server deploy wallet is out of tDUST, D52/FR-059), NOT a user error — and
+ * is surfaced as such; `unavailable` is a submit-PATH fault (the SDK adapter is not wired, or an
+ * unexpected adapter fault) — ALSO a platform issue, distinct from a genuine node rejection so it
+ * NEVER impersonates "node rejected the deploy submission" (I2); `rejected` is any real node-side
+ * rejection.
  */
-export type SubmitRejectionCause = "insufficient-tdust" | "rejected";
+export type SubmitRejectionCause = "insufficient-tdust" | "unavailable" | "rejected";
 
 /** The result of {@link DeployExecutor.signAndSubmit} — a node rejection is DATA, not a throw. */
 export type SubmitOutcome =
@@ -124,7 +127,15 @@ export type DeployFinality =
   | { readonly outcome: "finalized"; readonly address: string }
   | { readonly outcome: "reorged" }
   | { readonly outcome: "failed"; readonly reason: string }
-  | { readonly outcome: "timeout" };
+  | { readonly outcome: "timeout" }
+  /**
+   * I1 (money-critical) — the tx is KNOWN-finalized on-chain but the executor could NOT extract
+   * the contract address (the SDK adapter's finalized-but-no-address path). It carries NO address,
+   * so nothing is announced; and because the tx IS finalized, a retry would double-deploy for
+   * CERTAIN — the pipeline maps this to a NON-retriable terminal, never the generic retriable
+   * backstop.
+   */
+  | { readonly outcome: "address-unavailable" };
 
 /**
  * The narrow, Nyx-INTERNAL deploy seam the state machine drives (constitution I). Three
@@ -275,6 +286,20 @@ export type DeployResult =
       readonly address: ContractDeployedPayload["address"];
       readonly txRef: string;
       readonly retriable: false;
+    }
+  /**
+   * I1 (money-critical) — the deploy FINALIZED on-chain but the contract address could not be
+   * extracted ({@link DeployFinality} `address-unavailable`). Like `record-failed`, the contract
+   * EXISTS on-chain, so this is NOT retriable: a blind retry (a fresh `requestId`) would fund a
+   * SECOND on-chain deploy (real tDUST double-spend). `contract:deployed` is NOT announced (there
+   * is no address); ops reconcile the on-chain contract into the registry from the `txRef` + the
+   * loud server log. Distinct from `record-failed` (which HAS an address) — here the address is
+   * the very thing that is missing.
+   */
+  | {
+      readonly kind: "address-unavailable";
+      readonly txRef: string;
+      readonly retriable: false;
     };
 
 /** The `deployed` arm of {@link DeployResult} — memoised per `requestId` for exactly-once replay. */
@@ -333,6 +358,13 @@ export const DEPLOY_FAILURE_DETAIL = {
    */
   recordingFailed:
     "deploy landed on-chain but recording it failed — support is on it; do not retry",
+  /**
+   * I1 — the deploy finalized on-chain but the contract address was unavailable. Framed as a
+   * platform issue with a DO-NOT-RETRY steer (a retry double-deploys); the txRef + diagnostics go
+   * only to the loud log + the `address-unavailable` result, never onto the wire.
+   */
+  addressUnavailable:
+    "deploy finalized but the contract address is unavailable — support is investigating; do not retry",
 } as const;
 
 /**
@@ -609,7 +641,12 @@ export function createDeployPipeline(deps: DeployPipelineDeps): DeployPipeline {
       emitStatus(input.requestId, "submitting");
       const submitOutcome = await deps.executor.signAndSubmit(proveOutcome.proof);
       if (submitOutcome.outcome === "rejected") {
-        const platform = submitOutcome.cause === "insufficient-tdust";
+        // Both EC-38 (insufficient-tDUST) and a submit-PATH `unavailable` fault (I2 — an unwired
+        // adapter or an unexpected adapter fault) are PLATFORM issues framed as such; only a real
+        // node `rejected` cause is a node fault. So `unavailable` never impersonates a node
+        // rejection on the wire.
+        const platform =
+          submitOutcome.cause === "insufficient-tdust" || submitOutcome.cause === "unavailable";
         emitStatus(
           input.requestId,
           "failed",
@@ -657,6 +694,21 @@ export function createDeployPipeline(deps: DeployPipelineDeps): DeployPipeline {
             reason: finality.reason,
             retriable: true,
           };
+        case "address-unavailable":
+          // I1 (money-critical) — the tx FINALIZED on-chain but the executor could not extract the
+          // contract address. Do NOT retry (a retry double-deploys — the tx is finalized). Announce
+          // nothing (there is no address); log LOUDLY (ops reconcile from the txRef); give a
+          // terminal, NON-retriable status.
+          logError(
+            "deploy FINALIZED on-chain but the contract address was UNAVAILABLE — ops must reconcile (do NOT retry: a retry would double-deploy)",
+            {
+              projectId: input.projectId,
+              requestId: input.requestId,
+              txRef: submitOutcome.txRef,
+            },
+          );
+          emitStatus(input.requestId, "failed", DEPLOY_FAILURE_DETAIL.addressUnavailable);
+          return { kind: "address-unavailable", txRef: submitOutcome.txRef, retriable: false };
         default:
           return assertNever(finality);
       }

@@ -532,6 +532,172 @@ describe("createDevnetDeployExecutor.awaitFinality", () => {
       expect(at).toBeLessThan(1_000);
     }
   });
+
+  // --- I1: queryFinality throws are handled IN the executor (no reject → no double-deploy) ------
+
+  it("I1: tolerates a one-off transient queryFinality throw and still reaches finalized (no reject)", async () => {
+    const { store } = await seedStore();
+    const clock = injectedClock();
+    // A transient indexer/transport fault (matched by name, like the real DeployIndexerUnavailableError).
+    const transient = new Error("indexer unreachable: http://localhost:8088");
+    transient.name = "DeployIndexerUnavailableError";
+    let call = 0;
+    const executor = createDevnetDeployExecutor({
+      signingKey: CANARY_KEY,
+      network: NETWORK,
+      proverClient: fakeProverClient(() => Promise.resolve(okProxyResult(new Uint8Array()))),
+      artifacts: store,
+      sdk: fakeSdk({
+        queryFinality: () => {
+          call += 1;
+          if (call === 1) {
+            return Promise.reject(transient);
+          }
+          return Promise.resolve<FinalityQueryResult>({ status: "finalized", address: "addr-ok" });
+        },
+      }),
+      now: clock.now,
+      delay: clock.delay,
+      finalityPollIntervalMs: 100,
+    });
+
+    // The one-off throw is treated as pending (keep polling); the deploy still finalizes — a blip
+    // never aborts an otherwise-finalizing deploy, and awaitFinality NEVER rejects.
+    const finality = await executor.awaitFinality({ txRef: "tx-1", timeoutMs: 60_000 });
+    expect(finality).toEqual({ outcome: "finalized", address: "addr-ok" });
+    expect(call).toBe(2);
+  });
+
+  it("I1: a PERSISTENTLY-throwing queryFinality degrades to the honest timeout — never rejects, never a retriable re-drive", async () => {
+    const { store } = await seedStore();
+    const clock = injectedClock();
+    const outage = new Error("indexer down");
+    outage.name = "DeployIndexerUnavailableError";
+    const executor = createDevnetDeployExecutor({
+      signingKey: CANARY_KEY,
+      network: NETWORK,
+      proverClient: fakeProverClient(() => Promise.resolve(okProxyResult(new Uint8Array()))),
+      artifacts: store,
+      sdk: fakeSdk({ queryFinality: () => Promise.reject(outage) }),
+      now: clock.now,
+      delay: clock.delay,
+      finalityPollIntervalMs: 100,
+    });
+
+    // A persistent outage bounds out to `timeout` (never a reject that the pipeline backstop would
+    // mark retriable → a re-drive → a SECOND on-chain deploy).
+    const finality = await executor.awaitFinality({ txRef: "tx-1", timeoutMs: 1_000 });
+    expect(finality).toEqual({ outcome: "timeout" });
+  });
+
+  it("I1: a finalized-but-no-address throw maps to a NON-retriable address-unavailable + a loud key-free log (txRef only)", async () => {
+    const { store } = await seedStore();
+    const clock = injectedClock();
+    const logs: { message: string; detail: Record<string, unknown> }[] = [];
+    // The sdk-adapter's finalized-but-no-address signal (matched by name, no SDK import).
+    const notWired = new Error("finalized-deploy address extraction (confirm the subfield ...)");
+    notWired.name = "DeploySdkNotWiredError";
+    const executor = createDevnetDeployExecutor({
+      signingKey: CANARY_KEY,
+      network: NETWORK,
+      proverClient: fakeProverClient(() => Promise.resolve(okProxyResult(new Uint8Array()))),
+      artifacts: store,
+      sdk: fakeSdk({ queryFinality: () => Promise.reject(notWired) }),
+      now: clock.now,
+      delay: clock.delay,
+      logError: (message, detail) => {
+        logs.push({ message, detail });
+      },
+    });
+
+    const finality = await executor.awaitFinality({ txRef: "tx-deadbeef", timeoutMs: 60_000 });
+    // A distinct NON-retriable terminal (the pipeline maps it so a retry can never double-deploy).
+    expect(finality).toEqual({ outcome: "address-unavailable" });
+    // A loud log carrying the txRef (ops reconcile) + the error NAME only — never the message.
+    expect(logs).toHaveLength(1);
+    expect(logs[0]?.detail.txRef).toBe("tx-deadbeef");
+    expect(logs[0]?.detail.errorName).toBe("DeploySdkNotWiredError");
+  });
+});
+
+// --- I2: deploy faults are logged loudly (name-only, SC-031-safe) -----------
+
+describe("createDevnetDeployExecutor (I2 fault observability)", () => {
+  it("logs a buildDeploy fault loudly with the error NAME only — never the key or message", async () => {
+    const { store } = await seedStore();
+    const logs: { message: string; detail: Record<string, unknown> }[] = [];
+    // The build error's MESSAGE maliciously echoes the signing key (a real SDK error could).
+    const boom = new Error(`build blew up key=${CANARY_KEY}`);
+    const executor = createDevnetDeployExecutor({
+      signingKey: CANARY_KEY,
+      network: NETWORK,
+      proverClient: fakeProverClient(() => Promise.resolve(okProxyResult(new Uint8Array()))),
+      artifacts: store,
+      sdk: fakeSdk({ buildDeploy: () => Promise.reject(boom) }),
+      logError: (message, detail) => {
+        logs.push({ message, detail });
+      },
+    });
+
+    const outcome = await executor.prove({ urlPrefix: URL_PREFIX, compilerVersion: "0.31.1" });
+
+    expect(outcome.outcome).toBe("failed");
+    expect(logs).toHaveLength(1);
+    expect(logs[0]?.detail.errorName).toBe("Error");
+    // Canary: nothing the sink received echoes the key (name-only, never message/stack).
+    expect(JSON.stringify(logs)).not.toContain(CANARY_KEY);
+  });
+
+  it("logs a submit fault loudly, and classifies a not-wired submit as `unavailable` with a DISTINCT reason (never 'node rejected')", async () => {
+    const { store } = await seedStore();
+    const logs: { message: string; detail: Record<string, unknown> }[] = [];
+    const notWired = new Error("owner-gated: real Midnight-SDK proven-deploy sign+submit ...");
+    notWired.name = "DeploySdkNotWiredError";
+    const executor = createDevnetDeployExecutor({
+      signingKey: CANARY_KEY,
+      network: NETWORK,
+      proverClient: fakeProverClient(() => Promise.resolve(okProxyResult(new Uint8Array()))),
+      artifacts: store,
+      sdk: fakeSdk({ submit: () => Promise.reject(notWired) }),
+      logError: (message, detail) => {
+        logs.push({ message, detail });
+      },
+    });
+
+    const outcome = await executor.signAndSubmit({ bytes: new Uint8Array() });
+
+    expect(outcome.outcome).toBe("rejected");
+    if (outcome.outcome !== "rejected") throw new Error("unreachable");
+    // A not-wired submit is its OWN cause + reason — it no longer impersonates a node rejection.
+    expect(outcome.cause).toBe("unavailable");
+    expect(outcome.reason).not.toBe("node rejected the deploy submission");
+    expect(logs).toHaveLength(1);
+    expect(logs[0]?.detail.errorName).toBe("DeploySdkNotWiredError");
+  });
+
+  it("SC-031 canary: a submit error whose MESSAGE echoes the signing key reaches the log sink NAME-only — the key never leaks", async () => {
+    const { store } = await seedStore();
+    const logs: { message: string; detail: Record<string, unknown> }[] = [];
+    // A maliciously key-echoing node error (message embeds the key).
+    const leaky = new Error(`node rejected: ${CANARY_KEY}`);
+    const executor = createDevnetDeployExecutor({
+      signingKey: CANARY_KEY,
+      network: NETWORK,
+      proverClient: fakeProverClient(() => Promise.resolve(okProxyResult(new Uint8Array()))),
+      artifacts: store,
+      sdk: fakeSdk({ submit: () => Promise.reject(leaky) }),
+      logError: (message, detail) => {
+        logs.push({ message, detail });
+      },
+    });
+
+    await executor.signAndSubmit({ bytes: new Uint8Array() });
+
+    expect(logs).toHaveLength(1);
+    // The sink received the error NAME only ("Error") — the key-bearing message never reached it.
+    expect(logs[0]?.detail.errorName).toBe("Error");
+    expect(JSON.stringify(logs)).not.toContain(CANARY_KEY);
+  });
 });
 
 // --- SC-031: the signing key never leaks -----------------------------------

@@ -17,6 +17,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   createNyxtVaultStateReader,
+  VaultModuleLoadError,
   type VaultDepositsModule,
   type VaultLedgerState,
   type VaultStateProvider,
@@ -223,6 +224,33 @@ describe("createNyxtVaultStateReader — no-state vs. faults", () => {
     });
 
     await expect(reader(VAULT)).rejects.toBe(boom);
+  });
+
+  // --- M1: a malformed decode fails LOUD, never flows a bad magnitude/key into the store --------
+
+  it("M1: REJECTS a non-bigint decoded amount — credits NOTHING (never a non-bigint magnitude)", async () => {
+    const reader = createNyxtVaultStateReader({
+      indexerUrl: "http://localhost:8088",
+      vaultModuleDir: MODULE_DIR,
+      provider: fakeProvider({ data: STATE_DATA, finalized: true }),
+      // A malformed decode: the amount is a NUMBER, not the promised bigint.
+      loadModule: () => Promise.resolve(fakeModule([[REF_A_BYTES, 5_000 as unknown as bigint]])),
+    });
+
+    // The reader throws BEFORE returning any map, so nothing flows downstream to be credited.
+    await expect(reader(VAULT)).rejects.toBeInstanceOf(VaultModuleLoadError);
+  });
+
+  it("M1: REJECTS a wrong-length decoded ref key (malformed decode)", async () => {
+    const reader = createNyxtVaultStateReader({
+      indexerUrl: "http://localhost:8088",
+      vaultModuleDir: MODULE_DIR,
+      provider: fakeProvider({ data: STATE_DATA, finalized: true }),
+      // A 31-byte key (not the required 32) — a malformed decode must fail loud.
+      loadModule: () => Promise.resolve(fakeModule([[new Uint8Array(31), 5_000n]])),
+    });
+
+    await expect(reader(VAULT)).rejects.toBeInstanceOf(VaultModuleLoadError);
   });
 });
 

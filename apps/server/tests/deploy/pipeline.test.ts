@@ -646,4 +646,52 @@ describe("createDeployPipeline", () => {
     expect(h.executorCalls.prove).toHaveLength(0);
     expect(h.logs.some((entry) => entry.detail.error === boom)).toBe(true);
   });
+
+  // --- I1: a finalized-but-no-address finality is a NON-retriable terminal ----------------------
+
+  it("I1: an address-unavailable finality surfaces a NON-retriable address-unavailable, announces nothing, logs loudly, never rejects", async () => {
+    const h = makeHarness({ finality: { outcome: "address-unavailable" } });
+    const pipeline = createDeployPipeline(h.deps);
+
+    // runDeploy RESOLVES (never rejects) — the tx is finalized on-chain but the address is missing.
+    const result = await pipeline.runDeploy(inputWith(GREEN_BUILD));
+
+    expect(result).toEqual({ kind: "address-unavailable", txRef: TX_REF, retriable: false });
+    expect(h.deployed).toHaveLength(0); // no address → nothing announced
+    expect(h.registryCalls).toHaveLength(0); // nothing recorded
+    expect(phasesOf(h)).toEqual([
+      "validating",
+      "proving",
+      "submitting",
+      "awaiting_finality",
+      "failed",
+    ]);
+    expect(h.statuses.at(-1)?.detail).toBe(DEPLOY_FAILURE_DETAIL.addressUnavailable);
+    // Loud log naming the finalized-but-unrecordable deploy by txRef (ops reconcile).
+    expect(h.logs.some((entry) => entry.detail.txRef === TX_REF)).toBe(true);
+  });
+
+  // --- I2: a submit `unavailable` cause is a PLATFORM fault, never a node rejection --------------
+
+  it("I2: a submit `unavailable` (adapter-not-wired) rejection is a PLATFORM fault, never impersonating a node rejection", async () => {
+    const h = makeHarness({
+      submit: { outcome: "rejected", cause: "unavailable", reason: "adapter not wired" },
+    });
+    const pipeline = createDeployPipeline(h.deps);
+
+    const result = await pipeline.runDeploy(inputWith(GREEN_BUILD));
+
+    expect(result).toEqual({
+      kind: "failed",
+      phase: "submitting",
+      fault: "platform",
+      reason: "adapter not wired",
+      retriable: true,
+    });
+    expect(h.executorCalls.finality).toHaveLength(0);
+    expect(h.deployed).toHaveLength(0);
+    // The wire detail is the platform frame — NOT "deploy submission rejected" (no node impersonation).
+    expect(h.statuses.at(-1)?.detail).toBe(DEPLOY_FAILURE_DETAIL.platform);
+    expect(h.statuses.at(-1)?.detail).not.toBe(DEPLOY_FAILURE_DETAIL.node);
+  });
 });

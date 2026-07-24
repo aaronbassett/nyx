@@ -140,7 +140,23 @@ export function createNyxtVaultStateReader(deps: NyxtVaultStateReaderDeps): Depo
     const decoded = mod.ledger(state.data);
 
     const out = new Map<string, DepositStateEntry>();
-    for (const [keyBytes, amount] of decoded.deposits) {
+    // Iterate the decoder output as UNTRUSTED (widened to `unknown` elements): the compiled
+    // module's generated iterator TYPE promises `[Uint8Array(32), bigint]`, but a malformed decode
+    // must fail LOUD, never flow a non-bigint magnitude / wrong-length ref into the credit store
+    // (M1 — money-critical). Guards below re-narrow after validating at this trust boundary.
+    for (const [keyBytes, amount] of decoded.deposits as Iterable<readonly [unknown, unknown]>) {
+      if (typeof amount !== "bigint") {
+        throw new VaultModuleLoadError(
+          `decoded deposit amount is not a bigint (got ${typeof amount}) — refusing to credit a non-bigint magnitude`,
+        );
+      }
+      if (!(keyBytes instanceof Uint8Array) || keyBytes.length !== 32) {
+        const shape =
+          keyBytes instanceof Uint8Array ? `${String(keyBytes.length)} bytes` : typeof keyBytes;
+        throw new VaultModuleLoadError(
+          `decoded deposit ref is not a 32-byte key (got ${shape}) — malformed decode`,
+        );
+      }
       // amount: native bigint from the compiled decoder (Uint<128>) — never Number().
       // finalized: the provider's per-read VALUE — never a reader-side literal (I1).
       out.set(refHex(keyBytes), { amount, finalized: state.finalized });

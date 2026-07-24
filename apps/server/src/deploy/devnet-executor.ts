@@ -154,6 +154,15 @@ export interface DevnetDeployExecutorDeps {
   readonly delay?: (ms: number) => Promise<void>;
   /** Interval between finality polls (ms); defaults to {@link DEFAULT_FINALITY_POLL_INTERVAL_MS}. */
   readonly finalityPollIntervalMs?: number;
+  /**
+   * Structured error sink for otherwise-swallowed deploy faults (I2). A build/submit/finality
+   * fault used to vanish (no server log) — an unwired adapter or a real SDK bug presented to ops
+   * as nothing. This logs them LOUDLY. ⚠️ SC-031: it is only ever called with `error.name` (never
+   * `.message`/`.stack` — a real SDK error can echo inputs incl. the signing key) plus key-free
+   * context (projectId/txRef/phase). Defaults to a structured `process.stderr` line (mirrors the
+   * pipeline/handler seam); tests inject a spy to assert the loud log fired and stays key-free.
+   */
+  readonly logError?: (message: string, detail: Record<string, unknown>) => void;
 }
 
 // --- Artifact-URL parsing ---------------------------------------------------
@@ -223,6 +232,47 @@ export function isInsufficientTdust(error: unknown): boolean {
   return typeof name === "string" && name.includes("Wallet.InsufficientFunds");
 }
 
+/**
+ * The `.name` of an unknown throw, safe to LOG (SC-031 — a name is a class identifier, never an
+ * input echo, unlike `.message`/`.stack`). Falls back to a fixed token for a nameless throw.
+ */
+export function errorNameOf(error: unknown): string {
+  const name = (error as { name?: unknown } | null)?.name;
+  return typeof name === "string" && name.length > 0 ? name : "UnknownError";
+}
+
+/**
+ * The adapter's owner-gated "not wired" error class NAME (`sdk-adapter.ts` `DeploySdkNotWiredError`).
+ * Matched by NAME (not an `instanceof` import) so this module — and its tests — pull in NO
+ * `@midnight-ntwrk/*` (importing the class would load the SDK-touching adapter). Two contexts throw
+ * it: `submit` (the sign+submit seam is unwired) and `queryFinality` (the finalized-but-no-address
+ * extraction path); the caller interprets it per context (I1/I2).
+ */
+const DEPLOY_SDK_NOT_WIRED_ERROR_NAME = "DeploySdkNotWiredError";
+
+/** Is `error` the adapter's not-wired signal (matched by name, no SDK import)? */
+function isDeploySdkNotWired(error: unknown): boolean {
+  return errorNameOf(error) === DEPLOY_SDK_NOT_WIRED_ERROR_NAME;
+}
+
+/**
+ * The default structured error sink (I2): a single JSON line to `process.stderr` (mirrors the
+ * pipeline/handler `defaultLogError`). ⚠️ It renders `detail` values verbatim, so the CALLER must
+ * only ever pass key-free values (an `errorName` string, never a raw `Error` whose message/stack
+ * could echo the signing key). A stray `bigint` renders to a decimal string so the line can never
+ * throw and block the deploy.
+ */
+function defaultLogError(message: string, detail: Record<string, unknown>): void {
+  const rendered: Record<string, unknown> = { level: "error", source: "deploy-executor", message };
+  for (const [key, value] of Object.entries(detail)) {
+    rendered[key] = value;
+  }
+  const line = JSON.stringify(rendered, (_key, value: unknown) =>
+    typeof value === "bigint" ? value.toString() : value,
+  );
+  process.stderr.write(`${line}\n`);
+}
+
 // --- Fixed, key-free outcome reasons (SC-031) -------------------------------
 
 /**
@@ -238,6 +288,11 @@ const REASON = {
   buildFailed: "failed to build the deploy transaction",
   insufficientTdust: "deploy wallet has insufficient tDUST (EC-38)",
   nodeRejected: "node rejected the deploy submission",
+  /**
+   * I2 — a submit-PATH fault (the SDK adapter is not wired) — DISTINCT from a real node rejection
+   * so it never impersonates "node rejected the deploy submission" (no node was contacted).
+   */
+  submitUnavailable: "deploy submission path unavailable (SDK adapter not wired)",
 } as const;
 
 // --- Executor ---------------------------------------------------------------
@@ -279,6 +334,7 @@ export function createDevnetDeployExecutor(deps: DevnetDeployExecutorDeps): Depl
   const now = deps.now ?? Date.now;
   const delay = deps.delay ?? defaultDelay;
   const pollIntervalMs = deps.finalityPollIntervalMs ?? DEFAULT_FINALITY_POLL_INTERVAL_MS;
+  const logError = deps.logError ?? defaultLogError;
 
   // Per-wallet submission mutex (SPIKE-2 risk 7): a simple promise chain so every `signAndSubmit`
   // awaits the prior one — concurrent projects' deploys share the one deploy wallet, and their
@@ -335,7 +391,15 @@ export function createDevnetDeployExecutor(deps: DevnetDeployExecutorDeps): Depl
     let unprovenDeploy: Uint8Array;
     try {
       ({ unprovenDeploy } = await sdk.buildDeploy({ files: fileSet, signingKey, network }));
-    } catch {
+    } catch (error) {
+      // I2: log the fault LOUDLY (an unwired adapter / real SDK bug used to vanish) — name ONLY
+      // (SC-031: never `.message`/`.stack`, which could echo the signing key).
+      logError("deploy build failed", {
+        projectId,
+        sourceHash,
+        phase: "proving",
+        errorName: errorNameOf(error),
+      });
       return { outcome: "failed", reason: REASON.buildFailed };
     }
 
@@ -369,6 +433,8 @@ export function createDevnetDeployExecutor(deps: DevnetDeployExecutorDeps): Depl
         const { txRef } = await sdk.submit({ provenDeploy: proof.bytes, signingKey, network });
         return { outcome: "submitted", txRef } as const;
       } catch (error) {
+        // I2: log the fault LOUDLY (name ONLY — SC-031: never `.message`/`.stack`).
+        logError("deploy submit failed", { phase: "submitting", errorName: errorNameOf(error) });
         // Classify WITHOUT ever interpolating the raw error (it could echo the signing key) — a
         // FIXED, key-free reason per cause (SC-031).
         if (isInsufficientTdust(error)) {
@@ -376,6 +442,15 @@ export function createDevnetDeployExecutor(deps: DevnetDeployExecutorDeps): Depl
             outcome: "rejected",
             cause: "insufficient-tdust",
             reason: REASON.insufficientTdust,
+          } as const;
+        }
+        if (isDeploySdkNotWired(error)) {
+          // I2: the submit PATH is unwired — NOT a node rejection (no node was contacted). A
+          // distinct cause + reason so it never impersonates "node rejected the deploy submission".
+          return {
+            outcome: "rejected",
+            cause: "unavailable",
+            reason: REASON.submitUnavailable,
           } as const;
         }
         return { outcome: "rejected", cause: "rejected", reason: REASON.nodeRejected } as const;
@@ -388,7 +463,30 @@ export function createDevnetDeployExecutor(deps: DevnetDeployExecutorDeps): Depl
     // Bounded poll loop (EC-39): poll at least once, then stop the instant the deadline is reached —
     // never a poll at or beyond `timeoutMs`, never an unbounded wait.
     for (;;) {
-      const result = await sdk.queryFinality({ txRef: request.txRef, network });
+      let result: FinalityQueryResult;
+      try {
+        result = await sdk.queryFinality({ txRef: request.txRef, network });
+      } catch (error) {
+        // I1 (money-critical): `queryFinality` is DOCUMENTED to resolve, but the real adapter
+        // THROWS on two paths. Handle both HERE so a throw never escapes into the pipeline's
+        // generic retriable backstop → a retry that re-drives prove→submit → a SECOND on-chain
+        // deploy (real tDUST double-spend).
+        if (isDeploySdkNotWired(error)) {
+          // Finalized-but-no-address: the tx is KNOWN-finalized, only the address extraction failed.
+          // A retry double-deploys for CERTAIN, so return a distinct NON-retriable terminal (the
+          // pipeline maps it accordingly) + a LOUD, key-free log carrying the txRef for ops.
+          logError(
+            "deploy FINALIZED on-chain but the contract address was UNAVAILABLE — do NOT retry (a retry would double-deploy); ops reconcile from the txRef",
+            { txRef: request.txRef, phase: "awaiting_finality", errorName: errorNameOf(error) },
+          );
+          return { outcome: "address-unavailable" };
+        }
+        // A transient indexer/transport fault (e.g. DeployIndexerUnavailableError) — or any other
+        // unexpected throw — is treated as PENDING: keep polling within the bounded wait, so a
+        // one-off blip does not abort an otherwise-finalizing deploy. A persistent outage then
+        // degrades to the honest `timeout` (never a reject that re-drives submit).
+        result = { status: "pending" };
+      }
       switch (result.status) {
         case "finalized":
           return { outcome: "finalized", address: result.address };

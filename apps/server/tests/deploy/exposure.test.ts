@@ -69,9 +69,15 @@ const FORBIDDEN_KEY_TOKENS = /deployKey|DEPLOY_KEY|secret|\bsigningKey\b/i;
 const EMITTED_FRAME_LINE =
   /ctx\s*\.\s*send\s*\(|(?<![A-Za-z])emit\s*\(|emitContractDeployed\s*\(|reply\s*\.\s*send\s*\(/;
 
-/** A line that writes to a log / diagnostic sink (where `console.log(deps.signingKey)` would live). */
+/**
+ * A line that writes to a log / diagnostic sink (where `console.log(deps.signingKey)` would live).
+ * Includes `logError(` — the deploy modules' structured error seam (I1/I2 added loud fault logs to
+ * the executor/handler); a regression that logged `{ signingKey: deps.signingKey }` through it must
+ * fail this gate exactly like a raw `console.log` would. The scan is per-line, so the seam's rule
+ * is "name no key material on the `logError(` line" (the executor/handler pass `error.name` ONLY).
+ */
 const LOG_SURFACE_LINE =
-  /console\s*\.\s*\w+\s*\(|process\s*\.\s*(?:stdout|stderr)\s*\.\s*write\s*\(/;
+  /console\s*\.\s*\w+\s*\(|process\s*\.\s*(?:stdout|stderr)\s*\.\s*write\s*\(|logError\s*\(/;
 
 // --- A complete, valid env (mirrors config.test.ts) so `loadConfig` yields a real Config. ---
 
@@ -306,6 +312,20 @@ describe("SC-031: the audit catches a real leak (regex self-check)", () => {
     const violation = "  console.log(deps.signingKey);";
     expect(LOG_SURFACE_LINE.test(violation)).toBe(true);
     expect(violation).toMatch(FORBIDDEN_KEY_TOKENS);
+  });
+
+  it("flags a logError call that names the executor's signingKey dependency (I1/I2 loud logs)", () => {
+    // The exact regression the loud deploy-fault logs (I1/I2) could introduce: passing the raw key
+    // (or a key-bearing field) through the structured error seam instead of `error.name` only.
+    const violation = '    logError("deploy submit failed", { signingKey: deps.signingKey });';
+    expect(LOG_SURFACE_LINE.test(violation)).toBe(true);
+    expect(violation).toMatch(FORBIDDEN_KEY_TOKENS);
+  });
+
+  it("does NOT flag the loud logs' legitimate name-only detail (errorName)", () => {
+    // The sanctioned shape the executor/handler actually use: the error NAME only, never the key.
+    const safe = '    logError("deploy build failed", { phase: "proving", errorName: name });';
+    expect(safe).not.toMatch(FORBIDDEN_KEY_TOKENS);
   });
 
   it("does NOT flag the executor's legitimate signingKey field type declaration or private read", () => {

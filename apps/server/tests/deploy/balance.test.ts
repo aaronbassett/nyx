@@ -154,6 +154,10 @@ describe("createDevnetBalanceQuery", () => {
     });
 
     it("the not-wired rejection never leaks the signing key", async () => {
+      // Teeth (Opus-2): the key-leak assertion runs only inside `.catch()`, so pin the count — if
+      // the query ever STOPS rejecting, the catch never fires and this test FAILS instead of
+      // passing vacuously.
+      expect.assertions(1);
       const query = createDevnetBalanceQuery({ network: NETWORK, signingKey: CANARY_KEY });
 
       await query().catch((error: unknown) => {

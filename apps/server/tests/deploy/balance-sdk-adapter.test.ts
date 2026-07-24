@@ -39,6 +39,10 @@ describe("createBalanceSdkAdapter", () => {
   });
 
   it("the not-wired rejection never leaks the signing key (SC-031)", async () => {
+    // Teeth (Opus-2): the key-leak assertion lives only inside `.catch()`, so pin the assertion
+    // count — if the adapter ever STOPS rejecting, the catch never runs and this test FAILS loudly
+    // (rather than passing vacuously).
+    expect.assertions(1);
     const sdk = createBalanceSdkAdapter();
     const key = "secret-deploy-key-1234567890";
 
