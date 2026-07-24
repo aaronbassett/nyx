@@ -64,6 +64,17 @@ export interface DepositRegistration {
   readonly expiresAt: number;
 }
 
+/**
+ * A still-open deposit ref the observation adapter must keep watching (Task 7). "Open" =
+ * a watchable status (`preregistered`/`seen`) OR an `expired` ref still inside the
+ * late-deposit grace window (D46/EC-30 — a deposit that lands after TTL still credits, so
+ * a recently-expired ref must stay watched until the grace window closes).
+ */
+export interface OpenDepositRef {
+  /** The deposit reference to watch on the indexer. */
+  readonly ref: string;
+}
+
 /** A read projection for `GET /deposits/:ref` (the pre-registered ref lifecycle). */
 export interface DepositView {
   readonly status: DepositStatus;
@@ -160,6 +171,13 @@ export interface DepositStore {
   expireStale(): Promise<number>;
   /** Read the deposit-ref lifecycle status for `GET /deposits/:ref`, or `null` if unknown. */
   getDeposit(ref: string): Promise<DepositView | null>;
+  /**
+   * List the refs the observation adapter must still watch (Task 7): every `preregistered`
+   * or `seen` ref, plus every `expired` ref whose expiry is less than `graceMs` ago (the
+   * late-deposit grace window, D46/EC-30). Expiry is decided by the store's clock (the DB
+   * `now()` for {@link PgDepositStore}) — never a caller-supplied timestamp.
+   */
+  listOpenRefs(graceMs: number): Promise<readonly OpenDepositRef[]>;
 }
 
 /**
@@ -279,6 +297,10 @@ interface DepositRefRow {
 
 interface StatusRow {
   readonly status: DepositStatus;
+}
+
+interface RefRow {
+  readonly ref: string;
 }
 
 /** A `deposit_refs` row re-branded at the store boundary. */
@@ -470,6 +492,20 @@ export class PgDepositStore implements DepositStore {
     );
     const row = rows[0];
     return row === undefined ? null : { status: row.status };
+  }
+
+  async listOpenRefs(graceMs: number): Promise<readonly OpenDepositRef[]> {
+    // The DB clock decides the grace window (never the process clock): a watchable ref
+    // (`preregistered`/`seen`) OR an `expired` ref whose expiry is less than `graceMs` ago
+    // (late-deposit grace, D46/EC-30). `graceMs` is a bound parameter, never interpolated.
+    const { rows } = await this.db.query<RefRow>(
+      `SELECT ref FROM deposit_refs
+        WHERE status IN ('preregistered', 'seen')
+           OR (status = 'expired'
+               AND expires_at > now() - ($1::bigint * interval '1 millisecond'))`,
+      [graceMs],
+    );
+    return rows.map((row) => ({ ref: row.ref }));
   }
 
   /** Read a `deposit_refs` row, or `null` if the ref is unknown. */

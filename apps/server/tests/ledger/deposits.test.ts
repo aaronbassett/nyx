@@ -41,6 +41,7 @@ import type {
   DepositStatus,
   DepositStore,
   DepositView,
+  OpenDepositRef,
 } from "../../src/ledger/deposits.js";
 import { NonPositiveAmountError } from "../../src/ledger/ledger.js";
 import type { Balance, LedgerEntryRecord, LedgerStore, Turn } from "../../src/ledger/ledger.js";
@@ -296,6 +297,31 @@ class InMemoryDepositStore implements DepositStore {
   getDeposit(ref: string): Promise<DepositView | null> {
     const record = this.refs.get(ref);
     return Promise.resolve(record === undefined ? null : { status: record.status });
+  }
+
+  listOpenRefs(graceMs: number): Promise<readonly OpenDepositRef[]> {
+    // Mirrors the Pg SQL: watchable statuses (`preregistered`/`seen`) always, plus
+    // `expired` refs still within the late-deposit grace window (D46/EC-30) — an expiry
+    // less than `graceMs` ago, decided against the store clock (the DB `now()` in Pg).
+    const now = this.clock();
+    const open: OpenDepositRef[] = [];
+    for (const record of this.refs.values()) {
+      const watchable = record.status === "preregistered" || record.status === "seen";
+      const gracedExpired = record.status === "expired" && record.expiresAt > now - graceMs;
+      if (watchable || gracedExpired) {
+        open.push({ ref: record.ref });
+      }
+    }
+    return Promise.resolve(open);
+  }
+
+  /** Test-only seam: force a ref's status to exercise statuses the public API can't reach. */
+  setStatusForTest(ref: string, status: DepositStatus): void {
+    const record = this.refs.get(ref);
+    if (record === undefined) {
+      throw new Error(`unknown ref: ${ref}`);
+    }
+    record.status = status;
   }
 }
 
@@ -589,6 +615,57 @@ describe("a finalized success after TTL expiry still credits (never drop confirm
 describe("getDeposit reads the deposit-ref lifecycle status", () => {
   it("returns null for an unknown ref", async () => {
     expect(await store.getDeposit("never-registered")).toBeNull();
+  });
+});
+
+// --- listOpenRefs for observation polling (Task 6, D46/EC-30) ---------------
+
+describe("listOpenRefs surfaces watchable + graced-expired refs (Task 6)", () => {
+  const GRACE_MS = 60_000; // 1-minute late-deposit grace window.
+
+  it("lists a preregistered ref", async () => {
+    const { ref } = await store.preregister(ACCOUNT, 5_000n);
+    const open = await store.listOpenRefs(GRACE_MS);
+    expect(open.map((entry) => entry.ref)).toEqual([ref]);
+  });
+
+  it("lists a seen ref", async () => {
+    const { ref } = await store.preregister(ACCOUNT, 5_000n);
+    store.setStatusForTest(ref, "seen");
+    const open = await store.listOpenRefs(GRACE_MS);
+    expect(open.map((entry) => entry.ref)).toEqual([ref]);
+  });
+
+  it("does NOT list a credited ref", async () => {
+    const { ref } = await store.preregister(ACCOUNT, 5_000n);
+    await store.observeFinalized(observe({ ref, amount: 5_000n }));
+    expect((await store.getDeposit(ref))?.status).toBe("credited");
+    expect(await store.listOpenRefs(GRACE_MS)).toEqual([]);
+  });
+
+  it("does NOT list a failed ref (non-open terminal status)", async () => {
+    const { ref } = await store.preregister(ACCOUNT, 5_000n);
+    store.setStatusForTest(ref, "failed");
+    expect(await store.listOpenRefs(GRACE_MS)).toEqual([]);
+  });
+
+  it("lists an expired ref within graceMs of its expiry, but not after", async () => {
+    const { ref, expiresAt } = await store.preregister(ACCOUNT, 5_000n);
+    // Advance just past the TTL and sweep → the ref is now `expired`.
+    clock.now = expiresAt + 1;
+    expect(await store.expireStale()).toBe(1);
+    expect((await store.getDeposit(ref))?.status).toBe("expired");
+
+    // Within the grace window (expired < graceMs ago) → still watched.
+    expect((await store.listOpenRefs(GRACE_MS)).map((entry) => entry.ref)).toEqual([ref]);
+
+    // Past the grace window → no longer watched.
+    clock.now = expiresAt + GRACE_MS + 1;
+    expect(await store.listOpenRefs(GRACE_MS)).toEqual([]);
+  });
+
+  it("returns an empty list when nothing is open", async () => {
+    expect(await store.listOpenRefs(GRACE_MS)).toEqual([]);
   });
 });
 

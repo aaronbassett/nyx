@@ -185,6 +185,39 @@ describe.skipIf(!runLive)("PgDepositStore against live Postgres (US6)", () => {
     expect(orphanRows.rows[0]?.count).toBe("0");
   });
 
+  it("lists open refs: watchable + graced-expired, excluding credited (Task 6)", async () => {
+    const GRACE_MS = 3_600_000; // 1-hour grace window.
+
+    // A fresh `preregistered` ref → open.
+    const open = await store.preregister(OWNER, 5_000n);
+    refs.push(open.ref);
+
+    // A credited ref → NOT open.
+    const credited = await store.preregister(OWNER, 5_000n);
+    refs.push(credited.ref);
+    await store.observeFinalized(observe({ ref: credited.ref, amount: 5_000n }));
+
+    // A ref that expired just now (negative-TTL store) → within a wide grace window, open.
+    const graceStore = new PgDepositStore(db, new PgLedgerStore(db), {
+      minimumDeposit: 1_000n,
+      depositRefTtlMs: -1_000, // expires_at = now() - 1s → already stale, but recently.
+    });
+    const graced = await graceStore.preregister(OWNER, 5_000n);
+    refs.push(graced.ref);
+    expect(await graceStore.expireStale()).toBeGreaterThanOrEqual(1);
+    expect((await store.getDeposit(graced.ref))?.status).toBe("expired");
+
+    const listed = new Set((await store.listOpenRefs(GRACE_MS)).map((entry) => entry.ref));
+    expect(listed.has(open.ref)).toBe(true);
+    expect(listed.has(graced.ref)).toBe(true); // expired 1s ago, well inside the 1h grace.
+    expect(listed.has(credited.ref)).toBe(false);
+
+    // With a zero grace window, the expired ref drops out; the fresh one stays.
+    const zeroGrace = new Set((await store.listOpenRefs(0)).map((entry) => entry.ref));
+    expect(zeroGrace.has(open.ref)).toBe(true);
+    expect(zeroGrace.has(graced.ref)).toBe(false);
+  });
+
   it("expires only past-TTL preregistered refs against the DB clock (EC-29)", async () => {
     // A ref that is ALREADY past its TTL (negative TTL store) is swept; a fresh one is not.
     const staleStore = new PgDepositStore(db, new PgLedgerStore(db), {
