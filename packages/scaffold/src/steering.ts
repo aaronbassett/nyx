@@ -17,6 +17,12 @@
  *   against `EXPECTED_NETWORK_ID` (FR-037);
  * - {@link ScaffoldSteering.compactTestingRule} — ship OZ-simulator + Vitest tests
  *   for generated contracts per the compact-testing skill.
+ * - {@link ScaffoldSteering.packageManagerRule} — the generated project runs inside
+ *   the user's browser WebContainer and uses PLAIN npm (pnpm/sfw is a host-side
+ *   rule for the Nyx repo, never the user's code; design §7 supply-chain split);
+ * - {@link ScaffoldSteering.devWalletRule} — in local/dev-wallet mode the app signs
+ *   and submits its own transactions in-page from `VITE_DEV_WALLET_SEED`, with no
+ *   `window.midnight` connector inside the preview iframe (design §6, D37).
  *
  * The rules are DATA (typed constants); {@link (buildScaffoldingInstructions:function)}
  * and {@link (buildImplementationInstructions:function)} in `./instructions` do the
@@ -39,7 +45,7 @@ export interface SteeringRule {
   readonly guidance: string;
 }
 
-/** The four Nyx house rules, addressable by name. */
+/** The Nyx house rules, addressable by name. */
 export interface ScaffoldSteering {
   /** Contract address only via the `config.ts` chokepoint (D10, FR-080/FR-081). */
   readonly configChokepointRule: SteeringRule;
@@ -49,6 +55,10 @@ export interface ScaffoldSteering {
   readonly networkGuardRule: SteeringRule;
   /** Ship OZ-simulator + Vitest tests for generated contracts (compact-testing skill). */
   readonly compactTestingRule: SteeringRule;
+  /** Generated projects use PLAIN npm inside the WebContainer — never pnpm/sfw (design §7). */
+  readonly packageManagerRule: SteeringRule;
+  /** Dev-wallet mode signs/submits in-page from `VITE_DEV_WALLET_SEED`, no `window.midnight` iframe injection (design §6, D37). */
+  readonly devWalletRule: SteeringRule;
 }
 
 /**
@@ -107,16 +117,46 @@ export const SCAFFOLD_STEERING: ScaffoldSteering = {
       "(and the OZ-simulator patterns) so the tests use the real simulator API, then keep " +
       "them green as part of the verify cycle.",
   },
+  packageManagerRule: {
+    id: "package-manager",
+    title: "Container package manager",
+    decisions: ["design §7 supply-chain split"],
+    guidance:
+      "Generated projects run inside the user's browser WebContainer and use PLAIN npm for " +
+      "every install/script (npm install, npm run dev, npm test) — exactly what the " +
+      "in-browser runtime ships. NEVER generate pnpm, pnpm-lock.yaml, sfw, corepack, or " +
+      "any custom registry configuration into a user project: pnpm+sfw hardening is a " +
+      "HOST-side rule for the Nyx repo itself and must not leak into user code. Keep " +
+      "generated package.json scripts boringly standard npm.",
+  },
+  devWalletRule: {
+    id: "dev-wallet",
+    title: "Dev-wallet transaction signing (local mode)",
+    decisions: ["design §6 preview interaction", "D37"],
+    guidance:
+      "In local/dev-wallet mode the generated app signs and submits its own transactions " +
+      "in-page: it reads the signing seed from import.meta.env.VITE_DEV_WALLET_SEED " +
+      "(merged into the container .env.local by the platform — never hardcode a key, " +
+      "never prompt for one) and derives the wallet identity from it. There is NO " +
+      "window.midnight connector inside the preview iframe — do not generate connector " +
+      "detection for local mode; gate any connector path behind the absence of " +
+      "VITE_DEV_WALLET_SEED. The exact SDK call shapes for deriving the identity and " +
+      "building/submitting transactions are RETRIEVAL-SOURCED (constitution I): retrieve " +
+      "the platform's verified dev-wallet recipe (mirrored from the Nyx dev wallet and " +
+      "ceremony modules) rather than writing SDK calls from memory.",
+  },
 };
 
 /**
  * The steering rules as an ordered list — convenient for iteration (rendering
- * instructions, auditing the constitution-I flags). Same four rules as
- * {@link SCAFFOLD_STEERING}, in a stable order.
+ * instructions, auditing the constitution-I flags). Same rules as
+ * {@link SCAFFOLD_STEERING}, in a stable order (append-only — never reorder).
  */
 export const SCAFFOLD_STEERING_RULES: readonly SteeringRule[] = [
   SCAFFOLD_STEERING.configChokepointRule,
   SCAFFOLD_STEERING.proverProviderRule,
   SCAFFOLD_STEERING.networkGuardRule,
   SCAFFOLD_STEERING.compactTestingRule,
+  SCAFFOLD_STEERING.packageManagerRule,
+  SCAFFOLD_STEERING.devWalletRule,
 ];

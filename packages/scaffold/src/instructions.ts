@@ -68,10 +68,12 @@ function composeInstructions(
 
 /**
  * Build the steering block for the Scaffolding sub-agent (cold-start skeleton,
- * D3/FR-003). It carries the three rules the skeleton wires up — the config
- * chokepoint, the proving-provider default, and the wrong-network guard — plus the
- * reference snippets to adapt. The compact-testing rule is omitted: the skeleton
- * does not write the contract's tests (that is the Implementation agent's job).
+ * D3/FR-003). It carries the rules the skeleton wires up — the config chokepoint,
+ * the proving-provider default, the wrong-network guard, the container package
+ * manager (the skeleton emits package.json + scripts), and the dev-wallet signing
+ * mode (the skeleton wires the wallet-connection path) — plus the reference
+ * snippets to adapt. The compact-testing rule is omitted: the skeleton does not
+ * write the contract's tests (that is the Implementation agent's job).
  */
 export function buildScaffoldingInstructions(): string {
   return composeInstructions(
@@ -79,6 +81,8 @@ export function buildScaffoldingInstructions(): string {
       SCAFFOLD_STEERING.configChokepointRule,
       SCAFFOLD_STEERING.proverProviderRule,
       SCAFFOLD_STEERING.networkGuardRule,
+      SCAFFOLD_STEERING.packageManagerRule,
+      SCAFFOLD_STEERING.devWalletRule,
     ],
     STANDARD_REFERENCES,
   );
@@ -86,10 +90,11 @@ export function buildScaffoldingInstructions(): string {
 
 /**
  * Build the steering block for the Implementation sub-agent (the build step of a
- * verify cycle, D3/FR-002). It carries ALL four house rules — the Implementation
- * agent honours the chokepoint when reading the address, wires the providers per
- * policy, gates on the network, AND ships OZ-simulator + Vitest tests for the
- * contract — plus the same reference snippets to adapt.
+ * verify cycle, D3/FR-002). It carries ALL house rules — the Implementation agent
+ * honours the chokepoint when reading the address, wires the providers per policy,
+ * gates on the network, ships OZ-simulator + Vitest tests for the contract, uses
+ * plain npm in the container, and signs via the dev wallet in local mode — plus
+ * the same reference snippets to adapt.
  */
 export function buildImplementationInstructions(): string {
   return composeInstructions(SCAFFOLD_STEERING_RULES, STANDARD_REFERENCES);
