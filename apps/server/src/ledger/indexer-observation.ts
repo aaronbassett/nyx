@@ -65,8 +65,12 @@ export type CancelScheduled = () => void;
 
 /** Construction deps for {@link createObservationPoller}. */
 export interface ObservationPollerDeps {
-  /** The exactly-once credit chokepoint + the open-ref source (never bypassed). */
-  readonly store: Pick<DepositStore, "observeFinalized" | "listOpenRefs">;
+  /**
+   * The exactly-once credit chokepoint + the open-ref source (never bypassed) + the stale-ref
+   * sweep. `expireStale` runs at the TOP of every tick (I2) so abandoned pre-registered refs age
+   * out of `listOpenRefs` (EC-29) instead of growing the poller's work + `deposit_refs` forever.
+   */
+  readonly store: Pick<DepositStore, "observeFinalized" | "listOpenRefs" | "expireStale">;
   /** The indexer seam each tick queries for the open refs. */
   readonly query: DepositIndexerQuery;
   /** Poll cadence in ms between ticks. */
@@ -132,18 +136,27 @@ export function createObservationPoller(deps: ObservationPollerDeps): Observatio
 
   async function tick(gen: number): Promise<void> {
     try {
+      // I2 — sweep abandoned pre-registered refs past their TTL → `expired` (EC-29) BEFORE
+      // listing, so they leave `listOpenRefs` and stop accruing poller work / row growth.
+      await deps.store.expireStale();
       const open: readonly OpenDepositRef[] = await deps.store.listOpenRefs(deps.graceMs);
       if (open.length > 0) {
         const observations = await deps.query.findDeposits(open.map((row) => row.ref));
         for (const observation of observations) {
-          // OBSERVE — the store is the exactly-once CAS. The observation is passed through
-          // untouched; the store decides credit/ignore/orphan/failure (EC-28/EC-30/D46).
-          const outcome = await deps.store.observeFinalized(observation);
-          deps.onOutcome?.(outcome);
+          // I3 — per-observation isolation: one `observeFinalized` rejection must NOT skip every
+          // later observation this tick (cross-user credit starvation). Report and continue.
+          try {
+            // OBSERVE — the store is the exactly-once CAS. The observation is passed through
+            // untouched; the store decides credit/ignore/orphan/failure (EC-28/EC-30/D46).
+            const outcome = await deps.store.observeFinalized(observation);
+            deps.onOutcome?.(outcome);
+          } catch (error) {
+            deps.onError?.(error);
+          }
         }
       }
     } catch (error) {
-      // A list/query/store fault must NOT kill the poll loop — report and carry on.
+      // A list/query/expire fault must NOT kill the poll loop — report and carry on.
       deps.onError?.(error);
     } finally {
       // Reschedule — but only if this tick still belongs to the live generation (a `stop()`
@@ -175,9 +188,25 @@ export function createObservationPoller(deps: ObservationPollerDeps): Observatio
 export const INDEXER_GRAPHQL_PATH = "/api/v4/graphql";
 
 /**
- * Decode the NyxtVault's on-chain `deposits` map for a contract address into `refHex → amount`
- * (base units, `bigint`). This is the OWNER-GATED SDK seam (constitution I): the verified recipe
- * (SPIKE-2 §C/§D, `sdkwork/deposit-common.mjs`, executed 2026-07-23 against indexer 4.2.1) is
+ * One decoded on-chain deposit: the minted `amount` (base units, `bigint`) plus whether that
+ * state is FINALIZED. Finality is the READER's responsibility — the seam MUST set `finalized`
+ * true ONLY for state at/after finality (I1). This value flows straight into the
+ * {@link DepositObservation}'s `finalized` field, which the store gates crediting on
+ * ({@link DepositStore.observeFinalized} — SC-021), so a reader that reports a not-yet-final
+ * amount as `finalized: true` would breach the off-chain-mint finality backbone.
+ */
+export interface DepositStateEntry {
+  /** The ON-CHAIN minted amount in NYXT base units (native `bigint`, never `Number()`). */
+  readonly amount: bigint;
+  /** Whether this on-chain state is at/after finality — the reader's sole authority (I1). */
+  readonly finalized: boolean;
+}
+
+/**
+ * Decode the NyxtVault's on-chain `deposits` map for a contract address into
+ * `refHex → { amount, finalized }`. This is the OWNER-GATED SDK seam (constitution I): the
+ * verified recipe (SPIKE-2 §C/§D, `sdkwork/deposit-common.mjs`, executed 2026-07-23 against
+ * indexer 4.2.1) is
  *
  *   const state   = await publicDataProvider.queryContractState(vaultAddress); // indexer read
  *   const decoded = mod.ledger(state.data);   // the compiled NyxtVault module's generated decode
@@ -188,10 +217,20 @@ export const INDEXER_GRAPHQL_PATH = "/api/v4/graphql";
  * SPIKE-1 §8) and `publicDataProvider` is `@midnight-ntwrk/midnight-js-indexer-public-data-provider`
  * (not installed in the server) — the same owner-gated boundary as the deploy executor + the web
  * top-up ceremony. Wiring it is a body-only change: install the packages, import the compiled
- * module, and return the decoded map. The seam MUST surface amounts as native `bigint` (never
- * `Number()`) and MUST reflect only FINALIZED contract state (see the finality note below).
+ * module, and return the decoded map.
+ *
+ * SEAM CONTRACT (I1/M4):
+ *  - `amount` MUST be a native `bigint` (never `Number()`).
+ *  - `finalized` MUST reflect ONLY finalized on-chain state — the store credits on it directly
+ *    (see the finality note on {@link createDevnetDepositIndexerQuery}). The real reader
+ *    determines finality (e.g. the contract-action's block vs the finalized head).
+ *  - map KEYS MUST be lowercase hex, no `0x` prefix, 64 chars (the {@link randomDepositRef}
+ *    format). `findDeposits` lowercases each requested ref before lookup (M4) so a casing skew
+ *    on the request side can never silently strand a landed deposit.
  */
-export type DepositsStateReader = (vaultAddress: string) => Promise<ReadonlyMap<string, bigint>>;
+export type DepositsStateReader = (
+  vaultAddress: string,
+) => Promise<ReadonlyMap<string, DepositStateEntry>>;
 
 /** Options for {@link createDevnetDepositIndexerQuery}. */
 export interface DevnetDepositIndexerQueryOptions {
@@ -276,19 +315,21 @@ function graphqlEndpoint(indexerUrl: string): string {
  * this envelope — it is read from the contract's serialized `deposits` map via the owner-gated
  * {@link DepositsStateReader} (SPIKE-2 `queryContractState` + `mod.ledger(state).deposits.lookup`).
  *
- * FINALITY (retrieval-sourced): SPIKE-1 §5 observed the on-chain state change via the indexer
- * only AFTER finalization on node 0.22.5, so a ref present in the indexer-served `deposits` map is
- * treated as `finalized: true`. The precise finalized-vs-included semantics of the indexer's
- * contract-state read is an owner-gated live-schema confirmation (Task 7 Step 5); the safe
- * contract is that {@link DepositsStateReader} surfaces only FINALIZED state. The store gates on
- * `finalized` regardless, so a not-yet-final read never credits.
+ * FINALITY (I1 — structural, not a doc comment): the observation's `finalized` flag is the VALUE
+ * the {@link DepositsStateReader} returns per ref ({@link DepositStateEntry.finalized}), NEVER
+ * hardcoded here. SPIKE-1 §5 observed the on-chain state change via the indexer only AFTER
+ * finalization on node 0.22.5; the precise finalized-vs-included semantics of the indexer's
+ * contract-state read is an owner-gated live-schema confirmation (Task 7 Step 5), and it is the
+ * READER's contract to surface only FINALIZED state (see {@link DepositsStateReader}). The store
+ * gates crediting on `finalized`, so a reader that reports `finalized: false` never credits.
  *
  * `findDeposits`:
  *   1. GraphQL `contractAction(vaultAddress)` → tx hash (the diagnostic `txRef`) + existence.
  *      `null` / absent → `[]` (well-formed no-results; the decode seam is never reached).
- *   2. decode the on-chain `deposits` map (owner-gated) → `refHex → amount` (bigint).
- *   3. for each requested ref present in the map → a finalized `success` observation carrying the
- *      ON-CHAIN amount. Refs absent from the map yield no observation (the store keeps watching).
+ *   2. decode the on-chain `deposits` map (owner-gated) → `refHex → { amount, finalized }`.
+ *   3. for each requested ref present in the map → a `success` observation carrying the ON-CHAIN
+ *      amount and the reader's `finalized` flag. Refs absent from the map yield no observation
+ *      (the store keeps watching).
  *
  * `txRef` is the vault's latest contract-action tx hash (adequate for diagnostics / orphan
  * resolution, EC-31); a precise per-deposit tx would need a per-ref transactions query — an
@@ -301,8 +342,12 @@ export function createDevnetDepositIndexerQuery(
   const doFetch = options.fetch ?? fetch;
 
   async function fetchContractAction(): Promise<{ txRef: string } | null> {
+    // M1 — the vault address is a BOUND GraphQL variable (`$addr: HexEncoded!`), never
+    // interpolated, matching the module's "every value is a bound parameter" rule. The variable
+    // type is source-verified (constitution I): indexer `schema-v4.graphql`
+    // `contractAction(address: HexEncoded!, offset: ContractActionOffset)`.
     const query =
-      `{ contractAction(address: "${options.vaultAddress}") ` +
+      `query ($addr: HexEncoded!) { contractAction(address: $addr) ` +
       `{ __typename address unshieldedBalances { tokenType amount } ` +
       `transaction { hash block { height } } } }`;
 
@@ -311,7 +356,7 @@ export function createDevnetDepositIndexerQuery(
       response = await doFetch(endpoint, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify({ query, variables: { addr: options.vaultAddress } }),
       });
     } catch (error) {
       throw new IndexerUnavailableError(`indexer request failed: ${endpoint}`, { cause: error });
@@ -357,16 +402,21 @@ export function createDevnetDepositIndexerQuery(
 
       const observations: DepositObservation[] = [];
       for (const ref of refs) {
-        const amount = deposits.get(ref);
-        if (amount === undefined) {
+        // M4 — the seam's keys are lowercase hex; lowercase the requested ref before lookup so a
+        // casing skew can never silently strand a landed deposit. The observation keeps the ref
+        // as requested (the store's CAS matches the pre-registered ref).
+        const state = deposits.get(ref.toLowerCase());
+        if (state === undefined) {
           continue; // not landed on-chain yet — the store keeps watching this ref
         }
         observations.push({
           ref,
-          amount, // ON-CHAIN, native bigint (EC-28 authoritative) — never Number()
+          amount: state.amount, // ON-CHAIN, native bigint (EC-28 authoritative) — never Number()
           txRef: action.txRef,
           outcome: "success",
-          finalized: true,
+          // I1 — finality is the READER's value, NOT hardcoded: the store's finality gate only
+          // fires for this pipeline because this flag can be false (off-chain-mint safety).
+          finalized: state.finalized,
         });
       }
       return observations;
@@ -396,6 +446,13 @@ export interface CreditOutcomePushDeps {
   readonly ledger: Pick<LedgerStore, "getEntries">;
   /** Event-timestamp clock; the boot layer passes `Date.now`. */
   readonly now: () => number;
+  /**
+   * Loud sink for the "impossible" case (M2): the store reported a `credited` outcome but the
+   * matching `deposit_credit` row cannot be re-read. Rather than emit a synthetic `id: 0n` frame
+   * the P13 client silently drops (hiding the invariant break), we LOG it and emit nothing.
+   * Defaults to a no-op; the boot layer injects a stderr sink.
+   */
+  readonly onInvariantBreak?: (context: Record<string, unknown>, message: string) => void;
 }
 
 /**
@@ -419,6 +476,16 @@ export async function creditOutcomeToPush(
   switch (outcome.kind) {
     case "credited": {
       const entry = await resolveDepositCreditEntry(deps.ledger, outcome);
+      if (entry === null) {
+        // M2 — the store JUST wrote this credit, yet no matching row can be re-read. That is an
+        // "impossible" state; a synthetic `id: 0n` frame would be silently dropped by the P13
+        // client id-cursor guard and hide the invariant break. Log loudly and emit nothing.
+        (deps.onInvariantBreak ?? (() => undefined))(
+          { ref: outcome.ref, address: outcome.address, amount: outcome.amount.toString() },
+          "credited outcome has no re-readable deposit_credit row — dropped (invariant break)",
+        );
+        return null;
+      }
       const update: LedgerUpdateEvent = {
         type: "ledger:update",
         payload: {
@@ -457,13 +524,14 @@ export async function creditOutcomeToPush(
  * Resolve the `deposit_credit` {@link LedgerEntry} the store just wrote for this credit so the
  * `ledger:update` carries its REAL monotonic `id` (the web ledger reducer's sequence cursor —
  * a synthetic id would read as stale and be dropped). Scans newest-first for the entry matching
- * this credit's `ref`. Mirrors `supervisor.resolveSettlementEntry`: a synthetic `id: 0n`
- * fallback keeps the emit total in the impossible case the store returns no matching row.
+ * this credit's `ref`. Returns `null` in the "impossible" case the store returns no matching row
+ * (M2): the caller then logs loudly and emits nothing, rather than push a synthetic `id: 0n`
+ * frame the client silently drops (which would hide the invariant break).
  */
 async function resolveDepositCreditEntry(
   ledger: Pick<LedgerStore, "getEntries">,
   outcome: { readonly address: string; readonly ref: string; readonly amount: bigint },
-): Promise<LedgerEntry> {
+): Promise<LedgerEntry | null> {
   const entries = await ledger.getEntries(outcome.address);
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index];
@@ -477,11 +545,5 @@ async function resolveDepositCreditEntry(
       };
     }
   }
-  return {
-    id: 0n,
-    accountAddress: outcome.address as MidnightAddress,
-    kind: "deposit_credit",
-    amount: outcome.amount,
-    ref: outcome.ref,
-  };
+  return null;
 }

@@ -141,6 +141,17 @@ function readEnv(): Record<string, string | undefined> {
 }
 
 /**
+ * Whether this is a PRODUCTION build (`import.meta.env.PROD`). Belt-and-braces (Fable-M3): even
+ * if the demo flags leak into a prod build, {@link maybeInstallDevWallet} must never install a
+ * key-holding wallet. `PROD` is a Vite boolean; a stubbed string form is tolerated defensively.
+ */
+function isProductionBuild(): boolean {
+  const meta = import.meta as unknown as { env?: { PROD?: unknown } };
+  const prod = meta.env?.PROD;
+  return prod === true || prod === "true" || prod === "1";
+}
+
+/**
  * Install the dev wallet iff the demo env vars opt in: `VITE_DEV_WALLET === "1"`
  * and a non-empty `VITE_DEV_WALLET_SEED`. Returns whether it installed. The
  * reported network is pinned to {@link EXPECTED_NETWORK_ID} (the config chokepoint),
@@ -148,6 +159,11 @@ function readEnv(): Record<string, string | undefined> {
  * does not set the flags — production never ships a phantom wallet.
  */
 export function maybeInstallDevWallet(): boolean {
+  // Fable-M3 — never install a key-holding wallet in a production build, even if the demo
+  // flags somehow leak in. This is defence in depth behind main.tsx's dynamic-import gate.
+  if (isProductionBuild()) {
+    return false;
+  }
   const env = readEnv();
   const enabled = env.VITE_DEV_WALLET === "1";
   const seed = env.VITE_DEV_WALLET_SEED;

@@ -25,7 +25,9 @@ import {
   DepositIndexerNotWiredError,
   IndexerUnavailableError,
   type DepositIndexerQuery,
+  type DepositStateEntry,
 } from "../../src/ledger/indexer-observation.js";
+import { createDepositStore } from "../../src/ledger/deposits.js";
 import type {
   CreditOutcome,
   DepositObservation,
@@ -96,6 +98,11 @@ function ignoreAllMock(): DepositStore["observeFinalized"] {
   );
 }
 
+/** A no-op `expireStale` (I2): every tick runs the sweep; most tests only need it to succeed. */
+function expireStaleMock(): DepositStore["expireStale"] {
+  return vi.fn<DepositStore["expireStale"]>(() => Promise.resolve(0));
+}
+
 const FINALIZED_SUCCESS: DepositObservation = {
   ref: "aa".repeat(32),
   amount: 5_000n,
@@ -112,7 +119,7 @@ describe("createObservationPoller", () => {
     const listOpenRefs = listOpenRefsMock(); // → [] (nothing open)
     const findDeposits = vi.fn<DepositIndexerQuery["findDeposits"]>(() => Promise.resolve([]));
     const poller = createObservationPoller({
-      store: { listOpenRefs, observeFinalized: ignoreAllMock() },
+      store: { listOpenRefs, observeFinalized: ignoreAllMock(), expireStale: expireStaleMock() },
       query: { findDeposits },
       intervalMs: 1_000,
       graceMs: 60_000,
@@ -133,7 +140,11 @@ describe("createObservationPoller", () => {
     const timer = makeFakeTimer();
     const findDeposits = vi.fn<DepositIndexerQuery["findDeposits"]>(() => Promise.resolve([]));
     const poller = createObservationPoller({
-      store: { listOpenRefs: listOpenRefsMock("aa", "bb"), observeFinalized: ignoreAllMock() },
+      store: {
+        listOpenRefs: listOpenRefsMock("aa", "bb"),
+        observeFinalized: ignoreAllMock(),
+        expireStale: expireStaleMock(),
+      },
       query: { findDeposits },
       intervalMs: 1_000,
       graceMs: 0,
@@ -162,7 +173,11 @@ describe("createObservationPoller", () => {
     );
     const outcomes: CreditOutcome[] = [];
     const poller = createObservationPoller({
-      store: { listOpenRefs: listOpenRefsMock(FINALIZED_SUCCESS.ref), observeFinalized },
+      store: {
+        listOpenRefs: listOpenRefsMock(FINALIZED_SUCCESS.ref),
+        observeFinalized,
+        expireStale: expireStaleMock(),
+      },
       query: { findDeposits },
       intervalMs: 1_000,
       graceMs: 0,
@@ -188,7 +203,11 @@ describe("createObservationPoller", () => {
     );
     const outcomes: CreditOutcome[] = [];
     const poller = createObservationPoller({
-      store: { listOpenRefs: listOpenRefsMock(unfinalized.ref), observeFinalized },
+      store: {
+        listOpenRefs: listOpenRefsMock(unfinalized.ref),
+        observeFinalized,
+        expireStale: expireStaleMock(),
+      },
       query: { findDeposits },
       intervalMs: 1_000,
       graceMs: 0,
@@ -211,7 +230,11 @@ describe("createObservationPoller", () => {
     const findDeposits = vi.fn<DepositIndexerQuery["findDeposits"]>(() => Promise.reject(boom));
     const errors: unknown[] = [];
     const poller = createObservationPoller({
-      store: { listOpenRefs: listOpenRefsMock("aa"), observeFinalized: ignoreAllMock() },
+      store: {
+        listOpenRefs: listOpenRefsMock("aa"),
+        observeFinalized: ignoreAllMock(),
+        expireStale: expireStaleMock(),
+      },
       query: { findDeposits },
       intervalMs: 1_000,
       graceMs: 0,
@@ -236,6 +259,7 @@ describe("createObservationPoller", () => {
       store: {
         listOpenRefs: listOpenRefsMock(FINALIZED_SUCCESS.ref),
         observeFinalized: vi.fn(() => gate.promise),
+        expireStale: expireStaleMock(),
       },
       query: { findDeposits: vi.fn(() => Promise.resolve([FINALIZED_SUCCESS])) },
       intervalMs: 1_000,
@@ -259,7 +283,11 @@ describe("createObservationPoller", () => {
   it("stop() then start() does not double-arm (generation guard)", () => {
     const timer = makeFakeTimer();
     const poller = createObservationPoller({
-      store: { listOpenRefs: listOpenRefsMock(), observeFinalized: ignoreAllMock() },
+      store: {
+        listOpenRefs: listOpenRefsMock(),
+        observeFinalized: ignoreAllMock(),
+        expireStale: expireStaleMock(),
+      },
       query: { findDeposits: vi.fn(() => Promise.resolve([])) },
       intervalMs: 1_000,
       graceMs: 0,
@@ -276,7 +304,11 @@ describe("createObservationPoller", () => {
   it("start() is idempotent (a second start while running is a no-op)", () => {
     const timer = makeFakeTimer();
     const poller = createObservationPoller({
-      store: { listOpenRefs: listOpenRefsMock(), observeFinalized: ignoreAllMock() },
+      store: {
+        listOpenRefs: listOpenRefsMock(),
+        observeFinalized: ignoreAllMock(),
+        expireStale: expireStaleMock(),
+      },
       query: { findDeposits: vi.fn(() => Promise.resolve([])) },
       intervalMs: 1_000,
       graceMs: 0,
@@ -295,6 +327,7 @@ describe("createObservationPoller", () => {
       store: {
         listOpenRefs: listOpenRefsMock(FINALIZED_SUCCESS.ref),
         observeFinalized: vi.fn(() => gate.promise),
+        expireStale: expireStaleMock(),
       },
       query: { findDeposits: vi.fn(() => Promise.resolve([FINALIZED_SUCCESS])) },
       intervalMs: 1_000,
@@ -318,6 +351,78 @@ describe("createObservationPoller", () => {
     await firePromise;
     // Only now, after the store settled, is the next tick armed.
     expect(timer.armed()).toBe(true);
+  });
+
+  it("runs expireStale each tick BEFORE listing, so a swept ref drops out (I2 — EC-29 wired)", async () => {
+    const timer = makeFakeTimer();
+    // A stateful fake store: `old` is open until expireStale sweeps it, then it drops out.
+    let expired = false;
+    const expireStale = vi.fn<DepositStore["expireStale"]>(() => {
+      expired = true;
+      return Promise.resolve(1);
+    });
+    const listOpenRefs = vi.fn<DepositStore["listOpenRefs"]>(() =>
+      Promise.resolve(expired ? [] : ([{ ref: "old" }] as readonly OpenDepositRef[])),
+    );
+    const findDeposits = vi.fn<DepositIndexerQuery["findDeposits"]>(() => Promise.resolve([]));
+    const poller = createObservationPoller({
+      store: { listOpenRefs, observeFinalized: ignoreAllMock(), expireStale },
+      query: { findDeposits },
+      intervalMs: 1_000,
+      graceMs: 0,
+      schedule: timer.schedule,
+    });
+
+    poller.start();
+    await timer.fire();
+
+    // The sweep ran BEFORE listing, so the abandoned ref never reached the indexer query.
+    expect(expireStale).toHaveBeenCalledTimes(1);
+    expect(findDeposits).not.toHaveBeenCalled();
+    // And it is no longer returned by listOpenRefs (unbounded growth / dead EC-29 fixed).
+    await expect(listOpenRefs(0)).resolves.toEqual([]);
+  });
+
+  it("isolates a per-observation store rejection: later observations still credit (I3)", async () => {
+    const timer = makeFakeTimer();
+    const obsA: DepositObservation = { ...FINALIZED_SUCCESS, ref: "aa".repeat(32) };
+    const obsB: DepositObservation = { ...FINALIZED_SUCCESS, ref: "bb".repeat(32) };
+    const boom = new Error("store hiccup on A");
+    const creditedB: CreditOutcome = {
+      kind: "credited",
+      ref: obsB.ref,
+      address: "mn_addr_bob",
+      amount: 5_000n,
+      balance: { available: 5_000n, reserved: 0n },
+    };
+    // The FIRST observation's store call rejects; the SECOND must still be processed.
+    const observeFinalized = vi.fn<DepositStore["observeFinalized"]>((obs) =>
+      obs.ref === obsA.ref ? Promise.reject(boom) : Promise.resolve(creditedB),
+    );
+    const outcomes: CreditOutcome[] = [];
+    const errors: unknown[] = [];
+    const poller = createObservationPoller({
+      store: {
+        listOpenRefs: listOpenRefsMock(obsA.ref, obsB.ref),
+        observeFinalized,
+        expireStale: expireStaleMock(),
+      },
+      query: { findDeposits: vi.fn(() => Promise.resolve([obsA, obsB])) },
+      intervalMs: 1_000,
+      graceMs: 0,
+      onOutcome: (o) => outcomes.push(o),
+      onError: (e) => errors.push(e),
+      schedule: timer.schedule,
+    });
+
+    poller.start();
+    await timer.fire();
+
+    // A's rejection is reported but does NOT skip B (no cross-user credit starvation).
+    expect(errors).toEqual([boom]);
+    expect(observeFinalized).toHaveBeenCalledTimes(2);
+    expect(outcomes).toEqual([creditedB]);
+    expect(timer.armed()).toBe(true); // the loop still survives to the next tick
   });
 });
 
@@ -366,13 +471,13 @@ describe("createDevnetDepositIndexerQuery", () => {
   const REF_A = "aa".repeat(32);
   const REF_B = "bb".repeat(32);
 
-  it("POSTs the verified contractAction query to the GraphQL endpoint with the vault address", async () => {
+  it("POSTs the contractAction query with the vault address as a BOUND GraphQL variable (M1)", async () => {
     const fetchMock = jsonFetchMock(contractActionResponse("0xhash", 218));
     const query = createDevnetDepositIndexerQuery({
       indexerUrl: "http://localhost:8088",
       vaultAddress: VAULT,
       fetch: fetchMock,
-      readDepositsState: () => Promise.resolve(new Map<string, bigint>()),
+      readDepositsState: () => Promise.resolve(new Map<string, DepositStateEntry>()),
     });
 
     await query.findDeposits([REF_A]);
@@ -384,9 +489,12 @@ describe("createDevnetDepositIndexerQuery", () => {
     if (typeof body !== "string") {
       throw new Error("expected a string request body");
     }
-    const sentBody = JSON.parse(body) as { query: string };
-    expect(sentBody.query).toContain("contractAction(address:");
-    expect(sentBody.query).toContain(VAULT);
+    const sentBody = JSON.parse(body) as { query: string; variables: { addr: string } };
+    // M1 — the address is a bound `$addr: HexEncoded!` variable, NEVER interpolated into the
+    // query string (GraphQL-injection hygiene, matching the module's bound-parameter rule).
+    expect(sentBody.query).toContain("contractAction(address: $addr)");
+    expect(sentBody.query).not.toContain(VAULT);
+    expect(sentBody.variables).toEqual({ addr: VAULT });
   });
 
   it("maps a ref present in the decoded deposits map to a finalized success observation", async () => {
@@ -394,8 +502,12 @@ describe("createDevnetDepositIndexerQuery", () => {
       indexerUrl: "http://localhost:8088/api/v4/graphql",
       vaultAddress: VAULT,
       fetch: jsonFetchMock(contractActionResponse("0xdeadbeef", 218)),
-      // The on-chain amount arrives as a native bigint from `mod.ledger().deposits.lookup`.
-      readDepositsState: () => Promise.resolve(new Map<string, bigint>([[REF_A, 7_777n]])),
+      // The on-chain amount arrives as a native bigint from `mod.ledger().deposits.lookup`;
+      // the reader also reports finality (I1) — here a finalized entry.
+      readDepositsState: () =>
+        Promise.resolve(
+          new Map<string, DepositStateEntry>([[REF_A, { amount: 7_777n, finalized: true }]]),
+        ),
     });
 
     const observations = await query.findDeposits([REF_A, REF_B]);
@@ -415,8 +527,47 @@ describe("createDevnetDepositIndexerQuery", () => {
     expect(observations.map((o) => o.ref)).toEqual([REF_A]);
   });
 
+  it("propagates the reader's finalized flag — an UNFINALIZED read yields no credit (I1)", async () => {
+    // I1 — finality is a VALUE the reader returns, not hardcoded. A reader that reports the
+    // deposit as NOT yet finalized must produce a `finalized: false` observation so the store's
+    // finality gate (the off-chain-mint backbone, SC-021) actually fires for this pipeline.
+    const query = createDevnetDepositIndexerQuery({
+      indexerUrl: "http://localhost:8088",
+      vaultAddress: VAULT,
+      fetch: jsonFetchMock(contractActionResponse("0xhash", 218)),
+      readDepositsState: () =>
+        Promise.resolve(
+          new Map<string, DepositStateEntry>([[REF_A, { amount: 5_000n, finalized: false }]]),
+        ),
+    });
+
+    const observations = await query.findDeposits([REF_A]);
+    const observation = observations[0];
+    expect(observation?.finalized).toBe(false);
+    if (observation === undefined) {
+      throw new Error("expected an observation");
+    }
+
+    // Feed it through a REAL deposit store whose db + ledger THROW if touched: the finality gate
+    // must short-circuit to `ignored-unfinalized` BEFORE any credit work (NO off-chain mint).
+    const creditDeposit = vi.fn(() =>
+      Promise.reject(new Error("must not credit an unfinalized deposit")),
+    );
+    const dbQuery = vi.fn(() =>
+      Promise.reject(new Error("must not query for an unfinalized deposit")),
+    );
+    const store = createDepositStore({ query: dbQuery }, {
+      creditDeposit,
+    } as unknown as LedgerStore);
+
+    const outcome = await store.observeFinalized(observation);
+    expect(outcome).toEqual({ kind: "ignored-unfinalized", ref: REF_A });
+    expect(creditDeposit).not.toHaveBeenCalled();
+    expect(dbQuery).not.toHaveBeenCalled();
+  });
+
   it("returns an empty array (well-formed no-results) when the contract has no action yet", async () => {
-    const readDepositsState = vi.fn(() => Promise.resolve(new Map<string, bigint>()));
+    const readDepositsState = vi.fn(() => Promise.resolve(new Map<string, DepositStateEntry>()));
     const query = createDevnetDepositIndexerQuery({
       indexerUrl: "http://localhost:8088",
       vaultAddress: VAULT,
@@ -435,7 +586,7 @@ describe("createDevnetDepositIndexerQuery", () => {
       indexerUrl: "http://localhost:8088",
       vaultAddress: VAULT,
       fetch: jsonFetchMock({}, { status: 503 }),
-      readDepositsState: () => Promise.resolve(new Map<string, bigint>()),
+      readDepositsState: () => Promise.resolve(new Map<string, DepositStateEntry>()),
     });
     await expect(query.findDeposits([REF_A])).rejects.toBeInstanceOf(IndexerUnavailableError);
   });
@@ -445,7 +596,7 @@ describe("createDevnetDepositIndexerQuery", () => {
       indexerUrl: "http://localhost:8088",
       vaultAddress: VAULT,
       fetch: jsonFetchMock({ errors: [{ message: "unknown field" }] }),
-      readDepositsState: () => Promise.resolve(new Map<string, bigint>()),
+      readDepositsState: () => Promise.resolve(new Map<string, DepositStateEntry>()),
     });
     await expect(query.findDeposits([REF_A])).rejects.toBeInstanceOf(IndexerUnavailableError);
   });
@@ -455,7 +606,7 @@ describe("createDevnetDepositIndexerQuery", () => {
       indexerUrl: "http://localhost:8088",
       vaultAddress: VAULT,
       fetch: vi.fn<typeof fetch>(() => Promise.reject(new Error("ECONNREFUSED"))),
-      readDepositsState: () => Promise.resolve(new Map<string, bigint>()),
+      readDepositsState: () => Promise.resolve(new Map<string, DepositStateEntry>()),
     });
     await expect(query.findDeposits([REF_A])).rejects.toBeInstanceOf(IndexerUnavailableError);
   });
@@ -520,14 +671,21 @@ describe("creditOutcomeToPush", () => {
     expect(entry.ref).toBe("dep-ref-1");
   });
 
-  it("falls back to a synthetic id:0 entry when no matching deposit_credit row is found", async () => {
+  it("emits NO frame and logs loudly when no matching deposit_credit row can be re-read (M2)", async () => {
+    // M2 — the store JUST wrote this credit yet no row is re-readable: an "impossible" state. A
+    // synthetic `id: 0n` frame would be silently dropped by the P13 client id-cursor guard,
+    // HIDING the invariant break. Instead we log loudly and emit nothing.
     const ledger = getEntriesMock([]); // store returned nothing for this address
-    const push = await creditOutcomeToPush(CREDITED, { ledger, now: () => NOW });
+    const breaks: { context: Record<string, unknown>; message: string }[] = [];
+    const push = await creditOutcomeToPush(CREDITED, {
+      ledger,
+      now: () => NOW,
+      onInvariantBreak: (context, message) => breaks.push({ context, message }),
+    });
 
-    const entry = (push?.event as { payload: { entry: Record<string, unknown> } }).payload.entry;
-    expect(entry.id).toBe("0");
-    expect(entry.amount).toBe("5000"); // still carries the credited amount + ref
-    expect(entry.ref).toBe("dep-ref-1");
+    expect(push).toBeNull(); // nothing emitted (no invisible synthetic frame)
+    expect(breaks).toHaveLength(1);
+    expect(breaks[0]?.context).toMatchObject({ ref: "dep-ref-1", address: "mn_addr_alice" });
   });
 
   it("maps a finalized FAILURE with a known address to a deposit:failed frame (no ledger read)", async () => {

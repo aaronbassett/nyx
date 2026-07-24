@@ -417,6 +417,7 @@ async function main(): Promise<void> {
       const push = await creditOutcomeToPush(outcome, {
         ledger: ledgerStore,
         now: () => Date.now(),
+        onInvariantBreak: logDepositWarning,
       });
       if (push === null) {
         return;

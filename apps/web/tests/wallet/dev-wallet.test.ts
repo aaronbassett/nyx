@@ -109,6 +109,16 @@ describe("maybeInstallDevWallet — env gate (d)", () => {
     expect(maybeInstallDevWallet()).toBe(false);
     expect(discoverWallets()).toEqual([]);
   });
+
+  it("refuses to install in a production build even when the flags are set (Fable-M3)", () => {
+    // Belt-and-braces: a key-holding wallet must NEVER be installed in a prod build, even if the
+    // demo env flags leak in past main.tsx's dynamic-import gate.
+    vi.stubEnv("PROD", true);
+    vi.stubEnv("VITE_DEV_WALLET", "1");
+    vi.stubEnv("VITE_DEV_WALLET_SEED", SEED);
+    expect(maybeInstallDevWallet()).toBe(false);
+    expect(discoverWallets()).toEqual([]);
+  });
 });
 
 describe("full-stack SIWE compatibility (e)", () => {

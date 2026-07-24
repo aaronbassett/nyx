@@ -178,4 +178,20 @@ describe("withFallback", () => {
     const primary = fakeProver();
     expect(withFallback(primary)).toBe(primary);
   });
+
+  it("retains the primary (wasm) error as `cause` when BOTH legs fail (Opus-2)", async () => {
+    const primaryError = new Error("wasm oom");
+    const fallbackError = new Error("proxy 503");
+    const combined = withFallback(
+      { prove: () => Promise.reject(primaryError) },
+      { prove: () => Promise.reject(fallbackError) },
+    );
+
+    // The bare `catch {}` used to swallow the wasm failure; now it survives as `cause` and both
+    // leg messages appear in the surfaced error (no lost diagnostic).
+    await expect(combined.prove(new Uint8Array([1]))).rejects.toMatchObject({
+      cause: primaryError,
+    });
+    await expect(combined.prove(new Uint8Array([1]))).rejects.toThrow(/wasm oom.*proxy 503/s);
+  });
 });

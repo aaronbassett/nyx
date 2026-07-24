@@ -40,11 +40,17 @@ function readEnv(): Record<string, string | undefined> {
   return meta.env ?? {};
 }
 
+/** A terse, safe rendering of an unknown thrown value for a diagnostic message. */
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 /**
  * Combine two provers into one that tries `primary`, and on ANY rejection falls back to
  * `fallback` (SPIKE-2's wasm→proof-server swap). With no `fallback` it is just `primary`.
  * The same unproven bytes are re-proven by the fallback — proving is a pure function of
- * the tx + key material, so a retry is safe.
+ * the tx + key material, so a retry is safe. If BOTH legs fail, the surfaced error RETAINS the
+ * primary (wasm) failure as its `cause` (Opus-2) so no diagnostic is lost.
  */
 export function withFallback(primary: CeremonyProver, fallback?: CeremonyProver): CeremonyProver {
   if (fallback === undefined) {
@@ -52,11 +58,24 @@ export function withFallback(primary: CeremonyProver, fallback?: CeremonyProver)
   }
   return {
     async prove(unprovenTx: Uint8Array): Promise<Uint8Array> {
+      let primaryError: unknown;
       try {
         return await primary.prove(unprovenTx);
-      } catch {
+      } catch (error) {
+        primaryError = error;
+      }
+      try {
         // The proof-server fallback re-proves the SAME tx with the SAME key material.
-        return fallback.prove(unprovenTx);
+        return await fallback.prove(unprovenTx);
+      } catch (fallbackError) {
+        // Opus-2 — both legs failed. Surface the fallback error but RETAIN the primary (wasm)
+        // failure as its `cause` (the bare `catch {}` used to swallow it — a lost diagnostic
+        // when the proxy also fails).
+        throw new Error(
+          `dev ceremony proving failed on both legs (wasm: ${describeError(primaryError)}; ` +
+            `proxy: ${describeError(fallbackError)})`,
+          { cause: primaryError },
+        );
       }
     },
   };
