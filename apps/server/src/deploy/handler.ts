@@ -84,6 +84,7 @@ import type {
   ServerToClientEvent,
 } from "@nyx/protocol";
 import type { ConnectionContext, EventRouter } from "../protocol/router.js";
+import { errorNameOf } from "./devnet-executor.js";
 import type { DeployArtifacts, DeployPipeline } from "./pipeline.js";
 import { InsufficientDeployFundsError, PLATFORM_REFUELLING_MESSAGE } from "./wallet.js";
 import type { DeployWalletMonitor } from "./wallet.js";
@@ -305,6 +306,14 @@ export function createDeployHandler(deps: DeployHandlerDeps): DeployHandler {
         try {
           await deps.wallet.assertCanDeploy();
         } catch (error) {
+          // I2: log the funds-gate fault LOUDLY (it used to be swallowed silently). Name ONLY
+          // (SC-031: a real balance-SDK error could echo the signing key in its message/stack, so
+          // never pass the raw error here — only its class name + key-free context).
+          logError("deploy funds gate failed — surfacing a platform fault", {
+            projectId,
+            requestId,
+            errorName: errorNameOf(error),
+          });
           // EC-38: an exhausted deploy wallet (or any funds-gate fault) is a PLATFORM issue, never
           // the user's fault — surface the platform-framed message and deploy nothing (no pipeline
           // is even built, so no `contract:deployed`).

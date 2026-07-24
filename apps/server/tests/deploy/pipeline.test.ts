@@ -646,4 +646,83 @@ describe("createDeployPipeline", () => {
     expect(h.executorCalls.prove).toHaveLength(0);
     expect(h.logs.some((entry) => entry.detail.error === boom)).toBe(true);
   });
+
+  // --- I1: a finalized-but-no-address finality is a NON-retriable terminal ----------------------
+
+  it("I1: an address-unavailable finality surfaces a NON-retriable address-unavailable, announces nothing, logs loudly, never rejects", async () => {
+    const h = makeHarness({ finality: { outcome: "address-unavailable" } });
+    const pipeline = createDeployPipeline(h.deps);
+
+    // runDeploy RESOLVES (never rejects) — the tx is finalized on-chain but the address is missing.
+    const result = await pipeline.runDeploy(inputWith(GREEN_BUILD));
+
+    expect(result).toEqual({ kind: "address-unavailable", txRef: TX_REF, retriable: false });
+    expect(h.deployed).toHaveLength(0); // no address → nothing announced
+    expect(h.registryCalls).toHaveLength(0); // nothing recorded
+    expect(phasesOf(h)).toEqual([
+      "validating",
+      "proving",
+      "submitting",
+      "awaiting_finality",
+      "failed",
+    ]);
+    expect(h.statuses.at(-1)?.detail).toBe(DEPLOY_FAILURE_DETAIL.addressUnavailable);
+    // Loud log naming the finalized-but-unrecordable deploy by txRef (ops reconcile).
+    expect(h.logs.some((entry) => entry.detail.txRef === TX_REF)).toBe(true);
+  });
+
+  // --- M-1: address-unavailable is memoised (a same-requestId re-run replays, never re-drives) ---
+
+  it("M-1: a same-requestId re-run after address-unavailable REPLAYS it — the executor is NOT re-driven (no CERTAIN second on-chain tx)", async () => {
+    // The finality is `address-unavailable`: the tx FINALIZED on-chain but the address could not be
+    // extracted — the money-critical NON-retriable terminal. Because the tx is finalized, a re-drive
+    // would double-deploy for CERTAIN (and there is no registry row, so tx_ref idempotency is no
+    // belt either), so the terminal MUST be memoised exactly like `deployed`/`record-failed`.
+    const h = makeHarness({ finality: { outcome: "address-unavailable" } });
+    const pipeline = createDeployPipeline(h.deps);
+
+    const first = await pipeline.runDeploy(inputWith(GREEN_BUILD));
+    expect(first).toEqual({ kind: "address-unavailable", txRef: TX_REF, retriable: false });
+    // The first run drove the executor EXACTLY once through prove → submit → finality.
+    expect(h.executorCalls.prove).toHaveLength(1);
+    expect(h.executorCalls.submit).toHaveLength(1);
+    expect(h.executorCalls.finality).toHaveLength(1);
+    const statusesAfterFirst = h.statuses.length;
+
+    // A re-run with the SAME requestId REPLAYS the memoised address-unavailable: the executor call
+    // counts do NOT grow (no second prove/submit/finality → no CERTAIN second on-chain tx), nothing
+    // is announced, and no new status is streamed.
+    const replay = await pipeline.runDeploy(inputWith(GREEN_BUILD));
+
+    expect(replay).toEqual(first);
+    expect(h.executorCalls.prove).toHaveLength(1); // NOT re-driven
+    expect(h.executorCalls.submit).toHaveLength(1); // NOT re-driven
+    expect(h.executorCalls.finality).toHaveLength(1); // NOT re-driven
+    expect(h.deployed).toHaveLength(0); // still nothing announced
+    expect(h.statuses).toHaveLength(statusesAfterFirst); // a replay streams no new status
+  });
+
+  // --- I2: a submit `unavailable` cause is a PLATFORM fault, never a node rejection --------------
+
+  it("I2: a submit `unavailable` (adapter-not-wired) rejection is a PLATFORM fault, never impersonating a node rejection", async () => {
+    const h = makeHarness({
+      submit: { outcome: "rejected", cause: "unavailable", reason: "adapter not wired" },
+    });
+    const pipeline = createDeployPipeline(h.deps);
+
+    const result = await pipeline.runDeploy(inputWith(GREEN_BUILD));
+
+    expect(result).toEqual({
+      kind: "failed",
+      phase: "submitting",
+      fault: "platform",
+      reason: "adapter not wired",
+      retriable: true,
+    });
+    expect(h.executorCalls.finality).toHaveLength(0);
+    expect(h.deployed).toHaveLength(0);
+    // The wire detail is the platform frame — NOT "deploy submission rejected" (no node impersonation).
+    expect(h.statuses.at(-1)?.detail).toBe(DEPLOY_FAILURE_DETAIL.platform);
+    expect(h.statuses.at(-1)?.detail).not.toBe(DEPLOY_FAILURE_DETAIL.node);
+  });
 });

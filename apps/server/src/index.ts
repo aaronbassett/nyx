@@ -20,7 +20,8 @@ import { ConfigValidationError, loadConfig } from "./config/index.js";
 import type { Config } from "./config/index.js";
 import { providerApiKeys } from "./config/schema.js";
 import { getDb } from "./db/index.js";
-import { createOwnerGatedDeployExecutor } from "./deploy/executor.js";
+import { createDevnetBalanceQuery } from "./deploy/balance.js";
+import { createDevnetDeployExecutor } from "./deploy/devnet-executor.js";
 import { createDeployHandler } from "./deploy/handler.js";
 import { createDeployPipeline } from "./deploy/pipeline.js";
 import { createDeployRegistry } from "./deploy/registry.js";
@@ -41,6 +42,7 @@ import {
 } from "./ledger/reconcile.js";
 import type { ReconcileAlarm } from "./ledger/reconcile.js";
 import { createReconcileScheduler } from "./ledger/reconcile-scheduler.js";
+import { createNyxtVaultStateReader } from "./ledger/vault-state-reader.js";
 import { createMcpClients } from "./mcp/index.js";
 import { createProjectAuthorizer } from "./projects/authorize.js";
 import {
@@ -262,27 +264,28 @@ async function main(): Promise<void> {
     fetchArtifact: storeFetchAdapter(artifactStore),
   });
 
-  // The US8 deploy loop. All seam construction, no network: the executor, the wallet balance
-  // query, and the latest-green-build lookup are OWNER-GATED / open wiring gaps (flagged below).
+  // The US8 deploy loop. Pure seam construction, no network at boot: the real devnet executor and
+  // balance query open the local devnet + a funded signing credential lazily on first ACTUAL
+  // deploy/balance call (their SDK bodies stay owner-gated behind *NotWiredError until P5), so the
+  // server still boots green; only a real deploy/balance attempt reaches the gated leg.
   const deployRegistry = createDeployRegistry(db);
-  // OWNER-GATED (constitution I): the real Midnight-SDK deploy adapter is a stub whose every
-  // method throws — it needs the local devnet + a funded signing credential + mnm-verified SDK
-  // shapes. The signing credential flows ONLY here (D50/constitution III), never client-routed.
-  const deployExecutor = createOwnerGatedDeployExecutor({
+  // The real Midnight-SDK deploy adapter (D50/constitution III). The signing credential flows ONLY
+  // here (never client-routed); the SDK graph is lazily imported on first deploy, so construction is
+  // side-effect-free and the artifact store is the read-only source of the compiled contract.
+  const deployExecutor = createDevnetDeployExecutor({
     signingKey: config.secrets.deployKey,
     network: config.network,
     proverClient,
+    artifacts: artifactStore,
   });
   const deployWallet = createDeployWalletMonitor({
-    // OWNER-GATED (constitution I): the real tDUST balance read (Midnight SDK/indexer adapter) is
-    // not wired. A rejected query is the loudest "not wired" — `assertCanDeploy` fails closed and
-    // no false balance is ever reported. (Unreached today: `getLatestGreenBuild` rejects first.)
-    queryBalance: () =>
-      Promise.reject(
-        new Error(
-          "owner-gated: deploy-wallet tDUST balance query not wired (needs the SDK/indexer adapter + a funded deploy wallet)",
-        ),
-      ),
+    // The real deploy-wallet tDUST balance read (Midnight SDK adapter, lazily loaded). A seam
+    // rejection propagates (fail-closed) — `assertCanDeploy` fails closed and no false balance is
+    // ever reported; the signing credential flows in as a dependency, never onto a client surface.
+    queryBalance: createDevnetBalanceQuery({
+      network: config.network,
+      signingKey: config.secrets.deployKey,
+    }),
     lowThreshold: DEPLOY_WALLET_LOW_THRESHOLD_TDUST,
     alert: logWalletAlert,
   });
@@ -395,14 +398,25 @@ async function main(): Promise<void> {
   // tick lists the still-open deposit refs, asks the indexer for exactly those, and hands every
   // observation VERBATIM to the store's exactly-once credit CAS (the poller never classifies or
   // credits — `deposits.ts` does). It mirrors the reconcile scheduler's lifecycle: started after
-  // listen, stopped on close. The real per-deposit on-chain DECODE (`readDepositsState`) is
-  // OWNER-GATED (constitution I) and deliberately NOT injected here, so until it + a deployed
-  // vault address land, every tick faults on the gated decode, is logged, and the loop survives —
-  // the honest "armed but gated" state (identical to the reconcile job's gated sources).
+  // listen, stopped on close. The per-deposit on-chain DECODE (`readDepositsState`) is the real
+  // NyxtVault state reader — but it needs BOTH a deployed vault address and the compiled vault
+  // module (`vaultArtifactsDir`), which only the P5 demo env supplies. When either is absent the
+  // reader is omitted, so every tick faults on the honest DepositIndexerNotWiredError, is logged,
+  // and the loop survives — the "armed but gated" state (identical to the reconcile job's sources).
+  const vaultModuleDir = config.artifacts.vaultArtifactsDir;
   const depositIndexerQuery = createDevnetDepositIndexerQuery({
     indexerUrl: config.network.indexerUrl,
     vaultAddress: config.nyxtVaultAddress,
-    // readDepositsState OWNER-GATED — omitted → findDeposits rejects (DepositIndexerNotWiredError).
+    // Inject the real decode ONLY when both the deployed vault address and the compiled vault module
+    // are configured (P5); otherwise omit it → findDeposits rejects (DepositIndexerNotWiredError).
+    ...(vaultModuleDir && config.nyxtVaultAddress
+      ? {
+          readDepositsState: createNyxtVaultStateReader({
+            indexerUrl: config.network.indexerUrl,
+            vaultModuleDir,
+          }),
+        }
+      : {}),
   });
 
   // Route a credit OUTCOME to the depositor's live socket(s) as a RENDER signal (FR-070): the

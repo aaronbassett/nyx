@@ -9,6 +9,7 @@
     "devnet:preflight": "tsx devnet/preflight-cli.ts"
   },
   "devDependencies": {
+    "@types/node": "26.1.1",
     "tsx": "^4.23.0"
   }
 }

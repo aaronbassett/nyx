@@ -393,6 +393,66 @@ describe("createDeployHandler", () => {
     expect(failed[0]?.detail).toBe(PLATFORM_REFUELLING_MESSAGE);
   });
 
+  it("I2: logs the funds-gate fault loudly with the error NAME only (never the raw error / key)", async () => {
+    const { ctx } = makeCtx();
+    const pipe = makePipelineHarness();
+    const logs: LoggedError[] = [];
+    // A funds-gate fault whose MESSAGE maliciously echoes a key-like string (a real balance-SDK
+    // error could) — the handler must log the NAME only, never the raw error.
+    const leaky = new Error("balance read failed key=SECRET-DEPLOY-KEY-abc");
+    const handler = createDeployHandler(
+      makeDeps({
+        makePipeline: pipe.makePipeline,
+        wallet: { assertCanDeploy: () => Promise.reject(leaky) },
+        logError: (message, detail) => {
+          logs.push({ message, detail });
+        },
+      }),
+    );
+    const fr = makeFakeRouter();
+    handler.handlers(fr.router);
+
+    await fr.invoke(deployRequestEvent(), ctx);
+
+    // The funds-gate fault was logged loudly, name-only — the raw error (and its key-bearing
+    // message) never reached the sink.
+    expect(logs).toHaveLength(1);
+    expect(logs[0]?.detail.errorName).toBe("Error");
+    expect(JSON.stringify(logs)).not.toContain("SECRET-DEPLOY-KEY-abc");
+    // Still deploys nothing (platform-fault path unchanged).
+    expect(pipe.factoryCalls()).toBe(0);
+  });
+
+  it("L-3: a funds-gate throw with a NON-string name logs the string fallback, never a raw non-string name", async () => {
+    const { ctx } = makeCtx();
+    const pipe = makePipelineHarness();
+    const logs: LoggedError[] = [];
+    // An Error whose runtime `name` is NOT a string (a real SDK error object could carry one). A raw
+    // `?.name` read would fold that bare number into the log detail; `errorNameOf` (the shared helper,
+    // L-3) applies a typeof-string guard and falls back to a fixed token, so `errorName` is ALWAYS a
+    // string. (Rejecting with a real Error keeps the `prefer-promise-reject-errors` lint happy.)
+    const weird = new Error("unusable");
+    Object.defineProperty(weird, "name", { value: 42, configurable: true });
+    const handler = createDeployHandler(
+      makeDeps({
+        makePipeline: pipe.makePipeline,
+        wallet: { assertCanDeploy: () => Promise.reject(weird) },
+        logError: (message, detail) => {
+          logs.push({ message, detail });
+        },
+      }),
+    );
+    const fr = makeFakeRouter();
+    handler.handlers(fr.router);
+
+    await fr.invoke(deployRequestEvent(), ctx);
+
+    expect(logs).toHaveLength(1);
+    expect(typeof logs[0]?.detail.errorName).toBe("string");
+    expect(logs[0]?.detail.errorName).toBe("UnknownError");
+    expect(pipe.factoryCalls()).toBe(0);
+  });
+
   it("targets ctx.projectId (the ownership-checked connect project), never a client-supplied project", async () => {
     const { ctx } = makeCtx("owned-project");
     const pipe = makePipelineHarness();
