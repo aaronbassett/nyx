@@ -35,6 +35,28 @@ export type {
 } from "./types";
 export { buildSiweMessage, logout, requestNonce, resumeSession, signIn } from "./auth";
 export * from "./topup";
+export { createDevWalletCeremony, DevCeremonyError } from "./dev-ceremony";
+export type {
+  CeremonyProver,
+  CeremonyStage,
+  DepositTxBuilder,
+  DevCeremonyDeps,
+  TxSubmitter,
+} from "./dev-ceremony";
+export {
+  createDepositTxBuilder,
+  createDevnetSubmitter,
+  createTxCeremonyProver,
+  DEPOSIT_CIRCUIT_ID,
+  DEV_TX_NETWORK_ID,
+} from "./dev-ceremony-tx";
+export type {
+  DepositTxBuilderOptions,
+  DevnetSubmitterOptions,
+  TxCeremonyProverOptions,
+} from "./dev-ceremony-tx";
+export { selectDepositCeremony, serializeSubmissions, withFallback } from "./ceremony-select";
+export type { SelectCeremonyDeps } from "./ceremony-select";
 export type {
   Account,
   AuthClientDeps,

@@ -39,4 +39,18 @@ describe("network-profile chokepoint", () => {
     const { EXPECTED_NETWORK_ID } = await import("@/wallet/config");
     expect(EXPECTED_NETWORK_ID).toBe(NETWORK.networkId);
   });
+
+  it("exposes NYXT_VAULT_ADDRESS from VITE_NYXT_VAULT_ADDRESS when set", async () => {
+    const address = "0200f1e2d3c4b5a600000000000000000000000000000000000000000000000000";
+    vi.stubEnv("VITE_NYXT_VAULT_ADDRESS", address);
+    vi.resetModules();
+    const { NYXT_VAULT_ADDRESS } = await import("@/config");
+    expect(NYXT_VAULT_ADDRESS).toBe(address);
+  });
+
+  it("defaults NYXT_VAULT_ADDRESS to the empty string when the var is unset", async () => {
+    vi.resetModules();
+    const { NYXT_VAULT_ADDRESS } = await import("@/config");
+    expect(NYXT_VAULT_ADDRESS).toBe("");
+  });
 });

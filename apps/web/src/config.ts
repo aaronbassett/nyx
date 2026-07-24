@@ -82,3 +82,20 @@ function resolveProfile(): NetworkProfile {
 
 /** The active network profile for this build (constitution VII chokepoint). */
 export const NETWORK: NetworkProfile = resolveProfile();
+
+/** Read `import.meta.env.VITE_NYXT_VAULT_ADDRESS` defensively (mirrors {@link readSelectedNetwork}). */
+function readVaultAddress(): string {
+  const meta = import.meta as unknown as { env?: Record<string, string | undefined> };
+  const value = meta.env?.VITE_NYXT_VAULT_ADDRESS;
+  return typeof value === "string" ? value : "";
+}
+
+/**
+ * The deployed NyxtVault contract address the top-up ceremony deposits into,
+ * read from `VITE_NYXT_VAULT_ADDRESS` (constitution VII — resolved HERE, never by
+ * an `import.meta.env` read scattered across call sites). P5's env generation
+ * writes the var after it deploys the dev vault; when unset (a build that ships no
+ * dev-wallet top-up) this is the empty string, and the ceremony selector treats an
+ * empty address as "not configured" rather than silently depositing to nowhere.
+ */
+export const NYXT_VAULT_ADDRESS: string = readVaultAddress();
